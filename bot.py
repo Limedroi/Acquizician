@@ -313,43 +313,45 @@ YEARS = {
     # quiz_index_n1.json etc.), completely separate from MFM's y1/y2/y3.
     # Nothing MFM-side is touched.
     #
-    # TODO before launch, per MNU year:
-    #   1. Create the channel, add this bot as ADMIN, get its ID from
-    #      @userinfobot, and paste it into "channel_id" (None = year is
-    #      hidden everywhere until it's filled in — see configured_years).
-    #   2. Re-order / rename the modules and subjects below to MNU's real
-    #      curriculum. The dict order IS the button order. The lists below
-    #      are just a copy of MFM's as a starting point.
+    # Each MNU year needs its channel_id set (None = year is hidden
+    # everywhere — see configured_years) and the bot added as ADMIN there.
+    # The dict order IS the button order. Module names are what admins type
+    # in lecture titles ("<Module> - <Subject> Lecture <n>: ...").
     "n1": {
         "label": "MNU Year 1",
         "university": "mnu",
-        "channel_id": None,
+        "channel_id": -1004479634684,
         "modules": {
+            # Term 1
             "Foundation (1)": ["Anatomy", "Embryology", "Biochemistry", "Histology", "Physiology"],
-            "Foundation (2)": ["Pathology", "Pharmacology", "Microbiology", "Parasitology", "Communication skills"],
-            "MSK":            ["Anatomy", "Biochemistry", "Histology", "Physiology", "Pathology"],
-            "CVS":            ["Physiology", "Anatomy", "Pharmacology", "Pathology", "Histology", "MP"],
+            "Foundation (2)": ["Pathology", "Pharmacology", "Microbiology", "Parasitology", "Terminology"],
+            # Term 2
+            "Musculoskeletal": ["Anatomy", "Biochemistry", "Histology", "Physiology", "Pathology"],
+            "Blood & Lymph":   ["Microbiology", "Physiology", "Biochemistry", "Pharmacology", "Parasitology",
+                                "Histology", "Pathology", "Psychiatry", "Communication skills", "MP"],
         },
     },
     "n2": {
         "label": "MNU Year 2",
         "university": "mnu",
-        "channel_id": None,
+        "channel_id": -1004313441905,
         "modules": {
-            "Respiratory":  ["Biochemistry", "Anatomy", "Physiology", "Histology", "Pharmacology", "Microbiology", "Pathology"],
-            "Blood":        ["Microbiology", "Physiology", "Biochemistry", "Pharmacology", "Parasitology", "Histology", "Pathology", "Psychiatry"],
-            "GIT":          ["Anatomy", "Pharmacology", "Parasitology", "Histology", "Pathology", "Physiology", "Microbiology"],
-            "CNS 1":        ["Physiology", "Anatomy"],
-            "CNS 2":        ["Pharmacology", "Physiology", "Parasitology", "Histology", "Pathology"],
+            # Term 1
+            "Respiratory":      ["Biochemistry", "Anatomy", "Physiology", "Histology", "Pharmacology", "Microbiology", "Pathology"],
+            "Cardiovascular":   ["Physiology", "Anatomy", "Pharmacology", "Pathology", "Histology", "Psychology"],
+            # Term 2
+            "Gastrointestinal": ["Anatomy", "Pharmacology", "Parasitology", "Histology", "Pathology", "Physiology", "Microbiology"],
+            "CNS":              ["Physiology", "Anatomy", "Pharmacology", "Parasitology", "Histology", "Pathology", "Life Support Basics"],
         },
     },
     "n3": {
         "label": "MNU Year 3",
         "university": "mnu",
-        "channel_id": None,
+        "channel_id": -1004312293265,
         "modules": {
-            "Endocrine":      ["Biochemistry", "Physiology", "Pathology", "Histology", "Pharmacology"],
-            "Genitourinary":  ["Anatomy", "Physiology", "Histology", "Pathology", "Microbiology"],
+            "Genitourinary":      ["Anatomy", "Physiology", "Histology", "Pathology", "Microbiology"],
+            "Endocrine":          ["Biochemistry", "Physiology", "Pathology", "Histology", "Pharmacology"],
+            "Community Medicine": ["Community Medicine"],
         },
     },
 }
@@ -378,6 +380,10 @@ SUBJECT_EMOJI = {
     "Communication skills": "💬",
     "MP":                   "👨‍⚕️",
     "Psychiatry":           "🏥",
+    "Terminology":          "📖",
+    "Psychology":           "💭",
+    "Life Support Basics":  "🚑",
+    "Community Medicine":   "🏘️",
 }
 
 def subject_label(subject: str) -> str:
@@ -392,6 +398,9 @@ MODULE_EMOJI = {
     "Respiratory": "🫁",
     "Blood":       "🩸",
     "GIT":         "😋",
+    "Blood & Lymph":    "🩸",
+    "Gastrointestinal": "😋",
+    "CNS":         "⚡️",
     "CNS 1":       "⚡️",
     "CNS 2":       "⚡️⚡️",
 }
@@ -483,6 +492,16 @@ ERROR_LOG_GROUP_ID = -1004333428419
 # edited to show both sides with fresh Reply/Close buttons. A plain group
 # the bot posts to — not a backup destination.
 REPORT_ISSUE_GROUP_ID = -1004331095016
+
+# MNU users' /report_issue reports land in their own channel instead. Only
+# the report CARDS/threads go here — the report_threads.json backup (pinned
+# document) stays in REPORT_ISSUE_GROUP_ID (the MFM channel) for everyone.
+REPORT_ISSUE_GROUP_ID_MNU = -1004304409061
+# MNU thread keys in REPORT_THREADS are message_id + this offset. Telegram
+# message ids are numbered per chat, so the same id could exist in both report
+# channels; the offset keeps the two key spaces from ever colliding. MFM keys
+# (and every thread saved before this existed) stay the plain message id.
+MNU_REPORT_KEY_OFFSET = 10 ** 12
 
 # ── Dedicated group for LECTURE_SESSIONS/DAILY_QUIZ_SESSIONS/
 # MISTAKES_RETAKE_SESSIONS JSON backups ──────────────────────────────
@@ -5778,6 +5797,15 @@ def settings_menu_keyboard(user_id: int, page: int = 1) -> InlineKeyboardMarkup:
     def _tag(on: bool) -> str:
         return "🟢 On" if on else "🔴 Off"
 
+    if page == 3:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("ℹ️ About Us", callback_data="settings_about_us")],
+            [InlineKeyboardButton("🫶 Support Us", callback_data="settings_support_us")],
+            [InlineKeyboardButton("📜 Terms of Service", callback_data="settings_terms")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="settings_page:2")],
+            [InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")],
+        ])
+
     if page == 2:
         reactions    = get_reactions_enabled(user_id)
         ach_notifs   = get_achievement_notifs_enabled(user_id)
@@ -5788,10 +5816,13 @@ def settings_menu_keyboard(user_id: int, page: int = 1) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(f"🏆 Achievement Alerts: {_tag(ach_notifs)}", callback_data="toggle_achievement_notifs")],
             [InlineKeyboardButton(f"🔔 Daily Notification: {_tag(daily_notifs)}", callback_data="toggle_daily_notifs")],
             [InlineKeyboardButton(f"📿 Zikr: {_tag(zikr)}", callback_data="toggle_zikr")],
-            [InlineKeyboardButton("ℹ️ About Us", callback_data="settings_about_us")],
-            [InlineKeyboardButton("🫶 Support Us", callback_data="settings_support_us")],
-            [InlineKeyboardButton("📜 Terms of Service", callback_data="settings_terms")],
-            [InlineKeyboardButton("⬅️ Back", callback_data="settings_page:1")],
+            [InlineKeyboardButton("✏️ Edit Nickname", callback_data="edit_nickname")],
+            [InlineKeyboardButton("📚 Change Year", callback_data="settings_year")],
+            [InlineKeyboardButton("🎓 Set University", callback_data="settings_uni")],
+            [
+                InlineKeyboardButton("⬅️ Back", callback_data="settings_page:1"),
+                InlineKeyboardButton("➡️ More Settings", callback_data="settings_page:3"),
+            ],
             [InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")],
         ]
         return InlineKeyboardMarkup(rows)
@@ -5803,8 +5834,6 @@ def settings_menu_keyboard(user_id: int, page: int = 1) -> InlineKeyboardMarkup:
     timer      = get_question_timer_seconds(user_id)
     timer_tag  = "🔴 Off" if timer == 0 else f"🟢 {timer}s"
     rows = [
-        [InlineKeyboardButton("✏️ Edit Nickname", callback_data="edit_nickname")],
-        [InlineKeyboardButton("📚 Change Year", callback_data="settings_year")],
         [InlineKeyboardButton(f"⏭️ Auto-Next: {_tag(auto_next)}", callback_data="toggle_auto_next")],
         [InlineKeyboardButton(f"🔀 Randomize: {_tag(randomize)}", callback_data="toggle_randomize")],
         [InlineKeyboardButton(f"🔀 Mix Written: {_tag(mix_written)}", callback_data="toggle_mix_written")],
@@ -7320,7 +7349,7 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # quiz-question image, and still works even while sleeping.
     report_wait_started = AWAITING_REPORT_ISSUE.pop(real_uid, None)
     if report_wait_started is not None and time.time() - report_wait_started <= REPORT_ISSUE_AWAIT_TIMEOUT:
-        if not REPORT_ISSUE_GROUP_ID:
+        if not _report_group_for_user(real_uid):
             await update.message.reply_text("⚠️ الميزة دي مش متاحة دلوقتي.")
             return
         report_photo = update.message.photo[-1] if update.message.photo else None
@@ -8301,7 +8330,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # against who's supposedly typing. Not admin-gated beyond "must be
     # sent in this group" for the same reason: if you're posting in a
     # private group only admins are in, that's the access control.
-    if REPORT_ISSUE_GROUP_ID and user_id == REPORT_ISSUE_GROUP_ID and text.startswith("-Reply"):
+    if user_id in _report_groups() and text.startswith("-Reply"):
         parts = text.split(maxsplit=2)
         if len(parts) < 3 or not parts[1].isdigit():
             await update.message.reply_text(
@@ -8452,7 +8481,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await update.message.reply_text(
                     "⚠️ الاسم فاضي — جرب تاني.",
-                    reply_markup=settings_menu_keyboard(real_uid),
+                    reply_markup=settings_menu_keyboard(real_uid, page=2),
                 )
             return
         if _contains_vulgar_word(nickname):
@@ -8469,7 +8498,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(
                     quizzy_block(QUIZZY_ANGRY_ART, "do you know that i had to make AN ENTIRE FILTER FOR PEOPLE LIKE YOU?!"),
                     parse_mode=ParseMode.HTML,
-                    reply_markup=settings_menu_keyboard(real_uid),
+                    reply_markup=settings_menu_keyboard(real_uid, page=2),
                 )
             return
         entry = _get_settings_entry(real_uid)
@@ -8495,7 +8524,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 f"✅ اتسجل! هنناديك <b>{html.escape(nickname)}</b> دلوقتي.",
                 parse_mode=ParseMode.HTML,
-                reply_markup=settings_menu_keyboard(real_uid),
+                reply_markup=settings_menu_keyboard(real_uid, page=2),
             )
         return
 
@@ -8506,7 +8535,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # fall through and this message is handled normally below instead.
     report_wait_started = AWAITING_REPORT_ISSUE.pop(real_uid, None)
     if report_wait_started is not None and time.time() - report_wait_started <= REPORT_ISSUE_AWAIT_TIMEOUT:
-        if not REPORT_ISSUE_GROUP_ID:
+        if not _report_group_for_user(real_uid):
             await update.message.reply_text("⚠️ الميزة دي مش متاحة دلوقتي.")
             return
         await _stage_report_draft(update, context, real_uid, text=text, photo_file_id=None)
@@ -8530,7 +8559,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # only ever be zero or one at a time in practice) exists, regardless
     # of whose id it's filed under.
     pending_reply = AWAITING_REPORT_REPLY.pop(real_uid, None)
-    if pending_reply is None and REPORT_ISSUE_GROUP_ID and user_id == REPORT_ISSUE_GROUP_ID and AWAITING_REPORT_REPLY:
+    if pending_reply is None and user_id in _report_groups() and AWAITING_REPORT_REPLY:
         fallback_uid = next(iter(AWAITING_REPORT_REPLY))
         pending_reply = AWAITING_REPORT_REPLY.pop(fallback_uid)
     if pending_reply:
@@ -11652,10 +11681,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == "settings_year":
         current = get_year_class(user_id)
         rows = list(year_class_keyboard("setyc", get_university(user_id)).inline_keyboard)
-        rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="menu_settings")])
+        rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="settings_page:2")])
         await query.edit_message_text(
             f"📚 <b>غيّر سنتك/فرقتك</b>\n\n"
             f"دلوقتي: <b>{html.escape(year_class_label(current))}</b>\n"
+            "⚠️ <b>تنبيه:</b> تغيير السنة هيمسح بياناتك المحفوظة.\n\n"
             "اختار السنة الجديدة:",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(rows),
@@ -11668,11 +11698,54 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("⚠️ الاختيار ده مش متاح.")
             return
         entry = _get_settings_entry(user_id)
-        if entry.get("year_class") != year_class:
+        new_uni = year_university(year_class)
+        if entry.get("year_class") != year_class or entry.get("university") != new_uni:
             entry["year_class"] = year_class
+            entry["university"] = new_uni   # keep the stored pick in step with the year's university
             await save_settings()
             await backup_settings_to_channel(context)
-        await _send_settings(context, user_id, query.message, edit=True)
+        await _send_settings(context, user_id, query.message, edit=True, page=2)
+        return
+
+    # ── settings_uni / setuni: — Set University (Settings page 2) ──────
+    # The university is derived from year_class (see get_university), so
+    # switching it means picking a year under the new university: setuni:<u>
+    # shows that university's years using the same setyc: handler as Change
+    # Year. Nothing changes until a year is actually tapped.
+    if query.data == "settings_uni":
+        current_uni = get_university(user_id)
+        rows = [[
+            InlineKeyboardButton(
+                ("✅ " if u == current_uni else "") + UNIVERSITIES[u],
+                callback_data=f"setuni:{u}",
+            )
+            for u in UNIVERSITY_ORDER
+        ]]
+        rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="settings_page:2")])
+        await query.edit_message_text(
+            "🎓 <b>غيّر الجامعة</b>\n\n"
+            f"دلوقتي: <b>{html.escape(UNIVERSITIES.get(current_uni, 'لسه محدد'))}</b>\n"
+            "⚠️ <b>تنبيه:</b> تغيير الجامعة هيمسح بياناتك المحفوظة.\n\n"
+            "اختار الجامعة:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+        return
+
+    if query.data.startswith("setuni:"):
+        university = query.data.split(":", 1)[1]
+        if university not in UNIVERSITIES:
+            await query.edit_message_text("⚠️ الاختيار ده مش متاح.")
+            return
+        rows = list(year_class_keyboard("setyc", university).inline_keyboard)
+        rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="settings_uni")])
+        await query.edit_message_text(
+            f"🎓 <b>{html.escape(UNIVERSITIES[university])}</b>\n\n"
+            "⚠️ <b>تنبيه:</b> تغيير الجامعة هيمسح بياناتك المحفوظة.\n\n"
+            "اختار سنتك/فرقتك في الجامعة دي:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
         return
 
     if query.data == "edit_nickname":
@@ -11681,7 +11754,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "✏️ ابعت الاسم المستعار اللي عايزه (حتى 32 حرف).\n"
             "⚠️ استخدم اسم لائق 🙊 — هو اللي هيظهر في الـ Leaderboard وقدام زمايلك.",
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔙 رجوع", callback_data="menu_settings"),
+                InlineKeyboardButton("🔙 رجوع", callback_data="settings_page:2"),
             ]]),
         )
         return
@@ -12122,6 +12195,27 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # the user re-does /report_issue, same as if the bot had been down when
 # they first tried.
 # ═══════════════════════════════════════════════════════════════
+def _report_groups() -> tuple:
+    """Every chat that hosts report cards (MFM + MNU), unset ones skipped."""
+    return tuple(g for g in (REPORT_ISSUE_GROUP_ID, REPORT_ISSUE_GROUP_ID_MNU) if g)
+
+def _report_group_for_user(user_id: int):
+    """Which report channel this person's /report_issue goes to: MNU users to
+    the MNU channel, everyone else (incl. anyone with no university yet) to
+    the MFM one."""
+    if get_university(user_id) == "mnu" and REPORT_ISSUE_GROUP_ID_MNU:
+        return REPORT_ISSUE_GROUP_ID_MNU
+    return REPORT_ISSUE_GROUP_ID
+
+def _report_key(chat_id: int, message_id: int) -> int:
+    """REPORT_THREADS key for the first card a report posted in chat_id."""
+    return message_id + MNU_REPORT_KEY_OFFSET if chat_id == REPORT_ISSUE_GROUP_ID_MNU else message_id
+
+def _report_chat_of_thread(thread: dict) -> int:
+    """The channel a thread's cards live in (threads saved before the MNU
+    split have no chat_id and are all MFM)."""
+    return thread.get("chat_id") or REPORT_ISSUE_GROUP_ID
+
 def _report_reply_keyboard(group_message_id: int, closed: bool) -> InlineKeyboardMarkup:
     if closed:
         return InlineKeyboardMarkup([[InlineKeyboardButton("🔒 Closed", callback_data="report_noop")]])
@@ -12237,15 +12331,16 @@ async def _refresh_report_thread(context: ContextTypes.DEFAULT_TYPE, group_messa
     to warn the admin in-group when it didn't (e.g. the user blocked the
     bot); the thread itself is still updated and saved either way."""
     closed = thread.get("closed", False)
+    report_chat = _report_chat_of_thread(thread)
 
-    # ── Admin-facing card, in REPORT_ISSUE_GROUP_ID ──
+    # ── Admin-facing card, in the thread's own report channel ──
     try:
         sent = await context.bot.send_message(
-            chat_id=REPORT_ISSUE_GROUP_ID,
+            chat_id=report_chat,
             text=_report_thread_text(thread, group_message_id), parse_mode=ParseMode.HTML,
             reply_markup=_report_reply_keyboard(group_message_id, closed=closed),
         )
-        await _collapse_old_report_message(context, REPORT_ISSUE_GROUP_ID, thread.get("latest_group_message_id"))
+        await _collapse_old_report_message(context, report_chat, thread.get("latest_group_message_id"))
         thread["latest_group_message_id"] = sent.message_id
     except Exception as e:
         print("REPORT THREAD GROUP REFRESH FAILED:", e)
@@ -12315,50 +12410,53 @@ async def _submit_report(context: ContextTypes.DEFAULT_TYPE, real_uid: int, tg_u
     via _refresh_report_thread instead of editing it in place."""
     name     = " ".join(p for p in (tg_user.first_name, tg_user.last_name) if p).strip() if tg_user else "?"
     username = tg_user.username if tg_user else None
+    report_chat = _report_group_for_user(real_uid)   # MNU channel for MNU users, MFM channel otherwise
     thread = {
         "user_id": real_uid, "name": name or "?", "username": username,
         "user_text": text, "photo_file_id": photo_file_id, "replies": [], "closed": False,
+        "chat_id": report_chat,
     }
     try:
         sent = await context.bot.send_message(
-            chat_id=REPORT_ISSUE_GROUP_ID,
+            chat_id=report_chat,
             text="📩 New issue report — loading…",   # placeholder; fixed up right below once we have the real id
             reply_markup=_report_reply_keyboard(0, closed=False),   # placeholder id, fixed up right below too
         )
     except Exception as e:
         print("REPORT ISSUE SEND FAILED:", e)
         return False
+    thread_key = _report_key(report_chat, sent.message_id)   # the ID admins type after -Reply
     # Both the displayed Reply ID and the keyboard's callback_data need
     # this message's own id, which we only get back after sending —
     # one edit to fix up both text and keyboard together.
     try:
         await context.bot.edit_message_text(
-            chat_id=REPORT_ISSUE_GROUP_ID, message_id=sent.message_id,
-            text=_report_thread_text(thread, sent.message_id), parse_mode=ParseMode.HTML,
-            reply_markup=_report_reply_keyboard(sent.message_id, closed=False),
+            chat_id=report_chat, message_id=sent.message_id,
+            text=_report_thread_text(thread, thread_key), parse_mode=ParseMode.HTML,
+            reply_markup=_report_reply_keyboard(thread_key, closed=False),
         )
     except Exception as e:
         print("REPORT ISSUE ID FIXUP FAILED:", e)
     if photo_file_id:
         try:
             await context.bot.send_photo(
-                chat_id=REPORT_ISSUE_GROUP_ID, photo=photo_file_id,
+                chat_id=report_chat, photo=photo_file_id,
                 caption="📎 Attached to the report above.",
                 reply_to_message_id=sent.message_id,
             )
         except Exception as e:
             print("REPORT ISSUE PHOTO FORWARD FAILED:", e)
     thread["latest_group_message_id"] = sent.message_id
-    REPORT_THREADS[sent.message_id] = thread
+    REPORT_THREADS[thread_key] = thread
     await save_report_threads()
     await backup_report_threads_to_channel(context)
     return True
 
 async def report_issue_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not REPORT_ISSUE_GROUP_ID:
+    real_uid = update.effective_user.id if update.effective_user else update.effective_chat.id
+    if not _report_group_for_user(real_uid):
         await update.message.reply_text("⚠️ الميزة دي مش متاحة دلوقتي.")
         return
-    real_uid = update.effective_user.id if update.effective_user else update.effective_chat.id
     AWAITING_REPORT_ISSUE[real_uid] = time.time()
     await update.message.reply_text(
         "✏️ اكتب مشكلتك أو ملاحظتك في رسالة واحدة (تقدر تبعت صورة معاها كمان لو حابب)، "
@@ -12634,11 +12732,14 @@ def _build_previewtxt_sections() -> list[str]:
         "── MAIN MENU / SETTINGS BUTTON LABELS ──\n\n"
         "Main menu: 🦦 How To Use · Quizzes ⁉️ · 📊 My Stats · ⚙️ Settings · "
         "💥Daily Quiz💥 · 🧠 Mistakes Bank · 🏆 Leaderboard (→ 📅 Weekly / 🌍 Global) · 🔥COMING SOON🔥\n\n"
-        "Settings (page 1): ✏️ Edit Nickname · 📚 Change Year · ⏭️ Auto-Next · 🔀 Randomize · "
+        "Settings (page 1): ⏭️ Auto-Next · 🔀 Randomize · "
         "🔀 Mix Written · 🔁 Spaced Repetition · ⏱️ Question Timer · "
         "➡️ More Settings · 🏠 Back to Home\n\n"
         "Settings (page 2): 🎭 Reactions · 🏆 Achievement Alerts · "
-        "🔔 Daily Notification · 📿 Zikr · ⬅️ Back · 🏠 Back to Home\n\n"
+        "🔔 Daily Notification · 📿 Zikr · ✏️ Edit Nickname · 📚 Change Year · "
+        "🎓 Set University · ⬅️ Back · ➡️ More Settings · 🏠 Back to Home\n\n"
+        "Settings (page 3): ℹ️ About Us · 🫶 Support Us · 📜 Terms of Service · "
+        "⬅️ Back · 🏠 Back to Home\n\n"
         "── HOW TO USE ──\n\n" + HOW_TO_USE_TEXT
     )
 
@@ -13876,7 +13977,7 @@ async def _send_info_page(context: ContextTypes.DEFAULT_TYPE, query, text: str, 
         text,
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔙 Back to Settings", callback_data="menu_settings")],
+            [InlineKeyboardButton("🔙 Back to Settings", callback_data="settings_page:3")],
             [InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")],
         ]),
     )
@@ -13887,28 +13988,38 @@ async def _send_settings(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply
     update.message or a callback_query.message). Mirrors _send_mystats:
     edit=True rewrites reply_target in place (button flow), edit=False
     sends a fresh reply. page 2 is the "➡️ More Settings" overflow page —
-    Reactions / Achievement Alerts / Daily Notification / Zikr;
-    page 1 is everything else (Username, Year/Class, Auto-Next,
-    Randomize, Spaced Repetition, Question Timer)."""
-    if page == 2:
+    Reactions / Achievement Alerts / Daily Notification / Zikr, then
+    Nickname / Year / University at its end; page 3 is About Us /
+    Support Us / Terms of Service; page 1 is everything else (Auto-Next,
+    Randomize, Mix Written, Spaced Repetition, Question Timer)."""
+    if page == 3:
+        text = (
+            "⚙️ <b>الإعدادات — صفحة 3</b>\n\n"
+            "ℹ️ <b>About Us</b> · 🫶 <b>Support Us</b> · 📜 <b>Terms of Service</b>"
+        )
+    elif page == 2:
+        nickname = get_nickname(user_id)
+        nick_line = f"<b>{html.escape(nickname)}</b>" if nickname else "<i>مش متسجل — دوس تحت تحطه</i>"
+        yc_line = html.escape(year_class_label(get_year_class(user_id)))
+        uni = get_university(user_id)
+        uni_line = html.escape(UNIVERSITIES.get(uni, "لسه محدد"))
         text = (
             "⚙️ <b>الإعدادات — صفحة 2</b>\n\n"
+            f"👤 الاسم المستعار: {nick_line}\n"
+            "⚠️ استخدم اسم لائق 🙊 — هو اللي هيظهر في الـ Leaderboard وقدام زمايلك.\n\n"
+            f"📚 <b>Year/Class</b>: {yc_line}\n"
+            f"🎓 <b>University</b>: {uni_line}\n"
+            "⚠️ <b>تنبيه:</b> تغيير السنة أو الجامعة هيمسح بياناتك المحفوظة.\n\n"
             "🎭 <b>Reactions</b>: البوت يرد بإيموجي عشوائي على رسايلك.\n"
             "🏆 <b>Achievement Alerts</b>: تنبيه لما تفتح achievement جديد.\n"
             "🔔 <b>Daily Notification</b>: تنبيه يومي الساعة 2 الضهر لما الـ Daily Quiz يتجدد.\n"
             "📿 <b>Zikr</b>: بوسترة ذكر كل ٧ أسئلة."
         )
     else:
-        nickname = get_nickname(user_id)
-        nick_line = f"<b>{html.escape(nickname)}</b>" if nickname else "<i>مش متسجل — دوس تحت تحطه</i>"
-        yc_line = html.escape(year_class_label(get_year_class(user_id)))
         spaced_rep_on = get_spaced_repetition_enabled(user_id)
         auto_next_on  = get_auto_next_enabled(user_id)
         text = (
-            f"⚙️ <b>الإعدادات</b>\n\n"
-            f"👤 الاسم المستعار: {nick_line}\n"
-            f"⚠️ استخدم اسم لائق 🙊 — هو اللي هيظهر في الـ Leaderboard وقدام زمايلك.\n\n"
-            f"📚 <b>Year/Class</b>: {yc_line}\n"
+            "⚙️ <b>الإعدادات</b>\n\n"
             "⏭️ <b>Auto-Next</b>: الأسئلة تتبعت واحد واحد بدل ما تتبعت كلها مرة واحدة.\n"
             "🔀 <b>Randomize</b>: ترتيب الأسئلة يبقى عشوائي كل مرة.\n"
             "🔁 <b>Spaced Repetition</b>: بيعيد سؤال غلطت فيه بعد شوية عشان يثبت في ذاكرتك."
