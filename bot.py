@@ -1,0 +1,14481 @@
+import re
+import string
+from types import SimpleNamespace
+import random
+import json
+import os
+import time
+import copy
+import asyncio
+import functools
+import html
+import unicodedata
+import tempfile
+import zipfile
+import traceback
+import hashlib
+import secrets
+from io import BytesIO
+from datetime import time as dt_time, datetime, timedelta
+from zoneinfo import ZoneInfo
+
+# ═══════════════════════════════════════════════════════════════
+# FILE INDEX — where to find things (line numbers approximate;
+# section banners below are exact and searchable).
+# ═══════════════════════════════════════════════════════════════
+#  130   FONT SETUP
+#  388   QUIZZY — The Quizician's cat friend (persona/flavor text)
+#  432   BOT MESSAGES — every user-facing string, in one place
+#  489   USERS STORAGE
+#  505   ANALYTICS — XP · LEVELS · ACHIEVEMENTS (also: telegram_name /
+#          telegram_username via _update_telegram_name). ACHIEVEMENTS
+#          holds 7 tiered categories: questions_answered, correct_streak,
+#          lectures_completed, xp_levels, daily_quiz, daily_streak (tier
+#          counts vary 4-6, see the dict itself and ACHIEVEMENT_STAT_FIELD
+#          for which analytics field each checks), and the meta category
+#          achievement_collector — thresholds check
+#          _total_achievements_unlocked (every OTHER category's unlocked
+#          tiers + unlocked extras) rather than a normal field, and its
+#          tiers grant a permanent entry["xp_multiplier"] instead of a
+#          one-time XP bonus; every _award_xp call scales by it, and tier
+#          5 (only reachable once literally everything else is unlocked)
+#          renames to "The Quizician". EXTRA_ACHIEVEMENTS holds 5 one-off
+#          (non-tiered) awards — quick_thinker, basmagy, perfect_run,
+#          insomniac, curious (the last checked via _settings_customized,
+#          no dedicated tracker) — unlocked
+#          via _check_extra_achievement and stored in
+#          entry["achievements"]["extras"]. New counters this system
+#          added: lectures_completed (_finish_lecture_session, non-retake
+#          only) and daily_quizzes_completed (_advance_daily_quiz_session,
+#          on completion).
+#  927   SETTINGS — per-user personalization (nickname, reactions,
+#          auto_next, randomize)
+#        🔎 SEARCH CONTENT — "Search Content 🔎" button on the Quizzes
+#          module list (and the rare no-locked-year fallback picker).
+#          search_pick_year:/search_year:/search_mod: callbacks (grep
+#          "SEARCH CONTENT" in button_handler) walk year -> module (or
+#          "All Modules") -> arms AWAITING_SEARCH_QUERY, then the user's
+#          next text message is matched against every ready lecture's
+#          poll questions via _search_quiz_questions (Arabic-aware
+#          substring match, same normalization as the nickname filter).
+#          Matches are shown as ONE paged list (numbered snippets + number
+#          buttons, SEARCH_RESULTS holds them); tapping a number resends
+#          that question as a live quiz poll via deliver_quiz (channel is
+#          private, so linking out isn't reliable). See
+#          _send_search_results / _search_list_view and the
+#          srchpick:/srchpage: callbacks.
+# 1114   LECTURE RESULTS — per-lecture leaderboard (own file + own
+#          backup channel: LECTURE_RESULTS_GROUP_ID)
+# 1267   MISTAKES BANK — per-user wrong-answer pool that seeds each user's
+#          own Daily Quiz "questions you got wrong before" slice. Entries
+#          are lightweight {user_id, mid, year, module, subject}
+#          REFERENCES, not full question snapshots — record_mistake()
+#          stores just the id; _resolve_mistake(s) turns a reference back
+#          into a full question dict on demand via _snapshot_from_mid +
+#          QUIZ_POLL_STATUS[year].
+#          Grep "_resolve_mistake" for every call site that needs resolved
+#          content (_build_daily_quiz_questions, start_mistakes_retake).
+# 1749   MISTAKES BANK RETAKE — 🧠 Mistakes Bank menu button, one-shot
+#          practice quiz over _scoped_mistakes_bank() (resolved first)
+# 1863   PASSWORD-GATED STORAGE (private group) — unrelated to quiz
+#          content; this is the password-triggered media vault. Its backup
+#          file is quizician_storage_backup.json (singular, no year
+#          suffix) — do NOT confuse with each year's Quizician_Quiz_Backup
+#          file below, despite the similar "storage/backup" wording.
+# 1986   QUIZ CHANNELS (per-year: YEARS registry near the top of the file
+#          controls channel_id + curriculum per year; index/state/poll-status/
+#          backup are all keyed by year, e.g. QUIZ_INDEX[year]). Each
+#          year's pinned backup document is named
+#          Quizician_Quiz_Backup_Y1.json / _Y2.json / _Y3.json
+#          (backup_quiz_to_channel) and contains quiz_index + quiz_state +
+#          quiz_poll_status for that year — this is what MISTAKES BANK
+#          entries resolve against.
+# 2212   STATE (in-memory dicts: LECTURE_SESSIONS, QUIZ_POLL_STATUS, etc.
+#          QUIZ_POLL_STATUS is persisted per-year alongside QUIZ_INDEX/
+#          QUIZ_STATE — see QUIZ CHANNELS above. LECTURE_SESSIONS,
+#          DAILY_QUIZ_SESSIONS, and MISTAKES_RETAKE_SESSIONS are now also
+#          persisted — see SESSION PERSISTENCE (grep the banner) for the
+#          local-file + SESSIONS_GROUP_ID channel backup, restored in
+#          _post_init. A crash within the ~30s SESSIONS_BACKUP_MIN_INTERVAL
+#          window can still lose that window's worth of session progress,
+#          same accepted risk shape as the analytics flush.)
+# 2238   CONSTANTS
+# 2247   PER-USER SERIALIZATION — @_serialize_per_user decorator, applied
+#          to handle_poll_answer and button_handler. Needed because
+#          concurrent_updates() (see MAIN, near the bottom) lets different
+#          users' updates run truly concurrently now; this keeps each
+#          individual user's own updates ordered against each other via a
+#          private asyncio.Lock per user_id, without touching either
+#          handler's body.
+# 2287   HELPERS
+# 2446   QUIZ DELIVERY (single source of truth for sending a live quiz poll)
+# 2619   KEYBOARD HELPERS (main menu, settings menu, etc.)
+# 2706   MENU TEXT CONTENT
+# 3127   REACTIONS (react_random, lecture-answer streak reactions)
+# 3183   SLEEP / WAKE COMMANDS
+# 3195   PASSIVE ANSWER BACKFILL / LECTURE DELIVERY + SESSION LOGIC
+#          — _deliver_next_lecture_question, _deliver_all_lecture_questions,
+#            handle_poll_answer (@_serialize_per_user), _advance_lecture_session
+#            (records mistakes into MISTAKES_BANK via record_mistake(user_id, mid, ...))
+# 3567   FORWARDED POLL HANDLER
+# 3752   IMAGE HANDLER
+# 3917   STORAGE GROUP — AUTO-INDEXING
+# 4307   TEXT MESSAGE HANDLER (includes /start's onboarding nickname prompt)
+# 4564   INLINE BUTTON HANDLER (button_handler, @_serialize_per_user — all
+#          callback_data routing, including lecture preview/leaderboard,
+#          lecture start, settings toggles, and the /edit_quiz flow —
+#          eqyr:/eqmodule:/eqsubject:/eqlecture:/eqq:/eqdel:/eqins:,
+#          admin-only, parallel to yr:/module:/subject:/lecture: — lets an
+#          admin drill into a lecture, pick one question (16-char
+#          preview), then delete it or reopen the lecture in the quiz
+#          channel to insert new poll(s) right after it via
+#          QUIZ_INSERT_AFTER, closed the same way as authoring: -END).
+#          Also 🔎 Search Questions (eqsrch:/eqsrchpick:/eqsrchdel:/
+#          eqsrchpage:, see _eq_search_questions), and ➕ Tail poll (eqtail:,
+#          on a lecture's question list — same DM session as Insert-after but
+#          appending at the end of the lecture), and 📎 Add case / image
+#          (eqatt:/eqattc:/eqatti:/eqattxc:/eqattxi:, on a question's preview —
+#          attaches/replaces/removes a case study or image on an EXISTING
+#          question via poll_case_studies / poll_images) — type a word, get a
+#          paged list of every matching question across the year/module,
+#          open one to delete or edit it without drilling lecture by lecture)
+# 5437   START (also wakes bot from sleep; asks for a nickname on first use)
+# 5505   ADMIN HELPERS — is_admin, admin_bound_year/can_edit_year (each
+#          secondary admin in SECONDARY_ADMIN_YEARS is locked to one year
+#          for /add_lecture, /edit_quiz, /quiz_list, /quiz_delete — see
+#          the SECONDARY_ADMIN_YEARS comment near the top of the file),
+#          /dev_panel (Creator-only control panel: stats snapshot + Set
+#          year/Users/Backups/Daily module shortcuts, replaces the old
+#          /admincheck), /set_year (nickname/ID -> year picker, also
+#          reachable from the panel — see AWAITING_DEVPANEL_SETYEAR/
+#          _MYSTATS and _resolve_user_ref)
+# 5526   BROADCAST COMMAND (admin only)
+# 5603   MAIN — ApplicationBuilder here sets .concurrent_updates(256), so
+#          updates from different users are handled in parallel instead of
+#          one-at-a-time globally (see PER-USER SERIALIZATION above for
+#          how same-user ordering is still preserved). Also where
+#          _reconcile_backups_job lives: a job_queue.run_repeating() job
+#          (every BACKUP_RECONCILE_INTERVAL seconds) that re-checks each
+#          backup channel's pin and re-uploads if it's out of sync, so a
+#          missed pin/delete on the reactive path gets caught within a few
+#          seconds instead of waiting for the next real data change. The
+#          Zikr poll (_maybe_send_zikr_poll) is usage-based, not a job —
+#          it fires inline every ZIKR_POLL_QUESTION_INTERVAL questions
+#          delivered to a user who hasn't opted out via Settings -> More
+#          Settings -> Zikr (get_zikr_enabled, on by default). Also registers
+#          _daily_backup_export_job (job_queue.run_daily,
+#          DAILY_BACKUP_EXPORT_HOUR/MIN) — zips every local data file and
+#          sends it to ERROR_LOG_GROUP_ID once a day, as a flat-file
+#          backup on top of the per-system pinned-message backups.
+#
+# NOTE ON save_*() FUNCTIONS: all 11 are async, writing via
+# asyncio.to_thread(_atomic_write_json, ...) — atomic (temp file + fsync +
+# os.replace, so a crash can't leave a half-written JSON file) AND
+# non-blocking (the disk I/O runs in a worker thread instead of stalling
+# the event loop for every other user while one save is in flight). Every
+# call site must `await` them; a few originally-sync helper functions
+# (_record_activity, set_daily_quiz_scope, _record_lecture_result,
+# record_mistake, _index_item) became async too since they call save_*()
+# internally — grep any of these names before adding a new call site.
+#
+# NOTE: line numbers drift as the file grows — treat them as "roughly
+# here", and confirm with a grep for the section banner text if unsure.
+# ═══════════════════════════════════════════════════════════════
+
+
+from telegram import Update, ReactionTypeEmoji, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, InputFile, MessageEntity
+from telegram.error import Forbidden, BadRequest, TimedOut, NetworkError, RetryAfter
+from telegram.ext import (
+    ApplicationBuilder,
+    ApplicationHandlerStop,
+    MessageHandler,
+    CommandHandler,
+    CallbackQueryHandler,
+    PollHandler,
+    PollAnswerHandler,
+    MessageReactionHandler,
+    filters,
+    ContextTypes,
+    AIORateLimiter,
+)
+from telegram.constants import ParseMode
+from telegram.helpers import escape_markdown
+
+BOT_TOKEN = os.environ["BOT_TOKEN"]  # set this in Railway's Variables tab — never hardcode it
+# NOTE: AIORateLimiter (used below when building `app`) needs the extra:
+#   pip install "python-telegram-bot[rate-limiter]"
+# Add that to requirements.txt too, or the import at the top of this file fails.
+
+# Portable temp dir: tempfile.gettempdir() respects $TMPDIR, so this resolves
+# to a writable path on both Railway (/tmp) and Termux ($PREFIX/tmp) — a
+# hardcoded "/tmp" fails on Android, which has no writable /tmp.
+IMG_BASE_DIR  = os.path.join(tempfile.gettempdir(), "quizician_imgs")
+
+# ── Replace with YOUR Telegram numeric user ID ──────────────────
+# To find it: message @userinfobot on Telegram → it replies with your ID
+ADMIN_ID = 940770584
+
+# ── Secondary admins — full admin access EXCEPT /dev_panel, and each ──
+# one is bound to exactly one year (y1/y2/y3): they can only add/edit/
+# delete quiz content (/add_lecture, /edit_quiz, /quiz_list, /quiz_delete)
+# for THEIR OWN year — see admin_bound_year/can_edit_year below. Replace
+# the placeholders below with real Telegram numeric user IDs (same
+# @userinfobot lookup as ADMIN_ID above), each mapped to the year key
+# they're responsible for. They pass is_admin() — every admin command/
+# callback that gates on is_admin() — but fail is_creator(), which is the
+# one check /dev_panel (and its own callbacks/flows) uses instead. Shows
+# up in /mystats as "Admin" (vs. "The Creator" for ADMIN_ID itself).
+SECONDARY_ADMIN_YEARS = {
+    111111111: "y1",  # placeholder — replace with a real secondary admin's Telegram ID
+    222222222: "y2",  # placeholder — replace with a real secondary admin's Telegram ID
+}
+SECONDARY_ADMIN_IDS = set(SECONDARY_ADMIN_YEARS)   # kept for any plain "is this a secondary admin?" membership check
+
+# ── Replace with your private GROUP's chat ID ────────────────────
+# 1. Create the group, add this bot to it as a member (admin not required
+#    unless you want it to survive being demoted/re-added later).
+# 2. Add @userinfobot to the same group (or forward a message from the
+#    group to it in DM) — it replies with the chat ID (a negative number,
+#    e.g. -1001234567890). Paste it below, then remove @userinfobot.
+STORAGE_GROUP_ID = -1004447646576
+
+# ── YEARS — one quiz channel + curriculum per academic year ──────────
+# /quiz now asks "which year?" first, then drills into that year's own
+# modules -> subjects -> lectures, exactly like before. Each year is
+# completely isolated: its own Telegram channel, its own quiz index, its
+# own backup document. That isolation is the whole point — a single
+# combined index/backup eventually outgrows Telegram's practical JSON
+# document size as more years/lectures pile in, so splitting by year
+# keeps each backup small indefinitely instead of one ever-growing file.
+#
+# To add/wire up a year's channel:
+#   1. Create a channel, add this bot as an ADMIN (channels require admin
+#      rights for the bot to receive posts at all).
+#   2. Forward any message from that channel to @userinfobot in a private
+#      DM — it replies with the channel's chat ID.
+#   3. Paste that ID below as that year's "channel_id".
+#
+# The old single-channel setup (channel -1004402622263) is kept as Year 3
+# below, repurposed and started fresh — its lecture index/state/poll-status
+# are stored under new "_y3" files, so nothing from the old combined
+# quiz_index.json/quiz_state.json/quiz_poll_status.json carries over.
+#
+# Subject names here are plain text, no emoji — this is the exact string
+# admins type in a lecture title ("<Module> - <Subject> Lecture <n>: ...")
+# and the exact string stored in QUIZ_INDEX, so it needs to stay simple and
+# typeable. Emoji are purely cosmetic and live in SUBJECT_EMOJI below,
+# looked up only when rendering a subject as a button label.
+YEARS = {
+    "y1": {
+        "label": "Year 1",
+        "channel_id": -1004491934509,
+        "modules": {
+            "Foundation (1)": ["Anatomy", "Embryology", "Biochemistry", "Histology", "Physiology"],
+            "Foundation (2)": ["Pathology", "Pharmacology", "Microbiology", "Parasitology", "Communication skills"],
+            "MSK":            ["Anatomy", "Biochemistry", "Histology", "Physiology", "Pathology"],
+            "CVS":            ["Physiology", "Anatomy", "Pharmacology", "Pathology", "Histology", "MP"],
+        },
+    },
+    "y2": {
+        "label": "Year 2",
+        "channel_id": -1004370807195,
+        "modules": {
+            "Respiratory":  ["Biochemistry", "Anatomy", "Physiology", "Histology", "Pharmacology", "Microbiology", "Pathology"],
+            "Blood":        ["Microbiology", "Physiology", "Biochemistry", "Pharmacology", "Parasitology", "Histology", "Pathology", "Psychiatry"],
+            "GIT":          ["Anatomy", "Pharmacology", "Parasitology", "Histology", "Pathology", "Physiology", "Microbiology"],
+            "CNS 1":        ["Physiology", "Anatomy"],
+            "CNS 2":        ["Pharmacology", "Physiology", "Parasitology", "Histology", "Pathology"],
+        },
+    },
+    "y3": {
+        "label": "Year 3",
+        # This is the existing channel, repurposed — starting fresh.
+        "channel_id": -1004402622263,
+        "modules": {
+            "Endocrine":      ["Biochemistry", "Physiology", "Pathology", "Histology", "Pharmacology"],
+            "Genitourinary":  ["Anatomy", "Physiology", "Histology", "Pathology", "Microbiology"],
+        },
+    },
+}
+# Display order for the /quiz year picker.
+YEAR_ORDER = ["y1", "y2", "y3"]
+
+# Cosmetic-only: emoji shown next to a subject's name on module/subject
+# selection buttons. Looked up by the plain subject string above — never
+# stored, matched against lecture titles, or used as a dict key anywhere.
+# A subject with no entry here just renders without an emoji.
+SUBJECT_EMOJI = {
+    "Anatomy":              "🩻",
+    "Embryology":           "👶🏼",
+    "Biochemistry":         "🧬",
+    "Histology":            "🔬",
+    "Physiology":           "🧠",
+    "Pathology":            "🩸",
+    "Pharmacology":         "💊",
+    "Microbiology":         "🦠",
+    "Parasitology":         "🪱",
+    "Communication skills": "💬",
+    "MP":                   "👨‍⚕️",
+    "Psychiatry":           "🏥",
+}
+
+def subject_label(subject: str) -> str:
+    """Subject string for display: name + its emoji, if it has one in
+    SUBJECT_EMOJI. Never use this for storage/matching — always plain
+    `subject` for that (parse_lecture_title, QUIZ_INDEX, callback_data)."""
+    emoji = SUBJECT_EMOJI.get(subject)
+    return f"{subject} {emoji}" if emoji else subject
+
+# Cosmetic-only, same idea as SUBJECT_EMOJI but for module names.
+MODULE_EMOJI = {
+    "Respiratory": "🫁",
+    "Blood":       "🩸",
+    "GIT":         "😋",
+    "CNS 1":       "⚡️",
+    "CNS 2":       "⚡️⚡️",
+}
+
+def module_label(module: str) -> str:
+    """Module string for display: name + its emoji, if it has one in
+    MODULE_EMOJI. Never use this for storage/matching — always plain
+    `module` for that (parse_lecture_title, QUIZ_INDEX, callback_data)."""
+    emoji = MODULE_EMOJI.get(module)
+    return f"{module} {emoji}" if emoji else module
+
+
+def year_channel_id(year: str):
+    return YEARS.get(year, {}).get("channel_id")
+
+def year_label(year: str) -> str:
+    return YEARS.get(year, {}).get("label", year)
+
+# Credit line shown under the module-selection prompt. Year 1 & 2 were
+# built by MDM44; Year 3 is Medify44. Cosmetic only.
+YEAR_CREDITS = {"y1": "MDM44", "y2": "MDM44", "y3": "Medify44"}
+
+def year_credit_line(year: str) -> str:
+    """'\n\nCreated by <b>NAME</b>' for the module-selection screen, or ''
+    if that year has no credit configured."""
+    name = YEAR_CREDITS.get(year)
+    return f"\n\nCreated by <b>{name}</b>" if name else ""
+
+def year_modules(year: str) -> dict:
+    return YEARS.get(year, {}).get("modules", {})
+
+def year_for_chat(chat_id: int):
+    """Which year (if any) a given chat/channel ID belongs to."""
+    for y, cfg in YEARS.items():
+        if cfg.get("channel_id") == chat_id:
+            return y
+    return None
+
+def configured_years() -> list:
+    """Years that actually have a channel_id set — unset ones (TODOs above)
+    are silently skipped everywhere (year picker, filters, backups, etc.)
+    until someone fills them in."""
+    return [y for y in YEAR_ORDER if YEARS.get(y, {}).get("channel_id")]
+
+# Every configured year's channel ID, e.g. for filters.Chat(...) which
+# accepts either a single ID or a list of them.
+QUIZ_CHANNEL_IDS = [cid for cid in (YEARS[y]["channel_id"] for y in YEARS) if cid]
+
+# ── Dedicated group for analytics JSON backups ────────────────
+# The bot pins the latest analytics.json here after every change
+# and deletes the previous one — always exactly one file in the group.
+ANALYTICS_GROUP_ID = -1003767364410
+
+# ── Dedicated group for user-settings JSON backups ─────────────
+# Same pin-and-replace pattern as ANALYTICS_GROUP_ID, but for
+# per-user personalization settings (nickname, etc).
+SETTINGS_GROUP_ID = -1004423684829
+
+# ── Dedicated group for per-lecture leaderboard/results JSON backups ──
+# Same pin-and-replace pattern as ANALYTICS_GROUP_ID, kept in its own
+# group (rather than folded into ANALYTICS_GROUP_ID) so a growing
+# leaderboard file never risks the analytics backup itself, and vice
+# versa. Set this up the same way as the others: create a group, add
+# the bot as admin, add @userinfobot to it, paste the ID it replies with below.
+LECTURE_RESULTS_GROUP_ID = -1004292587669
+
+# ── Mistakes bank: every wrong lecture answer, kept per-user ──
+# Feeds each user's own "questions you got wrong before" slice of the
+# Daily Quiz. Given by the user directly (already an existing group/channel).
+MISTAKES_BANK_GROUP_ID = -1004394139690
+
+# ── Dedicated group the bot posts crash/error reports to ────────────
+# Not a backup destination like the ones above — just a plain group the
+# bot sends a message to whenever an update handler raises an
+# unhandled exception. See the global error handler near app setup.
+ERROR_LOG_GROUP_ID = -1004333428419
+
+# ── User-submitted issue reports land here (see /report_issue) ──────
+# Each report is its own message with a "↩️ Reply" button; the admin's
+# next text message in this group becomes the reply, then the message is
+# edited to show both sides with fresh Reply/Close buttons. A plain group
+# the bot posts to — not a backup destination.
+REPORT_ISSUE_GROUP_ID = -1004331095016
+
+# ── Dedicated group for LECTURE_SESSIONS/DAILY_QUIZ_SESSIONS/
+# MISTAKES_RETAKE_SESSIONS JSON backups ──────────────────────────────
+# Unlike every group above, this backs up data that changes on almost
+# every answered question across every active user, so it deletes the
+# previous pinned message on each new upload instead of keeping every
+# backup forever (see the SESSION PERSISTENCE section for the full
+# reasoning). Set up the same way as the others: create a group, add
+# the bot as admin, add @userinfobot to it, paste the ID it replies with.
+SESSIONS_GROUP_ID = -1004499530524
+
+# ── Curriculum structure for the quiz channels ─────────────────────
+# Each year in YEARS (above) has its own "modules" dict in this same shape.
+# Lecture titles posted in a year's quiz channel must be formatted as:
+#   "<Module> - <Subject> Lecture <number>: <name>"
+#   e.g. "Endocrine - Physiology Lecture 3: Insulin Signaling"
+# Matching is case-insensitive; the canonical spelling from that year's
+# "modules" dict is what gets stored/displayed.
+
+# ═══════════════════════════════════════════════════════════════
+# QUIZZY — The Quizician's cat friend 🐾
+# ═══════════════════════════════════════════════════════════════
+# Nine moods, each (art, when it's used). Swap the whole block here if the
+# art is redrawn again rather than editing poses one by one.
+QUIZZY_HAPPY_ART = (   # normal greetings, Year/Class setting, the bully joke
+    "./\\___/\\ \n"
+    "(=^ ◡ ^=)つ"
+)
+QUIZZY_WINK_ART = (   # "haha i am just kidding"
+    " /\\___/\\ \n"
+    "( ^ ◡ < )つ"
+)
+QUIZZY_SAD_ART = (   # errors
+    "./\\___/\\ \n"
+    "(ಥ ﹏ ಥ)つ"
+)
+QUIZZY_ANGRY_ART = (   # writing a vulgar word / getting banned
+    " ./\\___/\\ \n"
+    "( ◣ _ ◢ )つ"
+)
+QUIZZY_ANNOYED_ART = (   # /mystats without starting any lecture
+    " ./\\___/\\ \n"
+    "( ¬ _ ¬ )つ"
+)
+QUIZZY_READY_ART = (   # daily quiz and lectures
+    " ./\\___/\\ \n"
+    "( ง •̀ _ •́ )ง"
+)
+QUIZZY_VICTORY_ART = (   # finishing a lecture
+    ". /\\___/\\ \n"
+    "ᕙ( ^ ◡ ^ )ᕗ"
+)
+QUIZZY_EXCITED_ART = (   # first time greeting, getting an achievement, getting in the leaderboard
+    ". /\\___/\\ \n"
+    "\\( ✧ ∇ ✧ )/"
+)
+QUIZZY_ADORE_ART = (   # top 3 of the leaderboard, leaving feedback
+    ". /\\___/\\ \n"
+    "( ♡ ∇ ♡ )つ"
+)
+QUIZZY_SLEEPING_ART = (
+    " /\\_/\\ \n"
+    "(  -.- ) zzz\n"
+    " > ^ <  "
+)
+
+QUIZZY_WELCOME_LINES = [
+    "صباح (أو مساء) الورد 🌹",
+    "باشا البلد",
+    "الله أكبر أخيرا قررت تذاكر",
+    "يا مراحب يا كبير الحتة! 🕶",
+    "مسا مسا على الناس الكويسة",
+    "اخويا الرشاش... اللي مبيفضاش...",
+    "أخويا المدرعة... اللي الضربة منه بأربعة...",
+    "أخويا السكرههه... اللي ضحكته منورههه...",
+    "Ah, the sweet smell of exam panic.",
+    "Look out world, a genius just logged in. 💪",
+    "لسه بدري... لسه بدري... 🔥🗣🗣",
+    "أنا جاي هنا عشان أذاكر.. والكل يشهد عليا!",
+    "ما لسه بدري يا فنان! كنت كملت نوم أحسن",
+    "هو المنهج ده ملوش أهـل يسألوا عليه؟",
+    "أنا مبخافش من أسئلة.. أنا الأسئلة هي اللي بتخاف مني!",
+]
+QUIZZY_SUCCESS_LINES = [
+    "تحياتي 🫡",
+    "مش بقول باشا 😎",
+    "قدوة 😌🙌",
+]
+QUIZZY_ERROR_LINES = [
+    "كويزي وقع على دماغه من الصدمة، بس متقلقش هنظبطها 😓",
+    "كويزي شايف إن المشكلة دي معندهاش داعي، جرب تاني 😓",
+    "احنا مش عارفين إيه اللي حصل، بس كويزي واثق إنها هتتحل 😓",
+    "كله بسبب قسم الفسيو 😓",
+]
+
+def quizzy_block(art: str, line: str) -> str:
+    """Quizzy's ASCII art + one of his lines, wrapped for Telegram HTML.
+    The art contains literal < > characters (whiskers/paws) which Telegram's
+    HTML parser would otherwise choke on as broken tags — escape them.
+    <code> instead of <pre>: a <pre> block gets Telegram's own language
+    auto-detection, and the art's first line reads enough like a shell
+    command that it was showing a "Shell" label + copy button above the
+    cat. <code> keeps the monospace look without that guess."""
+    return f"<code>{html.escape(art)}</code>\n<i>{html.escape(line)}</i>"
+
+# ═══════════════════════════════════════════════════════════════
+# BOT MESSAGES — every user-facing string the bot sends, in one place.
+# Grouped by feature. Dynamic ones use {placeholders} filled with .format().
+# (Content generated in a loop — like /c's command list, /quiz_list's
+# lecture rows — stays where it's built, since there's
+# nothing fixed to centralize there; only their static labels live here.)
+# ═══════════════════════════════════════════════════════════════
+
+# ── Generic / shared ──────────────────────────────────────────
+MSG_ADMIN_ONLY = "🚫 للأدمن فقط"
+
+# ── /cancel ────────────────────────────────────────────────────
+MSG_CANCEL_DONE = "❌ تم نطر أبلكاش"
+MSG_CANCEL_NOTHING = "بتلغيني أنا يعني ولا أي🤨"
+
+# ═══════════════════════════════════════════════════════════════
+# JSON HELPERS
+# ═══════════════════════════════════════════════════════════════
+def _atomic_write_json(path: str, data, **dump_kwargs):
+    """Writes JSON to `path` atomically: dump to a temp file in the same
+    directory, flush + fsync it to disk, then os.replace() it over the
+    real path. os.replace is atomic on both POSIX and Windows (same
+    filesystem), so a crash/power loss can only ever leave either the old
+    file or the fully-written new one — never a half-written/truncated
+    one. Every save_*() function in this file should go through this
+    instead of `open(path, "w")` + json.dump directly."""
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    fd, tmp_path = tempfile.mkstemp(prefix=".tmp-", suffix=".json", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, **dump_kwargs)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)   # atomic rename, same filesystem
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+
+def _load_json_safe(path: str, expected_type, default_factory, label: str, *, encoding: str = "utf-8"):
+    """Reads JSON from `path` and guarantees the result is an instance of
+    `expected_type` (a type or tuple of types), or returns default_factory()
+    instead. Never raises. Covers the four ways a data file can be bad:
+      - unreadable / permission error / encoding error   (OSError, UnicodeDecodeError)
+      - truncated or syntactically invalid JSON          (JSONDecodeError)
+      - empty file                                       (JSONDecodeError)
+      - VALID JSON of the wrong top-level type — e.g. a bare string where
+        a dict is expected. json.load happily returns that, so a loader
+        that only catches parse errors hands a str to code that then
+        calls .items() / iterates it and blows up somewhere far away.
+    The loaders run at module level, so any raise here would take the whole
+    bot down at import time. A missing file is not an error: it returns the
+    default silently, same as a fresh install."""
+    if not os.path.exists(path):
+        return default_factory()
+    try:
+        with open(path, "r", encoding=encoding) as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
+        print(f"{label}: couldn't load {path} ({type(e).__name__}: {e}) — using empty default.")
+        return default_factory()
+    if not isinstance(data, expected_type):
+        want = expected_type.__name__ if isinstance(expected_type, type) else "/".join(t.__name__ for t in expected_type)
+        print(f"{label}: {path} held a {type(data).__name__}, expected {want} — using empty default.")
+        return default_factory()
+    return data
+
+# ── Serialized concurrent writers ───────────────────────────────────
+# _atomic_write_json makes ONE write crash-safe, but it does nothing about
+# TWO writes to the same file overlapping. Every save_*() hands its write to
+# asyncio.to_thread, so two saves of the same file (e.g. two different users
+# changing a setting at the same moment — they hold different per-user locks,
+# so _serialize_per_user can't help) run in parallel OS threads. Each one
+# takes its snapshot at a slightly different time, and whichever thread's
+# os.replace() happens to land LAST wins — which can be the OLDER snapshot,
+# silently overwriting the newer one (a lost update).
+#
+# Fix: one asyncio.Lock per destination path. All writers of a given file
+# queue up behind it and run strictly one at a time, in arrival order.
+# Crucially the snapshot is taken INSIDE the lock (via `get_data`), not by
+# the caller beforehand: a caller that snapshotted first and then waited for
+# the lock would write a stale copy AFTER a fresher one had already landed.
+# Taking it under the lock guarantees each write captures everything every
+# earlier writer's mutation left behind, so the last write is always the
+# newest state. Different files never block each other (separate locks).
+_FILE_WRITE_LOCKS: dict[str, asyncio.Lock] = {}
+
+def _get_file_write_lock(path: str) -> asyncio.Lock:
+    key  = os.path.abspath(path)
+    lock = _FILE_WRITE_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _FILE_WRITE_LOCKS[key] = lock
+    return lock
+
+async def _write_json_serialized(path: str, get_data, **dump_kwargs) -> None:
+    """Serializes concurrent writes to `path`. `get_data` is a zero-arg
+    callable returning the object to persist; it is called while holding
+    the file's lock, and its result must be a frozen snapshot (deepcopy)
+    because the actual dump runs on a worker thread while the event loop
+    keeps mutating the live state. Use this instead of calling
+    asyncio.to_thread(_atomic_write_json, ...) directly."""
+    async with _get_file_write_lock(path):
+        snapshot = get_data()
+        await asyncio.to_thread(_atomic_write_json, path, snapshot, **dump_kwargs)
+
+def _backup_filename(base: str) -> str:
+    """base.json -> base_20260910T143201Z.json. Every backup upload now
+    gets a distinct, sortable filename instead of reusing the same name —
+    paired with no longer deleting the previous backup message in every
+    backup_*_to_channel function, this means every backup ever taken
+    stays in its channel, each individually identifiable by caption +
+    timestamp. restore_cmd (/restore) reads this back off the filename to
+    show the admin what they're picking between."""
+    from datetime import timezone
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    name, _, ext = base.rpartition(".")
+    return f"{name}_{stamp}.{ext}" if name else f"{base}_{stamp}"
+
+# ═══════════════════════════════════════════════════════════════
+# USERS STORAGE
+# ═══════════════════════════════════════════════════════════════
+USERS_FILE = "users.json"
+
+def load_users():
+    raw = _load_json_safe(USERS_FILE, list, list, "USERS")
+    # ids are ints; anything else in the list is junk from a bad edit. set()
+    # of an unhashable element (a nested list/dict) would itself raise, so
+    # filter to scalars first.
+    return {u for u in raw if isinstance(u, (int, str)) and not isinstance(u, bool)}
+
+async def save_users():
+    await _write_json_serialized(USERS_FILE, lambda: list(USERS), ensure_ascii=False)
+
+USERS = load_users()
+
+# ═══════════════════════════════════════════════════════════════
+# ANALYTICS — XP · LEVELS · ACHIEVEMENTS
+#
+# analytics.json schema per user:
+# {
+#   "questions_created": int,
+#   "streak":            int,   # daily activity streak — backs "daily_streak" achievements
+#   "streak_best":       int,
+#   "last_active_date":  "YYYY-MM-DD" | null,
+#   "lecture_questions_answered":   int,
+#   "lecture_questions_correct":    int,
+#   "lecture_questions_incorrect":  int,
+#   "lecture_correct_streak_current": int,
+#   "lecture_correct_streak_best":    int,
+#   "subject_stats":     {module: {subject: "correct/answered"}},  # per-subject accuracy,
+#                        # every answered question (lecture, Daily Quiz, retake).
+#                        # String-encoded on purpose — see _record_subject_answer.
+#   "last_module":       str | None,  # module of the user's most recent answer — /mystats
+#                        # falls back to it when no /daily_module scope is set
+#   "lectures_completed":       int,   # real (non-retake) lecture completions
+#   "daily_quizzes_completed":  int,   # Daily Quiz completions
+#   "xp":                int,
+#   "xp_multiplier":     float,   # permanent multiplier on every XP award (see
+#                                  # _award_xp), granted by "achievement_collector"
+#   "level":             int,
+#   "achievements": {
+#       # tiered categories — see ACHIEVEMENTS for tier counts/thresholds:
+#       "questions_answered": 0-6, "correct_streak": 0-5,
+#       "lectures_completed": 0-5, "xp_levels": 0-6,
+#       "daily_quiz": 0-5, "daily_streak": 0-5,
+#       "achievement_collector": 0-5,   # meta: counts unlocks across every
+#                                        # OTHER category + extras (see
+#                                        # _total_achievements_unlocked);
+#                                        # tier 5 renames to "The Quizician"
+#                                        # (unlocks only once EVERY other
+#                                        # achievement — tiers + extras —
+#                                        # is unlocked)
+#       "extras": {key: True, ...}   # one-off EXTRA_ACHIEVEMENTS unlocked
+#   }
+# }
+# ═══════════════════════════════════════════════════════════════
+ANALYTICS_FILE          = "analytics.json"
+ANALYTICS_BACKUP_MARKER = "🗄 QUIZICIAN_ANALYTICS_BACKUP"
+
+
+# ── Level curve ──────────────────────────────────────────────
+# xp_needed(level) = LEVEL_CURVE_A * level^2 + LEVEL_CURVE_B * level
+# (a gentle quadratic, not the old pure sqrt curve — see _xp_to_level /
+# _level_xp_range for the actual formulas, which invert/evaluate this).
+#
+# Tuned against a concrete weekly pace: 8 lectures/week, ~40 questions
+# each, ~80% accuracy (15xp/correct, 5xp/incorrect, +25 lecture-completion
+# bonus) -> ~545 XP/lecture. Target was level 5 in ~4 lectures, level 10
+# in ~12, level 15 in ~16 — i.e. steady progress, not accelerating or
+# decelerating. These coefficients land on ~5.2 / ~10.6 / ~16.2 lectures
+# for those three, and keep costing roughly 6-7 lectures per level all
+# the way up: level 50 (~62 lectures, ~1.5 months), level 100
+# (~147 lectures, ~4.5 months) — reachable within a school year for a
+# dedicated student, instead of the old sqrt curve's multi-year ceiling.
+LEVEL_CURVE_A = 2.5
+LEVEL_CURVE_B = 550
+
+# ── XP per action ────────────────────────────────────────────
+XP_PER_QUESTION   = 10
+
+# ── Achievement definitions ───────────────────────────────────
+# Each tiered achievement is (threshold, name, xp_bonus, emoji, quip) —
+# quip is a short flavor line shown alongside the unlock announcement
+# (see _announce_events) and in the achievements gallery (_send_achievements).
+# Tier counts vary per category (4-6), so nothing below assumes exactly 5.
+# A name/quip containing the literal token "{nick}" gets that token
+# replaced with the unlocking user's own nickname wherever it's actually
+# shown — see _personalize_ach_text — so it's a plain string here, not a
+# per-user value.
+# stat_key → the actual analytics entry field each category's threshold is
+# checked against (kept separate from the ACHIEVEMENTS dict key so the
+# lookup doesn't silently break if either name changes later).
+ACHIEVEMENT_STAT_FIELD = {
+    "questions_answered": "lecture_questions_answered",
+    "correct_streak":     "lecture_correct_streak_best",
+    "lectures_completed": "lectures_completed",
+    "xp_levels":          "level",
+    "daily_quiz":         "daily_quizzes_completed",
+    "daily_streak":       "streak_best",
+}
+ACHIEVEMENTS = {
+    "questions_answered": [
+        (100,   "Rookie",      25,  "📚", "لسه يا دوب بنقول يا هادي"),
+        (500,   "Apprentice",  75,  "📚", "كدا دخلنا فالجد بقا"),
+        (1000,  "Expert",      150, "📚", "دماغك بدأت تنور أهي"),
+        (3000,  "Master",      300, "📚", "وصل الكبير"),
+        (5000,  "Grandmaster", 600, "📚", "يبني أرحم"),
+        (8000,  "Titan",       1200, "📚", "ولا حتى ليفاي يقدر يعملك حاجة"),
+    ],
+    "correct_streak": [
+        (5,   "Hot Start",        20,  "🔥", "ولع يا باشا"),
+        (15,  "On Fire",          50,  "🔥", "ولعععع"),
+        (25,  "Unstoppable",      125, "🔥", "خلاص كفايه ولعة كدا"),
+        (50,  "Monster Streak",   300, "🔥", "💀 كفايه توليع يسطا"),
+        (60,  "Legendary Streak", 700, "🔥", "حد يتصل على المطافي"),
+    ],
+    "lectures_completed": [
+        (4,  "First Lecture",     25,  "📖", "هانت متقلقش أول يوم خلص أهو والأجازه قربت 🥹"),
+        (8,  "Student",           100, "📖", "Aaaand DOES... I mean DONE!"),
+        (15, "Scholar",           200, "📖", "💯 الدنيا بدأت توسع، بس أنت قدها"),
+        (25, "Professor",         350, "📖", "😏 دانت تشرحلنا الماده بقا"),
+        (50, "Walking Textbook",  700, "📖", "أنت مش هتسيب حاجة لباقي الدفعه؟"),
+    ],
+    "xp_levels": [
+        # xp_levels' own threshold is checked against xp directly for its
+        # first tier (First XP), then level for the rest — see the special
+        # case in _check_achievements.
+        (2000, "First XP",     0,   "⭐", "عبي يابا"),
+        (5,    "Level Up!",    50,  "⭐", "ما الدنيا حلوه أهي"),
+        (10,   "Rising Star",  100, "⭐", "دانا نسيبلك الطلعه دي بقا"),
+        (25,   "Powerhouse",   250, "⭐", "ربنا يعلي مراتبك يبني"),
+        (50,   "Legend",       500, "⭐", "مش سهلة دي خالي بالك"),
+        (100,  "Ascended",     1000, "⭐", "أنت قفلت البوت مش باقي غير تقفل المادة 😂"),
+    ],
+    "daily_quiz": [
+        (1,   "Daily Visitor", 25,  "📅", "أول يوم مدرسة أول يوم مدرسة!!"),
+        (7,   "Dedicated",     75,  "📅", "أسبوع بحاله، دانت رايق بقا"),
+        (30,  "Committed",     200, "📅", "الشهر خلص، وأنت لا 💪"),
+        (100, "Disciplined",   500, "📅", "الترم قرب يخلص، بس أن شاء الله تلحق تلم الدنيا"),
+        # {nick} -> the unlocking user's nickname, resolved at display
+        # time (see _personalize_ach_text) — this is the only tiered
+        # achievement whose *name* (not just quip) is personalized.
+        (200, "{nick} was here", 1500, "📅", "i was there when it was written!"),
+    ],
+    "daily_streak": [
+        (3,   "Three-Peat",       20,  "🔥", "تلاته - صفر لينا"),
+        (7,   "Week Warrior",     50,  "🔥", "a week isn't for the weak"),
+        (30,  "Monthly Machine",  150, "🔥", "أنت واخدها تحدي شخصي بقا"),
+        (50,  "determined",       400, "🔥", "أنت لسه عايش يا بلدينا؟"),
+        (100, "Unstoppable",      1000, "🔥", "ميه ميه 😎"),
+    ],
+    "achievement_collector": [
+        # A meta-category: its threshold is checked against the total
+        # number of OTHER achievements unlocked (every tiered category
+        # above + every unlocked extra — see _total_achievements_unlocked),
+        # not a normal analytics field. Every slot's xp_bonus is a permanent
+        # XP multiplier, not a one-time XP bonus — see the special case in
+        # _check_achievements and how _award_xp applies entry["xp_multiplier"].
+        # Tier 5 ("The Quizician") is appended below, right after
+        # EXTRA_ACHIEVEMENTS is defined, since its threshold has to equal
+        # the total count of every tier + extra that exists. Its quip uses
+        # {nick} too, same mechanism as daily_quiz's last tier above.
+        (5,  "Achievement Collector", 1.05, "🔍", "حلاوة البدايات"),
+        (10, "Achievement Collector", 1.10, "🔍", "عشرة فعين الحاسدين اللهم بارك 😤😤"),
+        (20, "Achievement Collector", 1.15, "🔍", "this"),
+        (30, "Achievement Collector", 1.20, "🔍", "You are making me 'tier' up 🥹"),
+    ],
+}
+
+# ── "Extras" — one-off achievements, not tiered thresholds ─────────
+# Each is (name, emoji, xp_bonus, description, quip). Unlocked state lives
+# in entry["achievements"]["extras"] as {key: True}, checked by bespoke
+# conditions at the relevant event (see _check_extra_achievement and its
+# call sites) rather than a single numeric stat. "curious" is checked by
+# _settings_customized/_maybe_award_curious — no dedicated tracker field,
+# just a live diff of the user's SETTINGS entry against
+# _blank_settings_entry() every time a preference toggle saves. It needs
+# every watched setting (all except Daily Notification / Zikr) to be
+# off its default at the same moment.
+EXTRA_ACHIEVEMENTS = {
+    "quick_thinker": ("Quick Thinker", "⚡️", 100, "خلصت محاضرة في أقل من 15 دقيقة",         "سرعة نبيهه ⚡️"),
+    "basmagy":       ("Basmagy",       "😎", 150, "خلصت الـ Daily Quiz في أقل من 60 ثانية بـ 100%", "قوة بصمجتك محتاجة تدرس"),
+    "perfect_run":   ("Perfect Run",   "💯", 100, "خلصت محاضرة كاملة بـ 100%",                "متكلمنيش عن البيرفكشونزم"),
+    "insomniac":     ("Insomniac",     "🌚", 75,  "خلصت كويز بين 2-5 الفجر",                  "النوم دا لضعفاء القلب 👊"),
+    "curious":       ("Curious",       "🧐", 50,  "غيّرت كل الإعدادات (غير الإشعارات والزكر) عن الوضع الافتراضي",                "هو أنت ديدي أخت ديكستر اللي بتتك على كل الزراير؟ 🤨"),
+}
+
+# "achievement_collector" tier 5 — "The Quizician" — only unlocks once
+# EVERY other achievement in the whole system (every tier in every other
+# category + every extra) has been unlocked. Computed here, right after
+# EXTRA_ACHIEVEMENTS exists, so the threshold always tracks the real total
+# instead of a hardcoded number that would silently drift the moment a
+# tier or extra is added/removed elsewhere in this file. Its quip's
+# {nick} is resolved to the unlocking user's own nickname at display time
+# — see _personalize_ach_text.
+_TOTAL_ACHIEVEMENTS_POSSIBLE = (
+    sum(len(tiers) for key, tiers in ACHIEVEMENTS.items() if key != "achievement_collector")
+    + len(EXTRA_ACHIEVEMENTS)
+)
+ACHIEVEMENTS["achievement_collector"].append((
+    _TOTAL_ACHIEVEMENTS_POSSIBLE, "The Quizician", 1.25, "🪄",
+    "you have become THE QUIZICIAN... The Creator sends you his kindest regards, "
+    "Thanks for quizzing along, Dr.{nick} ❤️",
+))
+
+LEVEL_TITLES = {
+    0:   "Beginner",
+    5:   "Active",
+    10:  "Pro",
+    15:  "Expert",
+    20:  "Master",
+    25:  "Sage",
+    30:  "Mythic",
+    40:  "Superhuman",
+    50:  "Genius",
+    60:  "Emperor of Quizzes",
+    70:  '"HIM"',
+    80:  "The star",
+    90:  "The Legend",
+    100: "The Quizician.",
+}
+
+def _level_title(level: int) -> str:
+    title = LEVEL_TITLES[0]
+    for threshold, t in LEVEL_TITLES.items():
+        if level >= threshold:
+            title = t
+    return title
+
+def _xp_to_level(xp: int) -> int:
+    """Inverts xp_needed(level) = A*level^2 + B*level for level, via the
+    quadratic formula (positive root only — level can't be negative),
+    then floors it. See LEVEL_CURVE_A/B for the tuning behind this, and
+    _level_xp_range for why thresholds are ceil'd — this function relies
+    on that ceiling to guarantee _xp_to_level(threshold) always lands
+    exactly on the right level. A tiny epsilon absorbs sqrt's own
+    floating-point rounding noise right at a threshold."""
+    import math
+    if xp <= 0:
+        return 0
+    a, b = LEVEL_CURVE_A, LEVEL_CURVE_B
+    level = (-b + math.sqrt(b ** 2 + 4 * a * xp)) / (2 * a)
+    return int(math.floor(level + 1e-9))
+
+def _level_xp_range(level: int) -> tuple[int, int]:
+    """(xp_start, xp_end) for this level. Ceils the formula's result
+    (which can be fractional, e.g. LEVEL_CURVE_A*1^2 + LEVEL_CURVE_B*1 =
+    552.5 for level 1) up to a whole number — XP awarded is always an
+    int, so a level's true threshold is the first whole XP value at or
+    above the formula's output, not a truncation of it."""
+    import math
+    def xp_needed(lvl: int) -> int:
+        return math.ceil(LEVEL_CURVE_A * lvl ** 2 + LEVEL_CURVE_B * lvl)
+    return xp_needed(level), xp_needed(level + 1)
+
+def _blank_entry() -> dict:
+    return {
+        "questions_created": 0,
+        "streak":            0,
+        "streak_best":       0,
+        "last_active_date":  None,
+        "lecture_questions_answered":   0,
+        "lecture_questions_correct":    0,
+        "lecture_questions_incorrect":  0,
+        "weekly_week":                  None, # start date (YYYY-MM-DD, Friday) of the week the two
+        "weekly_correct":               0,    # counters below belong to — see _record_weekly_answer.
+        "weekly_incorrect":             0,    # They reset lazily the first time a new week is seen.
+        "lecture_time_spent_seconds":   0.0,  # cumulative time-to-answer across every
+                                               # lecture question ever answered, timed
+                                               # question-delivered -> question-answered
+                                               # (or timed out). See _record_time_spent
+                                               # and the year leaderboard, which ranks
+                                               # by correct count first, this second.
+        "lecture_correct_streak_current": 0,
+        "lecture_correct_streak_best":    0,
+        "subject_stats":             {},  # {module: {subject: "correct/answered"}} — see
+                                            # _record_subject_answer / _send_mystats
+        "last_module":               None,  # module of the most recent answered question
+        "lectures_completed":        0,   # real (non-retake) lecture completions —
+                                            # see _finish_lecture_session. Backs the
+                                            # "lectures_completed" achievement category.
+        "daily_quizzes_completed":   0,   # Daily Quiz completions — see
+                                            # _advance_daily_quiz_session. Backs the
+                                            # "daily_quiz" achievement category.
+        "xp":                0,
+        "xp_multiplier":     1.0,   # global XP multiplier from the "achievement_collector"
+                                     # meta-achievement (see ACHIEVEMENTS/_award_xp) — applied
+                                     # to every XP award, this one included.
+        "level":             0,
+        "achievements":      {**{k: 0 for k in ACHIEVEMENTS}, "extras": {}},
+        "daily_medals":      {"gold": 0, "silver": 0, "bronze": 0},  # lifetime Daily Quiz
+                                                                       # leaderboard finishes —
+                                                                       # see _finalize_daily_leaderboard
+        "zikr_question_count": 0,   # running count of questions delivered since the last
+                                     # Zikr poll — see _maybe_send_zikr_poll / ZIKR_POLL_QUESTION_INTERVAL
+        "telegram_name":     None,   # full display name (first + last), Telegram side
+        "telegram_username": None,   # @handle, without the @, or None if not set
+        "nickname":          None,   # bot-side nickname (see SETTINGS/get_nickname) —
+                                      # duplicated here so the analytics backup is
+                                      # readable on its own without cross-referencing
+                                      # the settings backup.
+    }
+
+def _is_valid_analytics_entry(e) -> bool:
+    """A minimal shape check for one ANALYTICS[user_id] entry — not
+    "has every key" (see _get_entry's own setdefault backfill for that,
+    which already handles a schema that's grown fields over time), just
+    "is this a dict at all, and are the fields most read directly by
+    key (without going through _get_entry first) actually the right
+    type." Guards against the kind of corruption that isn't a missing
+    key but a wrong-shaped value entirely — e.g. a restore that hands
+    back a string or a list where a dict belongs."""
+    if not isinstance(e, dict):
+        return False
+    if "achievements" in e and not isinstance(e["achievements"], dict):
+        return False
+    if "daily_medals" in e and not isinstance(e["daily_medals"], dict):
+        return False
+    if "subject_stats" in e and not isinstance(e["subject_stats"], dict):
+        return False
+    for k in ("questions_created", "streak", "streak_best", "lecture_questions_answered",
+              "lecture_questions_correct", "lecture_questions_incorrect", "lecture_time_spent_seconds",
+              "lectures_completed", "daily_quizzes_completed", "xp", "xp_multiplier", "level"):
+        if k in e and not isinstance(e[k], (int, float)):
+            return False
+    return True
+
+def _clean_analytics_dict(raw: dict) -> dict:
+    """Filters a whole ANALYTICS-shaped dict ({user_id_str: entry}),
+    dropping any entry that fails _is_valid_analytics_entry. Used by both
+    load_analytics and restore_analytics_from_channel so a bad entry from
+    either source is caught the same way, before it can crash something
+    that reads a field directly off it."""
+    if not isinstance(raw, dict):
+        print(f"ANALYTICS: top-level data wasn't a dict ({type(raw).__name__}) — ignoring entirely.")
+        return {}
+    clean = {
+        k: v for k, v in raw.items()
+        if isinstance(k, str) and k.lstrip("-").isdigit() and _is_valid_analytics_entry(v)
+    }
+    if len(clean) != len(raw):
+        print(f"ANALYTICS: dropped {len(raw) - len(clean)} malformed entr(y/ies).")
+    return clean
+
+def load_analytics() -> dict:
+    if os.path.exists(ANALYTICS_FILE):
+        try:
+            with open(ANALYTICS_FILE, encoding="utf-8") as f:
+                raw = json.load(f)
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
+            print(f"ANALYTICS: couldn't load {ANALYTICS_FILE} ({type(e).__name__}: {e}) — using empty default.")
+            return {}
+        return _clean_analytics_dict(raw)
+    return {}
+
+async def save_analytics():
+    # deepcopy BEFORE handing off to the background thread: to_thread runs
+    # _atomic_write_json (and therefore json.dump, which iterates the
+    # whole structure) on a separate OS thread while the event loop keeps
+    # running — any coroutine that mutates ANALYTICS while that thread is
+    # mid-iteration (e.g. another user's answer landing at the same
+    # moment) races json.dump and can throw "dictionary changed size
+    # during iteration" or worse, write corrupt/partial JSON. A snapshot
+    # copy freezes what gets written; the live dict stays free to mutate.
+    await _write_json_serialized(
+        ANALYTICS_FILE, lambda: copy.deepcopy(ANALYTICS), indent=2, ensure_ascii=False)
+
+ANALYTICS: dict = load_analytics()
+
+# Message ID of the currently pinned analytics backup in ANALYTICS_GROUP_ID.
+# Populated on startup by restore_analytics_from_channel; the pin is the
+# source of truth — no separate state file needed.
+_analytics_backup_msg_id: int | None = None
+
+# Throttle for backup_analytics_to_channel — the channel mirror (upload +
+# pin + delete-old-pin, three Telegram calls) gets debounced, since callers
+# like lecture-answer XP can fire dozens of times a minute and would
+# otherwise risk hitting Telegram's rate limits.
+_last_analytics_backup_at: float = 0.0
+ANALYTICS_BACKUP_MIN_INTERVAL = 30  # seconds
+
+# ── Local-disk debounce for the hot answer path ──────────────────
+# save_analytics() itself (deepcopy + atomic write of the WHOLE file, every
+# user's entry, not just the one who just answered) is still called
+# directly — and immediately — from low-frequency call sites (restore,
+# reset/import, nickname changes): those need the file on disk to be
+# correct right away and don't fire often enough for the cost to matter.
+#
+# The three poll-answer advance functions (_advance_lecture_session,
+# _advance_daily_quiz_session, _advance_mistakes_retake_session) are
+# different: they're the single hottest path in the bot, firing on every
+# answered question from every active user. Calling the real save_analytics()
+# there means every answer pays for a full-file deepcopy + fsync'd write,
+# scaling with total user count, not with "one answer." Those three now
+# call _mark_analytics_dirty() instead — an O(1) flag set, no I/O — and a
+# periodic job (_flush_analytics_job, registered in _post_init) does the
+# real save every ANALYTICS_FLUSH_INTERVAL seconds if anything changed.
+#
+# Data-loss window: a hard crash (not a clean restart/shutdown — see
+# _post_shutdown) between flushes can lose up to one interval's worth of
+# analytics deltas. 60s is deliberately much shorter than the 300s channel
+# backup already tolerates, so this isn't a new category of risk, just a
+# smaller version of one already accepted elsewhere in this file.
+_analytics_dirty: bool = False
+ANALYTICS_FLUSH_INTERVAL = 60  # seconds
+
+def _mark_analytics_dirty() -> None:
+    global _analytics_dirty
+    _analytics_dirty = True
+
+async def _flush_analytics_if_dirty() -> None:
+    """Writes ANALYTICS to disk only if something changed since the last
+    flush. Called by the periodic job and by _post_shutdown for a final
+    flush on clean exit."""
+    global _analytics_dirty
+    if not _analytics_dirty:
+        return
+    _analytics_dirty = False
+    await save_analytics()
+
+def _today() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+def _get_entry(user_id: int) -> dict:
+    key   = str(user_id)
+    entry = ANALYTICS.setdefault(key, _blank_entry())
+    # backfill missing keys for users created before this system
+    if "streak_best" not in entry:
+        # streak_best is new — backfill from their current streak (not 0)
+        # so an existing user with an active streak doesn't look like
+        # they've never had one; there's no historical data to do better.
+        entry["streak_best"] = entry.get("streak", 0)
+    for k, v in _blank_entry().items():
+        entry.setdefault(k, v)
+    if not isinstance(entry.get("achievements"), dict):
+        entry["achievements"] = {k: 0 for k in ACHIEVEMENTS}
+    for k in ACHIEVEMENTS:
+        entry["achievements"].setdefault(k, 0)
+    if not isinstance(entry["achievements"].get("extras"), dict):
+        entry["achievements"]["extras"] = {}
+    if not isinstance(entry.get("subject_stats"), dict):
+        entry["subject_stats"] = {}
+    if not isinstance(entry.get("daily_medals"), dict):
+        entry["daily_medals"] = {"gold": 0, "silver": 0, "bronze": 0}
+    for k in ("gold", "silver", "bronze"):
+        entry["daily_medals"].setdefault(k, 0)
+    return entry
+
+def _record_subject_answer(entry: dict, module: str | None, subject: str | None, is_correct: bool) -> None:
+    """Bumps this user's per-subject tally for one answered question and
+    remembers which module it was in (entry["last_module"]).
+
+    Stored as {module: {subject: "correct/answered"}} — a short string
+    rather than a [correct, answered] list, because analytics.json is
+    written with indent=2 and a JSON list expands to four lines per
+    subject; the string stays on one line, which keeps the file (and the
+    channel backup document) noticeably smaller across thousands of users.
+
+    Silently ignores a missing module/subject (legacy sessions, or a
+    session shape that never carried them) rather than raising — this
+    sits on the hot path of every answered question and must never be
+    able to break someone's quiz flow."""
+    if not module or not subject:
+        return
+    stats = entry.setdefault("subject_stats", {})
+    subj_map = stats.setdefault(module, {})
+    correct, answered = _parse_subject_stat(subj_map.get(subject))
+    subj_map[subject] = f"{correct + (1 if is_correct else 0)}/{answered + 1}"
+    entry["last_module"] = module
+
+def _parse_subject_stat(value) -> tuple[int, int]:
+    """'88/120' -> (88, 120). Anything malformed -> (0, 0) so one bad
+    value from a restore can't crash /mystats or the answer path."""
+    try:
+        c, a = str(value).split("/", 1)
+        c, a = int(c), int(a)
+        if 0 <= c <= a:
+            return c, a
+    except (ValueError, TypeError):
+        pass
+    return 0, 0
+
+def _current_module_for_stats(entry: dict) -> str | None:
+    """The module /mystats reports on: the admin-set /daily_module scope
+    when there is one (that's the module currently being taught), else the
+    module of the user's own most recent answer, else None."""
+    scope = get_daily_quiz_scope()
+    if scope and scope.get("module"):
+        return scope["module"]
+    return entry.get("last_module")
+
+def _subject_ranking(entry: dict, module: str | None) -> list[tuple[str, float, int, int]]:
+    """[(subject, pct, correct, answered), ...] for `module`, strongest
+    first. Ties on percentage break toward MORE answered questions (a
+    90% over 200 questions is more trustworthy than a 90% over 10), then
+    alphabetically so the order is stable between /mystats calls.
+    Subjects with zero answers are omitted."""
+    if not module:
+        return []
+    rows = []
+    for subject, value in entry.get("subject_stats", {}).get(module, {}).items():
+        correct, answered = _parse_subject_stat(value)
+        if answered:
+            rows.append((subject, correct / answered * 100, correct, answered))
+    rows.sort(key=lambda r: (-r[1], -r[3], r[0]))
+    return rows
+
+def _record_time_spent(user_id: int, seconds: float | None) -> None:
+    """Adds to a user's cumulative lecture_time_spent_seconds — see the
+    field's own comment in _blank_entry for what it measures and why.
+    Silently ignores None/negative/absurd values (clock skew, a session
+    that somehow never recorded a delivery time) rather than letting one
+    bad reading corrupt a running total that can never be un-summed."""
+    if seconds is None or seconds < 0 or seconds > 3600:
+        return
+    entry = _get_entry(user_id)
+    entry["lecture_time_spent_seconds"] = entry.get("lecture_time_spent_seconds", 0.0) + seconds
+    _mark_analytics_dirty()
+
+def _format_duration(seconds: float) -> str:
+    """1234.5 -> '20m 34s' (or just '34s' under a minute) — used on the
+    year leaderboard next to each user's correct count."""
+    total = int(seconds)
+    m, s = divmod(total, 60)
+    return f"{m}m {s}s" if m else f"{s}s"
+
+YEAR_LEADERBOARD_PAGE_SIZE = 20   # rows per page of the global (year_leaderboard) view
+
+def _year_leaderboard(year_class: str, limit: int = 100) -> list[dict]:
+    """Top users in one Year/Class cohort (SETTINGS' year_class — see the
+    onboarding question, NOT the quiz-browsing YEARS), ranked by all-time
+    lecture_questions_correct first (highest first), then by accuracy
+    (correct / (correct + incorrect), highest first) as the tiebreaker.
+    Only counts users who've actually set a Year/Class — that's the whole
+    filter, since ANALYTICS itself isn't year-scoped, SETTINGS is."""
+    rows = []
+    for uid_str, entry in ANALYTICS.items():
+        if not (isinstance(uid_str, str) and uid_str.lstrip("-").isdigit()):
+            continue   # not a real Telegram user id — corrupted/stray key, skip rather than crash
+        uid = int(uid_str)
+        if get_year_class(uid) != year_class:
+            continue
+        correct = entry.get("lecture_questions_correct", 0)
+        if correct <= 0:
+            continue   # no lecture activity yet — nothing to rank
+        incorrect = entry.get("lecture_questions_incorrect", 0)
+        answered  = correct + incorrect
+        accuracy  = (correct / answered * 100) if answered else 0.0
+        rows.append({
+            "user_id":  uid,
+            "name":     get_nickname(uid) or entry.get("telegram_name") or f"مستخدم #{uid % 10000}",
+            "correct":  correct,
+            "accuracy": accuracy,
+        })
+    rows.sort(key=lambda r: (-r["correct"], -r["accuracy"]))
+    return rows[:limit]
+
+# ── Weekly leaderboard ─────────────────────────────────────────────
+# Same ranking rule as the global board (correct answers first, accuracy as
+# the tiebreaker), but counting only answers given since the last reset.
+# The week runs Friday 00:00 -> next Friday 00:00 (the midnight between
+# Thursday and Friday) in DAILY_QUIZ_TZ (Cairo). No scheduled job: each
+# analytics entry remembers which week its weekly_* counters belong to
+# ("weekly_week" = that week's Friday date); the first answer recorded in a
+# new week zeroes them, and the leaderboard ignores anyone whose counters
+# still belong to an older week. Answers are counted at exactly the same
+# four places lecture_questions_correct/incorrect are (lecture, Daily Quiz,
+# Mistakes retake, Bookmarks retake) via _record_weekly_answer.
+WEEKLY_RESET_WEEKDAY = 4   # Monday=0 ... Friday=4
+
+def _weekly_window(now: datetime | None = None) -> tuple[str, datetime]:
+    """(week_key, next_reset) for `now` (default: right now, Cairo time).
+    week_key is the current week's Friday date as YYYY-MM-DD."""
+    now = now or datetime.now(DAILY_QUIZ_TZ)
+    days_since = (now.weekday() - WEEKLY_RESET_WEEKDAY) % 7
+    start = (now - timedelta(days=days_since)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return start.date().isoformat(), start + timedelta(days=7)
+
+def _record_weekly_answer(entry: dict, is_correct: bool) -> None:
+    """Counts one answered question toward this user's current week."""
+    week, _ = _weekly_window()
+    if entry.get("weekly_week") != week:
+        entry["weekly_week"]      = week
+        entry["weekly_correct"]   = 0
+        entry["weekly_incorrect"] = 0
+    if is_correct:
+        entry["weekly_correct"] = entry.get("weekly_correct", 0) + 1
+    else:
+        entry["weekly_incorrect"] = entry.get("weekly_incorrect", 0) + 1
+
+def _weekly_reset_countdown() -> str:
+    """'3 يوم و 5 ساعة' style time left until the next Friday-midnight reset."""
+    now = datetime.now(DAILY_QUIZ_TZ)
+    _, next_reset = _weekly_window(now)
+    secs = max(0, int(next_reset.timestamp() - now.timestamp()))
+    days, rem = divmod(secs, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    if days:
+        return f"{days} يوم و {hours} ساعة"
+    if hours:
+        return f"{hours} ساعة و {minutes} دقيقة"
+    return f"{max(minutes, 1)} دقيقة"
+
+def _weekly_leaderboard(year_class: str, limit: int = 100) -> list[dict]:
+    """Top users of one Year/Class cohort this week, ranked by this week's
+    correct answers (then accuracy). Each row also carries the user's
+    current level and level title for display."""
+    week, _ = _weekly_window()
+    rows = []
+    for uid_str, entry in ANALYTICS.items():
+        if not (isinstance(uid_str, str) and uid_str.lstrip("-").isdigit()):
+            continue
+        uid = int(uid_str)
+        if get_year_class(uid) != year_class:
+            continue
+        if entry.get("weekly_week") != week:
+            continue   # last counted in an older week — effectively reset
+        correct = entry.get("weekly_correct", 0)
+        if correct <= 0:
+            continue
+        answered = correct + entry.get("weekly_incorrect", 0)
+        level = entry.get("level", 0)
+        rows.append({
+            "user_id":  uid,
+            "name":     get_nickname(uid) or entry.get("telegram_name") or f"مستخدم #{uid % 10000}",
+            "correct":  correct,
+            "accuracy": (correct / answered * 100) if answered else 0.0,
+            "level":    level,
+            "title":    _level_title(level),
+        })
+    rows.sort(key=lambda r: (-r["correct"], -r["accuracy"]))
+    return rows[:limit]
+
+def _update_telegram_name(user_id: int, tg_user) -> None:
+    """Keeps the Telegram display name/username (and bot nickname) on the
+    analytics entry fresh — people rename themselves on Telegram all the
+    time, so this just overwrites rather than only filling blanks. tg_user
+    is a telegram.User (update.effective_user); no-ops if that's missing."""
+    if tg_user is None:
+        return
+    name = " ".join(p for p in (tg_user.first_name, tg_user.last_name) if p).strip() or None
+    entry = _get_entry(user_id)
+    entry["telegram_name"]     = name
+    entry["telegram_username"] = tg_user.username or None
+    entry["nickname"]          = get_nickname(user_id)
+
+def _award_xp(entry: dict, amount: int) -> int:
+    """Add XP (scaled by the "achievement_collector" meta-achievement's
+    xp_multiplier, if unlocked — see ACHIEVEMENTS), recalculate level.
+    Returns new level if levelled up, else 0. The multiplier applies here
+    at the single choke point every XP award already goes through, so
+    every caller (raw actions, lecture/daily-quiz answers, other
+    achievements' own XP bonuses) benefits automatically without needing
+    its own awareness of it."""
+    scaled = round(amount * entry.get("xp_multiplier", 1.0))
+    entry["xp"] += scaled
+    new_level    = _xp_to_level(entry["xp"])
+    levelled_up  = new_level > entry["level"]
+    entry["level"] = new_level
+    return new_level if levelled_up else 0
+
+def _total_achievements_unlocked(entry: dict) -> int:
+    """Count of every unlocked tier across every OTHER tiered category
+    (excluding achievement_collector itself — it can't count toward its
+    own threshold) plus every unlocked Extra. Backs the
+    "achievement_collector" meta-achievement's own threshold check."""
+    ach = entry.get("achievements", {})
+    tiers_unlocked = sum(v for k, v in ach.items() if k in ACHIEVEMENTS and k != "achievement_collector")
+    extras_unlocked = sum(1 for v in ach.get("extras", {}).values() if v)
+    return tiers_unlocked + extras_unlocked
+
+def _personalize_ach_text(text: str, user_id: int) -> str:
+    """Substitutes the literal "{nick}" token some achievement
+    names/quips use (daily_quiz's last tier, achievement_collector's
+    tier 5 quip) with the user's own nickname. A no-op for every other
+    achievement, which contains no such token. Call this on any
+    name/quip right before it's actually shown to someone — the
+    definitions in ACHIEVEMENTS/EXTRA_ACHIEVEMENTS stay generic strings,
+    not per-user values."""
+    if "{nick}" not in text:
+        return text
+    return text.replace("{nick}", get_nickname(user_id) or "حد ما")
+
+def _check_achievements(entry: dict, stat_key: str) -> list[dict]:
+    """Check one stat against its achievement tiers. Returns list of newly
+    unlocked tiers as dicts with keys: name, emoji, xp_bonus, tier, quip
+    (1-based, tier counts vary by category — see ACHIEVEMENTS). name/quip
+    may still contain an unresolved "{nick}" token — see
+    _personalize_ach_text, applied by callers right before display.
+
+    Special cases:
+    - "xp_levels" mixes two fields — its first tier (First XP) checks raw
+      xp, every tier after that checks level.
+    - "achievement_collector" checks _total_achievements_unlocked(entry)
+      instead of any ACHIEVEMENT_STAT_FIELD entry, and its 4th tuple slot
+      is a permanent XP multiplier (entry["xp_multiplier"]) rather than a
+      one-time XP bonus — no _award_xp call for this category, and
+      "xp_bonus" in the returned dict holds the new multiplier instead,
+      alongside "prev_multiplier" (the value it just replaced, for
+      announcing the increase — see _announce_events, which renders this
+      category differently).
+    Every other category checks a single field throughout, per
+    ACHIEVEMENT_STAT_FIELD."""
+    tiers    = ACHIEVEMENTS[stat_key]
+    current  = entry["achievements"][stat_key]
+    unlocked = []
+    if stat_key != "achievement_collector":
+        field = ACHIEVEMENT_STAT_FIELD.get(stat_key, stat_key)
+    for i, (threshold, name, xp_bonus, emoji, quip) in enumerate(tiers):
+        tier = i + 1
+        if tier <= current:
+            continue
+        if stat_key == "achievement_collector":
+            value = _total_achievements_unlocked(entry)
+        elif stat_key == "xp_levels" and i == 0:
+            value = entry.get("xp", 0)
+        else:
+            value = entry.get(field, 0)
+        if value >= threshold:
+            entry["achievements"][stat_key] = tier
+            if stat_key == "achievement_collector":
+                prev_multiplier = entry.get("xp_multiplier", 1.0)
+                entry["xp_multiplier"] = xp_bonus   # permanent multiplier, not a one-time bonus
+                unlocked.append({"name": name, "emoji": emoji, "quip": quip,
+                                  "xp_bonus": xp_bonus, "prev_multiplier": prev_multiplier,
+                                  "tier": tier, "multiplier": True})
+            else:
+                unlocked.append({"name": name, "emoji": emoji, "quip": quip,
+                                  "xp_bonus": xp_bonus, "tier": tier})
+                _award_xp(entry, xp_bonus)
+        else:
+            break   # tiers are ordered — no point checking higher ones
+    return unlocked
+
+def _check_extra_achievement(entry: dict, key: str) -> dict | None:
+    """Awards a one-off EXTRA_ACHIEVEMENTS entry if not already unlocked.
+    Returns the same shape _check_achievements' list entries use (name,
+    emoji, xp_bonus, tier, quip) so _announce_events can treat both the
+    same way — tier is always 1 here (extras aren't leveled) with no ⭐
+    shown (see _announce_events). Callers are expected to have already
+    checked the actual unlock condition; this only handles the "already
+    have it" guard + bookkeeping + XP."""
+    extras = entry["achievements"].setdefault("extras", {})
+    if extras.get(key):
+        return None
+    name, emoji, xp_bonus, _desc, quip = EXTRA_ACHIEVEMENTS[key]
+    extras[key] = True
+    _award_xp(entry, xp_bonus)
+    return {"name": name, "emoji": emoji, "xp_bonus": xp_bonus, "tier": 1, "extra": True, "quip": quip}
+
+# Preference toggles that count as "poking around in Settings" for the
+# "Curious" extra — deliberately excludes nickname/year_class, which
+# onboarding requires from everyone and so say nothing about curiosity.
+# Every Settings button that has a default state EXCEPT Daily Notification
+# and Hourly Zikr (those two are opt-out reminders, not preferences about
+# how quizzing itself behaves). "Curious" needs ALL of these off their
+# default at the same time — see _settings_customized. Edit Nickname isn't
+# listed: onboarding forces everyone to set one, so it has no "default".
+_CURIOUS_WATCHED_SETTINGS = (
+    "reactions", "auto_next", "randomize", "achievement_notifs",
+    "spaced_repetition", "question_timer",
+)
+
+def _settings_customized(user_id: int) -> bool:
+    """True only while EVERY _CURIOUS_WATCHED_SETTINGS toggle is away from
+    its default at the same time. It's a live check, not a running tally:
+    flipping one back to its default makes this False again, so a user
+    has to reach the state where all of them differ at once. No dedicated
+    tracker field for this — just diffs the live SETTINGS entry against a
+    fresh _blank_settings_entry() on demand, which is why it's only ever
+    worth calling right after a settings mutation (see
+    _maybe_award_curious) rather than on some schedule. The achievement
+    itself stays unlocked once awarded (see _check_extra_achievement)."""
+    entry   = SETTINGS.get(str(user_id), {})
+    default = _blank_settings_entry()
+    return all(entry.get(k, default[k]) != default[k] for k in _CURIOUS_WATCHED_SETTINGS)
+
+async def _maybe_award_curious(context, user_id: int) -> None:
+    """Call right after any of the _CURIOUS_WATCHED_SETTINGS toggles
+    below save. Awards "Curious" (mutates the ANALYTICS entry via
+    _get_entry — a different dict than the SETTINGS one
+    _settings_customized reads, hence _mark_analytics_dirty rather than
+    a settings save here) the moment ALL of a user's watched settings
+    differ from default at once, then announces it immediately since a
+    Settings tap is already an interactive moment, same as any other
+    achievement."""
+    if not _settings_customized(user_id):
+        return
+    ach = _check_extra_achievement(_get_entry(user_id), "curious")
+    if ach:
+        _mark_analytics_dirty()
+        await _announce_events(context, user_id, {"achievements": [ach], "level_up": 0})
+
+async def _record_activity(user_id: int, questions_delta: int = 0,
+                     persist: bool = True) -> dict:
+    """Update all stats. Returns dict of events for the caller to announce:
+    { "achievements": [...], "level_up": int | 0 }
+
+    persist=False skips the save_analytics() call at the end — for callers
+    (the three poll-answer advance functions) that go on to mutate the
+    entry further and call save_analytics() themselves right after, so the
+    whole ANALYTICS dict doesn't get deep-copied and written to disk twice
+    for the same answer."""
+    from datetime import datetime, timezone, timedelta
+    today  = _today()
+    entry  = _get_entry(user_id)
+    last   = entry.get("last_active_date")
+
+    # ── streak ───────────────────────────────────────────────
+    if last != today:
+        yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+        entry["streak"] = (entry["streak"] + 1) if last == yesterday else 1
+        entry["last_active_date"] = today
+        if entry["streak"] > entry.get("streak_best", 0):
+            entry["streak_best"] = entry["streak"]
+
+    # ── counters ─────────────────────────────────────────────
+    entry["questions_created"] += questions_delta
+
+    # ── XP for raw actions ───────────────────────────────────
+    xp_earned = questions_delta * XP_PER_QUESTION
+    new_level  = _award_xp(entry, xp_earned) if xp_earned else 0
+
+    # ── achievement checks ───────────────────────────────────
+    newly_unlocked = []
+    newly_unlocked += _check_achievements(entry, "daily_streak")
+    newly_unlocked += _check_achievements(entry, "achievement_collector")
+
+    # level-up might also happen from achievement XP bonuses
+    final_level = _xp_to_level(entry["xp"])
+    if final_level > entry["level"]:
+        entry["level"] = final_level
+        new_level = final_level
+
+    if persist:
+        await save_analytics()
+    return {"achievements": newly_unlocked, "level_up": new_level}
+
+async def _announce_events(context, chat_id: int, events: dict, settings_uid: int | None = None):
+    """Send achievement unlocks and level-up notifications to chat_id.
+    settings_uid is whose achievement_notifs setting to check (and whose
+    nickname any "{nick}" token in a name/quip resolves to — see
+    _personalize_ach_text); defaults to chat_id itself. Level-ups are a
+    separate, more significant event and always sent regardless."""
+    if settings_uid is None:
+        settings_uid = chat_id
+    msgs = []
+
+    if get_achievement_notifs_enabled(settings_uid):
+        for ach in events.get("achievements", []):
+            name = _personalize_ach_text(ach["name"], settings_uid)
+            quip = _personalize_ach_text(ach.get("quip", ""), settings_uid)
+            if ach.get("multiplier"):
+                prev = ach.get("prev_multiplier", 1.0)
+                msgs.append(
+                    f"{ach['emoji']} <b>إنجاز جديد!</b>\n"
+                    f"<b>{name}</b>\n"
+                    f"<i>XP Multiplier: x{prev:g} → x{ach['xp_bonus']:g}</i>\n"
+                    f"<i>{quip}</i>"
+                )
+                continue
+            stars = "" if ach.get("extra") else (" " + "⭐" * ach["tier"])
+            msgs.append(
+                f"{ach['emoji']} <b>إنجاز جديد!</b>\n"
+                f"<b>{name}</b>{stars}\n"
+                f"<i>+{ach['xp_bonus']} XP</i>\n"
+                f"<i>{quip}</i>"
+            )
+
+    if events.get("level_up"):
+        lvl   = events["level_up"]
+        title = _level_title(lvl)
+        msgs.append(
+            f"🎉 <b>ترقية!</b>\n"
+            f"وصلت للمستوى <b>{lvl}</b> — <i>{title}</i>"
+        )
+
+    for msg in msgs:
+        await context.bot.send_message(
+            chat_id=chat_id, text=msg, parse_mode=ParseMode.HTML
+        )
+
+RESTORE_MAX_ATTEMPTS      = 3   # attempts before giving up on a startup restore
+RESTORE_RETRY_DELAY_BASE  = 4   # seconds; multiplied by attempt number (4s, then 8s)
+
+# Whether each system's channel restore succeeded this run. False blocks
+# that system's backup_*_to_channel from firing — if the restore never
+# got the real data locally, we must NOT let a later backup push a
+# fresh/empty local file over the good backup still sitting in the
+# channel. Fixed by a restart once the underlying Telegram/network issue
+# clears (or manually via /restore_analytics etc. for analytics).
+RESTORE_OK = {"analytics": True, "settings": True, "storage": True, "lecture_results": True, "mistakes_bank": True, "report_threads": True, "sessions": True}
+RESTORE_OK.update({f"quiz_{y}": True for y in YEARS})  # one flag per year's quiz index
+
+class _RestoreNoBackup(Exception):
+    """Raised by a restore _do() when the channel has nothing pinned at
+    all, or what's pinned isn't this system's backup (no document, or
+    caption doesn't match the marker). Not a failure — local data is
+    left exactly as it was and is still trusted (RESTORE_OK stays
+    True). Distinguished from other exceptions so the retry loop
+    doesn't burn attempts on it, and so /restore's button flow can
+    offer a reset (create a fresh file) instead of showing an error."""
+    pass
+
+
+class _RestoreInvalidArchitecture(Exception):
+    """Raised by a restore _do() when a pinned backup WAS found and
+    downloaded, but its parsed JSON doesn't match the shape this
+    system expects (wrong top-level type, missing keys, entries that
+    don't look like real records, etc). Local data and the local file
+    are left untouched — we never partially apply a backup that might
+    be corrupted or from the wrong system."""
+    pass
+
+
+async def _run_restore_with_retries(app, key: str, label: str, do_restore, not_found_hint: str | None = None) -> str:
+    """Runs do_restore() (an async no-arg callable doing the actual
+    get_chat/get_file/parse work for one system) up to
+    RESTORE_MAX_ATTEMPTS times with a short backoff between attempts —
+    these failures are almost always a transient Telegram API timeout,
+    so a couple retries clear most of them without ever bothering the
+    admin. Only if every attempt fails do we DM the admin and mark this
+    system unsynced for the session (see RESTORE_OK).
+
+    Returns a short status string so callers (like /restore's button
+    flow) can react differently depending on what happened:
+      "ok"        — restored successfully.
+      "no_backup" — nothing pinned to restore from; local data untouched.
+      "invalid"   — a pinned backup exists but failed the architecture
+                    check; local data untouched, admin notified.
+      "error"     — every attempt raised a real (unexpected) error;
+                    local data untouched, admin notified.
+    """
+    for attempt in range(1, RESTORE_MAX_ATTEMPTS + 1):
+        try:
+            await do_restore()
+            RESTORE_OK[key] = True
+            return "ok"
+        except _RestoreNoBackup:
+            return "no_backup"
+        except _RestoreInvalidArchitecture as e:
+            print(f"{label.upper()} RESTORE ERROR — pinned backup failed the architecture check, refusing to restore:", e)
+            RESTORE_OK[key] = False
+            await _notify_admin_sync_failure(
+                app, label,
+                f"a pinned backup was found but its structure looks wrong, so nothing was restored: {e}",
+            )
+            return "invalid"
+        except Exception as e:
+            hint = not_found_hint if (not_found_hint and "chat not found" in str(e).lower()) else None
+            print(f"{label.upper()} RESTORE ERROR (attempt {attempt}/{RESTORE_MAX_ATTEMPTS}):", hint or e)
+            if attempt < RESTORE_MAX_ATTEMPTS:
+                await asyncio.sleep(RESTORE_RETRY_DELAY_BASE * attempt)
+            else:
+                RESTORE_OK[key] = False
+                await _notify_admin_sync_failure(app, label, hint or e)
+                return "error"
+    return "error"
+
+async def _notify_admin_sync_failure(app, what: str, error):
+    """Best-effort DM to ADMIN_ID once every retry has been exhausted.
+    Never raises — this runs inside _post_init, and a failure here (bot
+    blocked, admin never DM'd it, etc.) must not crash startup."""
+    if not ADMIN_ID:
+        return
+    try:
+        await app.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=(
+                f"<pre>{html.escape(QUIZZY_SAD_ART)}</pre>"
+                f"⚠️ <b>Error: failed to fetch {html.escape(what)} — try again later.</b>\n"
+                f"<code>{html.escape(str(error))}</code>\n\n"
+                f"Gave up after {RESTORE_MAX_ATTEMPTS} attempts. Local data was left as-is — "
+                f"I won't touch or re-save the {html.escape(what.lower())} file(s), and I won't "
+                f"push a new backup to the channel either, so nothing gets overwritten. "
+                f"Restart me once things look stable to retry."
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as notify_err:
+        print(f"ADMIN SYNC-FAILURE NOTIFY ERROR ({what}):", notify_err)
+
+async def backup_analytics_to_channel(context):
+    global _analytics_backup_msg_id, _last_analytics_backup_at
+    if not ANALYTICS_GROUP_ID:
+        return
+    if not RESTORE_OK["analytics"]:
+        print("ANALYTICS BACKUP SKIPPED — last restore failed, refusing to overwrite the channel backup.")
+        return
+    now = time.monotonic()
+    if now - _last_analytics_backup_at < ANALYTICS_BACKUP_MIN_INTERVAL:
+        return   # backed up recently enough — local save_analytics() already has the latest data
+    _last_analytics_backup_at = now
+    data = json.dumps(ANALYTICS, indent=2).encode("utf-8")
+    try:
+        sent = await context.bot.send_document(
+            chat_id=ANALYTICS_GROUP_ID,
+            document=InputFile(BytesIO(data), filename=_backup_filename("analytics.json")),
+            caption=ANALYTICS_BACKUP_MARKER,
+        )
+    except Exception as e:
+        print("ANALYTICS BACKUP ERROR:", e)
+        return
+    try:
+        await context.bot.pin_chat_message(
+            chat_id=ANALYTICS_GROUP_ID,
+            message_id=sent.message_id,
+            disable_notification=True,
+        )
+    except Exception as e:
+        print("ANALYTICS PIN ERROR:", e)
+    # Previous backups are no longer deleted — every one ever taken stays
+    # in the channel, timestamped, so /restore can offer a choice and a
+    # bad backup never wipes out the only copy of a good one. The pin
+    # just moves to the newest; nothing else needs to change here.
+    _analytics_backup_msg_id = sent.message_id
+
+async def restore_analytics_from_channel(app) -> str:
+    global _analytics_backup_msg_id
+    if not ANALYTICS_GROUP_ID:
+        return "not_configured"
+
+    async def _do():
+        global _analytics_backup_msg_id
+        chat   = await app.bot.get_chat(ANALYTICS_GROUP_ID)
+        pinned = chat.pinned_message
+        if not pinned or not pinned.document or (pinned.caption or "") != ANALYTICS_BACKUP_MARKER:
+            raise _RestoreNoBackup()
+        tg_file = await app.bot.get_file(pinned.document.file_id)
+        raw     = await tg_file.download_as_bytearray()
+        restored = json.loads(bytes(raw).decode("utf-8"))
+        if not isinstance(restored, dict) or not all(isinstance(v, dict) for v in restored.values()):
+            raise _RestoreInvalidArchitecture('expected a JSON object mapping user_id -> stats dict')
+        ANALYTICS.update(_clean_analytics_dict(restored))
+        await save_analytics()
+        _analytics_backup_msg_id = pinned.message_id
+        print(f"Restored analytics: {len(ANALYTICS)} user(s).")
+
+    return await _run_restore_with_retries(app, "analytics", "Analytics", _do)
+
+
+
+# ═══════════════════════════════════════════════════════════════
+# SETTINGS — per-user personalization (nickname, etc.)
+#
+# settings.json schema per user:
+# {
+#   "nickname":   str | None,
+#   "reactions":  bool,  # emoji reactions on submitted quiz questions
+#   "auto_next":  bool,  # sends lecture questions one by one, waiting for
+#                        # each answer, instead of all at once
+#   "randomize":  bool,  # shuffles question order within a lecture
+#   "achievement_notifs": bool,  # DMs a message when an achievement unlocks
+#                                # (level-up messages are separate and always sent)
+#   "year_class": str | None,  # one of YEAR_CLASS_NUMBER's keys ("y1"/"y2"/"y3") —
+#                              # asked once during onboarding, editable later
+#                              # in Settings. Not the quiz year picker (YEARS) —
+#                              # this is who the person is, for future features
+#                              # that need to know their class/cohort.
+#   "daily_quiz_last_date": str | None,  # "YYYY-MM-DD" — once-per-day gate for
+#                                        # the 💥Daily Quiz💥 button
+# }
+#
+# Mirrors the ANALYTICS system exactly: local JSON file, plus a pinned
+# backup in SETTINGS_GROUP_ID that gets replaced (upload + pin + delete
+# old pin) on every change and restored from on startup.
+# ═══════════════════════════════════════════════════════════════
+SETTINGS_FILE          = "settings.json"
+SETTINGS_BACKUP_MARKER = "⚙️ QUIZICIAN_SETTINGS_BACKUP"
+
+# Class numbers per academic year, for the onboarding "which year/class are
+# you in?" question. Keyed the same as YEARS ("y1"/"y2"/"y3") so this can
+# reuse year_label() for display, but kept as its own dict since a person's
+# class/cohort is who they are, not which quiz year they're browsing right
+# now — those happen to share y1/y2/y3 today but are conceptually separate.
+YEAR_CLASS_NUMBER = {
+    "y1": 46,
+    "y2": 45,
+    "y3": 44,
+}
+
+def _blank_settings_entry() -> dict:
+    return {
+        "nickname":  None,
+        "reactions": True,
+        "auto_next": True,
+        "randomize": True,
+        "mix_written": False,   # False (default): written entries always trail at the
+                                 # end of the lecture, even with randomize on. True:
+                                 # written entries are shuffled in among the poll
+                                 # questions instead — see get_mix_written_enabled.
+        "achievement_notifs": True,
+        "spaced_repetition": True,   # see get_spaced_repetition_enabled below
+        "question_timer": 0,   # seconds a live quiz poll stays open before
+                                # auto-closing; 0 = off. Cycles 0 -> 60 -> 30 -> 0.
+        "year_class": None,    # "y1"/"y2"/"y3" — see YEAR_CLASS_NUMBER above
+        "daily_quiz_last_date": None,   # "YYYY-MM-DD" (UTC) of the last completed Daily Quiz
+        "daily_notifs": True,   # the 2pm 💥Daily Quiz💥 push — see get_daily_notifs_enabled
+        "zikr_reminders": True,   # Zikr poll every N questions — see get_zikr_enabled / _maybe_send_zikr_poll.
+                                    # On by default; opt out via Settings -> More Settings -> Zikr.
+        "banned_until": None,   # epoch seconds (time.time()) this user's /ban lifts at, or None if not
+                                 # currently banned — see /ban (ban_cmd), get_ban_info, _ban_gate.
+        "ban_reason":   None,   # reason string from their most recent /ban (kept after it lifts too).
+    }
+
+def load_settings() -> dict:
+    return _load_json_safe(SETTINGS_FILE, dict, dict, "SETTINGS")
+
+async def save_settings():
+    # See save_analytics for why this snapshot copy is required, not
+    # just defensive style — same to_thread-races-live-mutation risk.
+    await _write_json_serialized(
+        SETTINGS_FILE, lambda: copy.deepcopy(SETTINGS), indent=2, ensure_ascii=False)
+
+SETTINGS: dict = load_settings()
+
+# Message ID of the currently pinned settings backup in SETTINGS_GROUP_ID.
+# Populated on startup by restore_settings_from_channel; the pin is the
+# source of truth — no separate state file needed.
+_settings_backup_msg_id: int | None = None
+
+# Channel mirror debounce — separate from the local-disk debounce below.
+_last_settings_backup_at: float = 0.0
+SETTINGS_BACKUP_MIN_INTERVAL = 30  # seconds
+
+# ── Local-disk debounce for the hot settings paths ────────────────
+# save_settings() itself (deepcopy + atomic write of EVERY user's settings,
+# not just the one who triggered it) is still called directly — and
+# immediately — from low-frequency, explicit single-user actions (a
+# settings toggle, a nickname change, a ban/unban, a channel restore):
+# those want the file on disk correct right away and don't fire often
+# enough for the cost to matter.
+#
+# start_daily_quiz is different: every one of the day's Daily Quiz taps
+# (hundreds of users within the same push window) used to pay for a full
+# SETTINGS file rewrite just to persist that one user's
+# daily_quiz_last_date. That call site now calls _mark_settings_dirty()
+# instead — an O(1) flag set, no I/O — and a periodic job
+# (_flush_settings_job, registered in _post_init) does the real save every
+# SETTINGS_FLUSH_INTERVAL seconds if anything changed. Same accepted
+# data-loss window as analytics: a hard crash between flushes can lose up
+# to one interval's worth of "already did today's Daily Quiz" gates, which
+# just means an affected user could see the Daily Quiz prompt again after
+# a crash-restart — not a correctness problem worth an fsync per tap.
+_settings_dirty: bool = False
+SETTINGS_FLUSH_INTERVAL = 60  # seconds
+
+def _mark_settings_dirty() -> None:
+    global _settings_dirty
+    _settings_dirty = True
+
+async def _flush_settings_if_dirty() -> None:
+    """Writes SETTINGS to disk only if something changed since the last
+    flush. Called by the periodic job and by _post_shutdown for a final
+    flush on clean exit."""
+    global _settings_dirty
+    if not _settings_dirty:
+        return
+    _settings_dirty = False
+    await save_settings()
+
+def _get_settings_entry(user_id: int) -> dict:
+    key   = str(user_id)
+    entry = SETTINGS.setdefault(key, _blank_settings_entry())
+    # backfill missing keys for users created before this system
+    for k, v in _blank_settings_entry().items():
+        entry.setdefault(k, v)
+    return entry
+
+def get_nickname(user_id: int) -> str | None:
+    return SETTINGS.get(str(user_id), {}).get("nickname")
+
+# ── Nickname vulgarity filter ───────────────────────────────────────
+# Blocks a nickname that contains a vulgar/inappropriate English or
+# Arabic word — checked at set-time in the AWAITING_NICKNAME handler
+# below. Matching is substring-based on a *normalized* form of the
+# text (lowercased; Arabic tashkeel/alef-yaa/taa-marbuta variants and
+# tatweel collapsed; all spacing/punctuation stripped) so trivial
+# tricks like "a s s" or "كُسّ" don't just slip past it. This is a
+# simple blocklist, not a full profanity classifier — extend the two
+# sets below if something obvious gets through.
+_AR_DIACRITICS_RE = re.compile(r"[\u064B-\u065F\u0670\u06D6-\u06ED\u0640]")  # tashkeel + tatweel
+_AR_LETTER_NORM = {
+    "أ": "ا", "إ": "ا", "آ": "ا", "ٱ": "ا",
+    "ى": "ي", "ة": "ه",
+}
+
+def _normalize_for_filter(text: str) -> str:
+    text = unicodedata.normalize("NFKC", text)
+    text = _AR_DIACRITICS_RE.sub("", text)
+    text = text.translate(str.maketrans(_AR_LETTER_NORM))
+    text = text.lower()
+    return re.sub(r"[^a-z0-9\u0600-\u06FF]", "", text)
+
+_VULGAR_WORDS_EN = {
+    "fuck", "shit", "bitch", "asshole", "bastard", "dick", "pussy",
+    "cunt", "slut", "whore", "nigger", "nigga", "faggot", "retard",
+    "cock", "twat", "wanker", "motherfucker", "dumbass", "jackass",
+}
+_VULGAR_WORDS_AR = {
+    "كس", "كسمك", "كسم", "طيز", "زبي", "زب", "عرص", "عرصة",
+    "شرموطة", "شرموط", "قحبة", "قحبه", "متناك", "متناكة", "متناكه",
+    "خول", "منيك", "لبوة", "لبوه", "ابن الكلب", "يلعن",
+}
+# Precomputed once so every nickname check just does plain substring
+# lookups against already-normalized sets.
+_VULGAR_WORDS_AR_NORM = {_normalize_for_filter(w) for w in _VULGAR_WORDS_AR}
+
+def _contains_vulgar_word(text: str) -> bool:
+    """True if `text` (an attempted nickname) contains a blocked English
+    or Arabic word, after normalization."""
+    normalized = _normalize_for_filter(text)
+    if any(word in normalized for word in _VULGAR_WORDS_EN):
+        return True
+    return any(word in normalized for word in _VULGAR_WORDS_AR_NORM)
+
+def _resolve_user_ref(ref: str) -> int | None:
+    """Resolves an admin-supplied '<Nickname or ID>' reference (as typed
+    to /set_year, /mystats, or the Dev Panel's text-prompt flows) to a
+    real Telegram user_id.
+
+    Tries a numeric Telegram ID first (only if it's a KNOWN user — a
+    random-looking number that isn't actually anyone is treated as "not
+    found" rather than silently addressing a stranger). Otherwise falls
+    back to a nickname match, using the same normalization as the
+    nickname vulgarity filter (_normalize_for_filter — case/diacritics/
+    spacing-insensitive): an exact normalized match wins outright, else
+    the first user whose normalized nickname contains the reference as a
+    substring. Returns None if nothing matches."""
+    ref = ref.strip()
+    if not ref:
+        return None
+    if ref.lstrip("-").isdigit():
+        uid = int(ref)
+        if uid in USERS or str(uid) in SETTINGS or str(uid) in ANALYTICS:
+            return uid
+        return None
+    target = _normalize_for_filter(ref)
+    if not target:
+        return None
+    substring_match = None
+    for uid_str, entry in SETTINGS.items():
+        nickname = entry.get("nickname")
+        if not nickname:
+            continue
+        normalized = _normalize_for_filter(nickname)
+        if normalized == target:
+            return int(uid_str)
+        if substring_match is None and target in normalized:
+            substring_match = int(uid_str)
+    return substring_match
+
+async def _prompt_set_year(reply_target, ref: str) -> None:
+    """Resolves `ref` (a nickname or ID, as typed) and replies on
+    reply_target (an update.message — this is only ever reached from a
+    typed command or a typed follow-up, never a button tap) with the
+    year/class picker for that person. Shared by /set_year and the Dev
+    Panel's 🔢 Set year flow (see AWAITING_DEVPANEL_SETYEAR). The actual
+    edit happens in button_handler's devpanel_setyear_pick: branch once
+    the admin taps a year."""
+    target_id = _resolve_user_ref(ref)
+    if target_id is None:
+        await reply_target.reply_text(f"⚠️ مش لاقي حد بالاسم/الـ ID ده: {html.escape(ref)}")
+        return
+    label = get_nickname(target_id) or str(target_id)
+    await reply_target.reply_text(
+        f"🔢 اختار السنة الجديدة لـ {html.escape(label)}:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=year_class_keyboard(f"devpanel_setyear_pick:{target_id}"),
+    )
+
+def _get_bool_setting(user_id: int, key: str) -> bool:
+    # Defaults to True for anyone not yet in SETTINGS (or missing the key) —
+    # matches _blank_settings_entry() defaults, no backfill required to read.
+    return SETTINGS.get(str(user_id), {}).get(key, True)
+
+def get_reactions_enabled(user_id: int) -> bool:
+    return _get_bool_setting(user_id, "reactions")
+
+def get_auto_next_enabled(user_id: int) -> bool:
+    return _get_bool_setting(user_id, "auto_next")
+
+def get_randomize_enabled(user_id: int) -> bool:
+    return _get_bool_setting(user_id, "randomize")
+
+def get_mix_written_enabled(user_id: int) -> bool:
+    return _get_bool_setting(user_id, "mix_written")
+
+def get_achievement_notifs_enabled(user_id: int) -> bool:
+    return _get_bool_setting(user_id, "achievement_notifs")
+
+def get_spaced_repetition_enabled(user_id: int) -> bool:
+    return _get_bool_setting(user_id, "spaced_repetition")
+
+def get_daily_notifs_enabled(user_id: int) -> bool:
+    """Whether this user should still get the 2pm 💥Daily Quiz💥 push —
+    see _daily_quiz_push_job. Doesn't affect the quiz itself, which stays
+    reachable from the main menu either way."""
+    return _get_bool_setting(user_id, "daily_notifs")
+
+def get_zikr_enabled(user_id: int) -> bool:
+    """Whether this user gets the Zikr poll every N questions — see
+    _maybe_send_zikr_poll. On by default, like the other toggles here
+    (opt out via Settings -> More Settings -> Zikr)."""
+    return _get_bool_setting(user_id, "zikr_reminders")
+
+def get_ban_info(user_id: int) -> tuple[float | None, str | None]:
+    """(banned_until epoch seconds, reason) for an active /ban, or
+    (None, None) if the user was never banned or their ban already
+    lifted — a lifted ban is treated as not-banned without needing a
+    cleanup job, since this just compares against time.time() on every
+    call. See ban_cmd (/ban) and _ban_gate."""
+    entry = SETTINGS.get(str(user_id), {})
+    until = entry.get("banned_until")
+    if not until or time.time() >= until:
+        return None, None
+    return until, entry.get("ban_reason")
+
+def is_banned(user_id: int) -> bool:
+    return get_ban_info(user_id)[0] is not None
+
+def get_question_timer_seconds(user_id: int) -> int:
+    # Defaults to 0 (off) for anyone not yet in SETTINGS — matches
+    # _blank_settings_entry()'s default, no backfill required to read.
+    return SETTINGS.get(str(user_id), {}).get("question_timer", 0)
+
+def get_year_class(user_id: int) -> str | None:
+    return SETTINGS.get(str(user_id), {}).get("year_class")
+
+def year_class_label(year_class: str | None) -> str:
+    """'Year 1 (Class 46)' style label for a year_class value, or a
+    placeholder if the person hasn't set one yet."""
+    if year_class not in YEAR_CLASS_NUMBER:
+        return "لسه محدد"
+    return f"{year_label(year_class)} / Class {YEAR_CLASS_NUMBER[year_class]}"
+
+def year_class_keyboard(callback_prefix: str) -> InlineKeyboardMarkup:
+    """The Year 1/2/3 (Class 46/45/44) picker, reused for both onboarding
+    and the Settings edit flow. callback_prefix distinguishes the two so
+    the button_handler branch knows whether to continue into the welcome
+    menu afterwards or just confirm and return to Settings."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(year_class_label(yc), callback_data=f"{callback_prefix}:{yc}")]
+        for yc in YEAR_ORDER
+    ])
+
+async def backup_settings_to_channel(context):
+    global _settings_backup_msg_id, _last_settings_backup_at
+    if not SETTINGS_GROUP_ID:
+        return
+    if not RESTORE_OK["settings"]:
+        print("SETTINGS BACKUP SKIPPED — last restore failed, refusing to overwrite the channel backup.")
+        return
+    now = time.monotonic()
+    if now - _last_settings_backup_at < SETTINGS_BACKUP_MIN_INTERVAL:
+        return   # backed up recently enough — local save_settings() already has the latest data
+    _last_settings_backup_at = now
+    data = json.dumps(SETTINGS, indent=2).encode("utf-8")
+    try:
+        sent = await context.bot.send_document(
+            chat_id=SETTINGS_GROUP_ID,
+            document=InputFile(BytesIO(data), filename=_backup_filename("settings.json")),
+            caption=SETTINGS_BACKUP_MARKER,
+        )
+    except Exception as e:
+        print("SETTINGS BACKUP ERROR:", e)
+        return
+    try:
+        await context.bot.pin_chat_message(
+            chat_id=SETTINGS_GROUP_ID,
+            message_id=sent.message_id,
+            disable_notification=True,
+        )
+    except Exception as e:
+        print("SETTINGS PIN ERROR:", e)
+    # Previous backups are no longer deleted — see the analytics backup
+    # function's comment for why.
+    _settings_backup_msg_id = sent.message_id
+
+async def restore_settings_from_channel(app) -> str:
+    global _settings_backup_msg_id
+    if not SETTINGS_GROUP_ID:
+        return "not_configured"
+
+    async def _do():
+        global _settings_backup_msg_id
+        chat   = await app.bot.get_chat(SETTINGS_GROUP_ID)
+        pinned = chat.pinned_message
+        if not pinned or not pinned.document or (pinned.caption or "") != SETTINGS_BACKUP_MARKER:
+            raise _RestoreNoBackup()
+        tg_file = await app.bot.get_file(pinned.document.file_id)
+        raw     = await tg_file.download_as_bytearray()
+        restored = json.loads(bytes(raw).decode("utf-8"))
+        if not isinstance(restored, dict) or not all(isinstance(v, dict) for v in restored.values()):
+            raise _RestoreInvalidArchitecture('expected a JSON object mapping user_id -> settings dict')
+        SETTINGS.update(restored)
+        await save_settings()
+        _settings_backup_msg_id = pinned.message_id
+        print(f"Restored settings: {len(SETTINGS)} user(s).")
+
+    return await _run_restore_with_retries(app, "settings", "Settings", _do)
+
+# ═══════════════════════════════════════════════════════════════
+# LECTURE RESULTS — per-lecture leaderboard, shown before a user
+# confirms they want to start a lecture.
+#
+# lecture_results.json schema:
+# {
+#   lecture_key: {
+#     str(user_id): {
+#       "best_correct": int, "best_total": int, "best_pct": int,
+#       "attempts": int, "last_at": "YYYY-MM-DD",
+#     }
+#   }
+# }
+#
+# Mirrors ANALYTICS/SETTINGS exactly: local JSON file, plus a pinned
+# backup in LECTURE_RESULTS_GROUP_ID that gets replaced (upload + pin +
+# delete old pin) on every change and restored from on startup. Kept in
+# its own file/channel rather than folded into ANALYTICS so this
+# leaderboard data (which will keep growing lecture over lecture) never
+# risks the analytics backup, and vice versa.
+# ═══════════════════════════════════════════════════════════════
+LECTURE_RESULTS_FILE          = "lecture_results.json"
+LECTURE_RESULTS_BACKUP_MARKER = "🏆 QUIZICIAN_LECTURE_RESULTS_BACKUP"
+
+def load_lecture_results() -> dict:
+    return _load_json_safe(LECTURE_RESULTS_FILE, dict, dict, "LECTURE RESULTS")
+
+async def save_lecture_results():
+    # See save_analytics for why this snapshot copy is required.
+    await _write_json_serialized(
+        LECTURE_RESULTS_FILE, lambda: copy.deepcopy(LECTURE_RESULTS), indent=2, ensure_ascii=False)
+
+LECTURE_RESULTS: dict = load_lecture_results()
+
+# Message ID of the currently pinned lecture-results backup in
+# LECTURE_RESULTS_GROUP_ID. Populated on startup by
+# restore_lecture_results_from_channel; the pin is the source of truth.
+_lecture_results_backup_msg_id: int | None = None
+
+# Same debounce pattern as analytics/settings — local save always
+# happens immediately; only the channel mirror is throttled.
+_last_lecture_results_backup_at: float = 0.0
+LECTURE_RESULTS_BACKUP_MIN_INTERVAL = 30  # seconds
+
+def _lr_key(year: str, lecture_key: str) -> str:
+    """LECTURE_RESULTS is one shared file across all years — prefix with
+    the year so two different years never collide even if they happen to
+    reuse the same module/subject/lecture-number/name text."""
+    return f"{year}:{lecture_key}"
+
+def _get_lecture_results(lecture_key: str) -> dict:
+    return LECTURE_RESULTS.setdefault(lecture_key, {})
+
+async def _record_lecture_result(user_id: int, lecture_key: str, correct: int, total: int) -> None:
+    if total <= 0:
+        return
+    results = _get_lecture_results(lecture_key)
+    key     = str(user_id)
+    pct     = round(correct / total * 100)
+    prev    = results.get(key)
+    if prev is None or pct > prev.get("best_pct", -1) or (
+        pct == prev.get("best_pct", -1) and correct > prev.get("best_correct", -1)
+    ):
+        best_correct, best_total, best_pct = correct, total, pct
+    else:
+        best_correct, best_total, best_pct = prev["best_correct"], prev["best_total"], prev["best_pct"]
+    results[key] = {
+        "best_correct": best_correct,
+        "best_total":   best_total,
+        "best_pct":     best_pct,
+        "attempts":     (prev.get("attempts", 0) if prev else 0) + 1,
+        "last_at":      _today(),
+    }
+    await save_lecture_results()
+
+def _lecture_leaderboard(lecture_key: str, limit: int = 20) -> list[dict]:
+    """Top attempts for this lecture, best % first (ties broken by more
+    correct answers, then earlier last_at). Each row also carries the
+    nickname (falling back to a generic label if the user never set one)."""
+    results = _get_lecture_results(lecture_key)
+    rows = []
+    for uid_str, r in results.items():
+        if not (isinstance(uid_str, str) and uid_str.lstrip("-").isdigit()):
+            continue   # not a real Telegram user id — corrupted/stray key, skip rather than crash
+        uid = int(uid_str)
+        rows.append({
+            "user_id":  uid,
+            "nickname": get_nickname(uid) or f"مستخدم #{uid % 10000}",
+            **r,
+        })
+    rows.sort(key=lambda r: (-r["best_pct"], -r["best_correct"], r["last_at"]))
+    return rows[:limit]
+
+async def backup_lecture_results_to_channel(context):
+    global _lecture_results_backup_msg_id, _last_lecture_results_backup_at
+    if not LECTURE_RESULTS_GROUP_ID:
+        return
+    if not RESTORE_OK["lecture_results"]:
+        print("LECTURE RESULTS BACKUP SKIPPED — last restore failed, refusing to overwrite the channel backup.")
+        return
+    now = time.monotonic()
+    if now - _last_lecture_results_backup_at < LECTURE_RESULTS_BACKUP_MIN_INTERVAL:
+        return   # backed up recently enough — local save_lecture_results() already has the latest data
+    _last_lecture_results_backup_at = now
+    data = json.dumps(LECTURE_RESULTS, indent=2).encode("utf-8")
+    try:
+        sent = await context.bot.send_document(
+            chat_id=LECTURE_RESULTS_GROUP_ID,
+            document=InputFile(BytesIO(data), filename=_backup_filename("lecture_results.json")),
+            caption=LECTURE_RESULTS_BACKUP_MARKER,
+        )
+    except Exception as e:
+        print("LECTURE RESULTS BACKUP ERROR:", e)
+        return
+    try:
+        await context.bot.pin_chat_message(
+            chat_id=LECTURE_RESULTS_GROUP_ID,
+            message_id=sent.message_id,
+            disable_notification=True,
+        )
+    except Exception as e:
+        print("LECTURE RESULTS PIN ERROR:", e)
+    # Previous backups are no longer deleted — see the analytics backup
+    # function's comment for why.
+    _lecture_results_backup_msg_id = sent.message_id
+
+async def restore_lecture_results_from_channel(app):
+    global _lecture_results_backup_msg_id
+    if not LECTURE_RESULTS_GROUP_ID:
+        return
+
+    async def _do():
+        global _lecture_results_backup_msg_id
+        chat   = await app.bot.get_chat(LECTURE_RESULTS_GROUP_ID)
+        pinned = chat.pinned_message
+        if not pinned or not pinned.document:
+            return
+        if (pinned.caption or "") != LECTURE_RESULTS_BACKUP_MARKER:
+            return
+        tg_file = await app.bot.get_file(pinned.document.file_id)
+        raw     = await tg_file.download_as_bytearray()
+        LECTURE_RESULTS.update(json.loads(bytes(raw).decode("utf-8")))
+        await save_lecture_results()
+        _lecture_results_backup_msg_id = pinned.message_id
+        print(f"Restored lecture results: {len(LECTURE_RESULTS)} lecture(s).")
+
+    await _run_restore_with_retries(app, "lecture_results", "Lecture results", _do)
+
+# ═══════════════════════════════════════════════════════════════
+# MISTAKES BANK — every lecture question a user's gotten wrong, kept
+# per-user, used to seed the "questions you got wrong before" slice of the
+# Daily Quiz (see DAILY QUIZ section).
+#
+# mistakes_bank.json schema:
+# [
+#   {"user_id": int, "mid": int, "year": str, "module": str, "subject": str},
+#   ...
+# ]
+#
+# Entries are lightweight REFERENCES, not self-contained snapshots — just
+# the question's message id (mid) plus enough scoping info to filter by
+# /daily_module and to look the question back up. Full content (question/
+# options/correct_option_id/explanation) is resolved on demand via
+# _snapshot_from_mid, which reads QUIZ_POLL_STATUS[year] — the same data
+# that's durably backed up per year in that year's quiz backup document
+# (see QUIZ_BACKUP_MARKER / backup_quiz_to_channel). This is what keeps
+# this file from ballooning: it used to bake in the full question text/
+# options on every miss, which made mistakes_bank.json grow unbounded.
+#
+# Trade-off vs. the old self-contained design: a mistake now stops
+# resolving if its specific question message is later deleted (not just
+# edited — QUIZ_POLL_STATUS keeps content fine for edited/closed
+# questions). _resolve_mistake prunes any entry that no longer resolves
+# the moment it's looked up, so the bank self-cleans instead of
+# accumulating dead references.
+#
+# Mirrors LECTURE_RESULTS exactly: local JSON file, plus a pinned backup
+# in MISTAKES_BANK_GROUP_ID that gets replaced (upload + pin + delete old
+# pin) on every change and restored from on startup.
+# ═══════════════════════════════════════════════════════════════
+MISTAKES_BANK_FILE          = "mistakes_bank.json"
+MISTAKES_BANK_BACKUP_MARKER = "🗑 QUIZICIAN_MISTAKES_BANK_BACKUP"
+
+MISTAKE_ENTRY_TYPE = "mistake"
+BOOKMARK_ENTRY_TYPE = "bookmarked"
+
+def _entry_type(entry: dict) -> str:
+    """Persistent question type inside QUIZICIAN_MISTAKES_BANK.
+
+    Old bank entries pre-date the type field, so a missing field is treated
+    as the original mistake type. Unknown values are also kept conservative
+    and treated as ordinary mistakes rather than as bookmarks."""
+    kind = entry.get("type", MISTAKE_ENTRY_TYPE) if isinstance(entry, dict) else MISTAKE_ENTRY_TYPE
+    return kind if kind in {MISTAKE_ENTRY_TYPE, BOOKMARK_ENTRY_TYPE} else MISTAKE_ENTRY_TYPE
+
+def load_mistakes_bank() -> list:
+    """Loads the single shared QUIZICIAN_MISTAKES_BANK file.
+
+    It now stores two question types: type="mistake" and
+    type="bookmarked". Legacy mistake records without a type are normalized
+    to type="mistake" so every reader can explicitly distinguish them."""
+    raw = _load_json_safe(MISTAKES_BANK_FILE, list, list, "MISTAKES BANK")
+    required = ("user_id", "mid", "year", "module", "subject")
+    clean = []
+    for item in raw:
+        if not (isinstance(item, dict) and all(k in item for k in required)):
+            continue
+        entry = dict(item)
+        entry["type"] = _entry_type(entry)
+        clean.append(entry)
+    if len(clean) != len(raw):
+        print(f"MISTAKES BANK: dropped {len(raw) - len(clean)} malformed entr(y/ies) missing a required key on load.")
+    return clean
+
+def _is_valid_mistake_entry(m) -> bool:
+    return (
+        isinstance(m, dict)
+        and all(k in m for k in ("user_id", "mid", "year", "module", "subject"))
+        and _entry_type(m) in {MISTAKE_ENTRY_TYPE, BOOKMARK_ENTRY_TYPE}
+    )
+
+async def save_mistakes_bank():
+    # See save_analytics for why this snapshot copy is required — this is
+    # the exact function whose race the load test's "dictionary changed
+    # size during iteration" errors most likely came from: record_mistake
+    # appends to MISTAKES_BANK from many concurrent _advance_lecture_session
+    # calls while a background thread could simultaneously be mid-iteration
+    # serializing the same live list to JSON.
+    await _write_json_serialized(
+        MISTAKES_BANK_FILE, lambda: copy.deepcopy(MISTAKES_BANK), indent=2, ensure_ascii=False)
+
+MISTAKES_BANK: list = load_mistakes_bank()
+
+# ── Per-user index over MISTAKES_BANK ───────────────────────────
+# MISTAKES_BANK is one flat list holding every user's entries (see
+# schema note above), which made every read of "this user's mistakes"
+# a full scan of the whole bank — fine at hundreds of entries, but a
+# scan that grows with EVERY user's activity just to answer a question
+# about ONE user doesn't scale as the bank grows. _MISTAKES_BY_USER
+# keeps the same entry dicts (not copies) grouped by user_id, so a
+# lookup is O(this user's mistakes) instead of O(everyone's). It's a
+# derived structure, not a second source of truth — MISTAKES_BANK stays
+# the one thing that gets saved/backed up; this index is rebuilt or
+# patched to match it at every mutation site (grep _reindex_mistakes,
+# _mistakes_index_add, _mistakes_index_remove to find all of them).
+_MISTAKES_BY_USER: dict[int, list] = {}
+
+def _reindex_mistakes_bank() -> None:
+    """Rebuilds _MISTAKES_BY_USER from scratch against the current
+    MISTAKES_BANK. Call this after any bulk replacement of the bank's
+    contents (initial load, a channel restore) — for the routine
+    single-entry cases (one mistake recorded, one stale entry pruned)
+    use _mistakes_index_add / _mistakes_index_remove instead, which
+    update the index in O(1) rather than rescanning everything."""
+    _MISTAKES_BY_USER.clear()
+    for m in MISTAKES_BANK:
+        if _is_valid_mistake_entry(m):
+            _MISTAKES_BY_USER.setdefault(m["user_id"], []).append(m)
+
+def _mistakes_index_add(entry: dict) -> None:
+    _MISTAKES_BY_USER.setdefault(entry["user_id"], []).append(entry)
+
+def _mistakes_index_remove(entry: dict) -> None:
+    bucket = _MISTAKES_BY_USER.get(entry.get("user_id"))
+    if bucket and entry in bucket:
+        bucket.remove(entry)
+
+_reindex_mistakes_bank()
+
+# Message ID of the currently pinned mistakes-bank backup in
+# MISTAKES_BANK_GROUP_ID. Populated on startup by
+# restore_mistakes_bank_from_channel; the pin is the source of truth.
+_mistakes_bank_backup_msg_id: int | None = None
+
+# Channel mirror debounce — separate from the local-disk debounce below.
+_last_mistakes_bank_backup_at: float = 0.0
+MISTAKES_BANK_BACKUP_MIN_INTERVAL = 30  # seconds
+
+# ── Local-disk debounce for the hot mistakes-bank path ─────────────
+# save_mistakes_bank() (deepcopy + atomic write of EVERY user's mistakes,
+# not just the one entry that just got added) is still called directly —
+# and immediately — from low-frequency paths: a channel restore, an admin
+# clearing a user's bank, or pruning a stale/malformed entry (see
+# _resolve_mistake) — those are rare enough, or want disk correct right
+# away, that the cost doesn't matter.
+#
+# record_mistake is different: it fires on every wrong answer, from every
+# active user, all day — the single hottest write path into this file.
+# Same fix as analytics/settings: mark dirty (O(1), no I/O) and let a
+# periodic job (_flush_mistakes_bank_job, registered in _post_init) do the
+# real save every MISTAKES_BANK_FLUSH_INTERVAL seconds if anything
+# changed. Worst case on a hard crash: up to one interval's worth of
+# recently-missed questions aren't in the bank yet — they just don't seed
+# that user's Mistakes Bank slice until missed again, not a correctness
+# problem worth an fsync per wrong answer.
+_mistakes_bank_dirty: bool = False
+MISTAKES_BANK_FLUSH_INTERVAL = 60  # seconds
+
+def _mark_mistakes_bank_dirty() -> None:
+    global _mistakes_bank_dirty
+    _mistakes_bank_dirty = True
+
+async def _flush_mistakes_bank_if_dirty() -> None:
+    """Writes MISTAKES_BANK to disk only if something changed since the
+    last flush. Called by the periodic job and by _post_shutdown for a
+    final flush on clean exit."""
+    global _mistakes_bank_dirty
+    if not _mistakes_bank_dirty:
+        return
+    _mistakes_bank_dirty = False
+    await save_mistakes_bank()
+
+async def record_mistake(user_id: int, mid: int, year: str, module: str, subject: str) -> bool:
+    """Adds a wrong-answer reference as type="mistake". Bookmark records
+    share the same physical bank but are independent from mistake records."""
+    for m in _MISTAKES_BY_USER.get(user_id, []):
+        if _entry_type(m) != MISTAKE_ENTRY_TYPE:
+            continue
+        if m["mid"] == mid and m["year"] == year:
+            return False
+    entry = {
+        "user_id": user_id,
+        "type": MISTAKE_ENTRY_TYPE,
+        "mid": mid,
+        "year": year,
+        "module": module,
+        "subject": subject,
+    }
+    MISTAKES_BANK.append(entry)
+    _mistakes_index_add(entry)
+    _mark_mistakes_bank_dirty()
+    return True
+
+async def backup_mistakes_bank_to_channel(context):
+    global _mistakes_bank_backup_msg_id, _last_mistakes_bank_backup_at
+    if not MISTAKES_BANK_GROUP_ID:
+        return
+    if not RESTORE_OK["mistakes_bank"]:
+        print("MISTAKES BANK BACKUP SKIPPED — last restore failed, refusing to overwrite the channel backup.")
+        return
+    now = time.monotonic()
+    if now - _last_mistakes_bank_backup_at < MISTAKES_BANK_BACKUP_MIN_INTERVAL:
+        return   # backed up recently enough — local save_mistakes_bank() already has the latest data
+    _last_mistakes_bank_backup_at = now
+    data = json.dumps(MISTAKES_BANK, indent=2).encode("utf-8")
+    try:
+        sent = await context.bot.send_document(
+            chat_id=MISTAKES_BANK_GROUP_ID,
+            document=InputFile(BytesIO(data), filename=_backup_filename("mistakes_bank.json")),
+            caption=MISTAKES_BANK_BACKUP_MARKER,
+        )
+    except Exception as e:
+        print("MISTAKES BANK BACKUP ERROR:", e)
+        return
+    try:
+        await context.bot.pin_chat_message(
+            chat_id=MISTAKES_BANK_GROUP_ID,
+            message_id=sent.message_id,
+            disable_notification=True,
+        )
+    except Exception as e:
+        print("MISTAKES BANK PIN ERROR:", e)
+    # Previous backups are no longer deleted — see the analytics backup
+    # function's comment for why.
+    _mistakes_bank_backup_msg_id = sent.message_id
+
+async def restore_mistakes_bank_from_channel(app) -> str:
+    global _mistakes_bank_backup_msg_id
+    if not MISTAKES_BANK_GROUP_ID:
+        return "not_configured"
+
+    async def _do():
+        global _mistakes_bank_backup_msg_id
+        chat   = await app.bot.get_chat(MISTAKES_BANK_GROUP_ID)
+        pinned = chat.pinned_message
+        if not pinned or not pinned.document or (pinned.caption or "") != MISTAKES_BANK_BACKUP_MARKER:
+            raise _RestoreNoBackup()
+        tg_file = await app.bot.get_file(pinned.document.file_id)
+        raw     = await tg_file.download_as_bytearray()
+        restored = json.loads(bytes(raw).decode("utf-8"))
+        if not isinstance(restored, list):
+            raise _RestoreInvalidArchitecture('expected a JSON array of mistake entries')
+        clean = [m for m in restored if _is_valid_mistake_entry(m)]
+        if restored and not clean:
+            raise _RestoreInvalidArchitecture('none of the entries matched the expected mistake-entry shape')
+        if len(clean) != len(restored):
+            print(f"MISTAKES BANK: dropped {len(restored) - len(clean)} malformed entr(y/ies) from the channel backup on restore.")
+        MISTAKES_BANK[:] = clean
+        _reindex_mistakes_bank()
+        await save_mistakes_bank()
+        _mistakes_bank_backup_msg_id = pinned.message_id
+        print(f"Restored mistakes bank: {len(MISTAKES_BANK)} question(s).")
+
+    return await _run_restore_with_retries(app, "mistakes_bank", "Mistakes bank", _do)
+
+# ═══════════════════════════════════════════════════════════════
+# DAILY QUIZ — 💥Daily Quiz💥: each day, every configured year gets ONE
+# shared run of DAILY_QUIZ_TOTAL_COUNT (15) random
+# questions — built once per (year, day) and then IDENTICAL for every
+# user in that year, so everyone's run (and the leaderboard ranking it
+# feeds) is a level playing field. No mistakes-bank content is used here
+# at all (that's exclusively the 🧠 Mistakes Bank menu button's own
+# retake flow). Restricted to that year's DAILY_QUIZ_ACTIVE_MODULE by
+# default, or to the admin-set /daily_module scope when one is set for
+# that year as a temporary override (see get_daily_quiz_scope).
+#
+# Tapping the 💥Daily Quiz💥 main-menu button opens a small hub
+# (show_daily_quiz_menu) that always shows the day's leaderboard for the
+# user's own Year/Class (get_year_class — prompting them to set it first
+# if they haven't), plus a Start button if they haven't run today's quiz
+# yet. Gated to once per person per day via each user's settings
+# "daily_quiz_last_date". Pushed to everyone at 2pm Cairo time once a day
+# (see the job_queue.run_daily call in MAIN) as just a button into that
+# same hub.
+#
+# Deliberately its own session type (DAILY_QUIZ_SESSIONS), separate from
+# LECTURE_SESSIONS, rather than shoehorned into the lecture-session shape:
+# a lecture session's dead-poll pruning, legacy-content recovery, and
+# result-recording are all keyed to one specific year+lecture_key, which
+# doesn't make sense for a session mixing many lectures/subjects at once.
+# A Daily Quiz question is fully self-contained (question/options/
+# correct_id baked in directly, same shape as a MISTAKES_BANK entry) so
+# delivery never needs to touch any year's live channel/state at all.
+# ═══════════════════════════════════════════════════════════════
+DAILY_QUIZ_SESSIONS = {}   # user_id -> {"queue": [question dict, ...], "current_poll_id",
+                           #             "current_correct_id", "current_message_id",
+                           #             "year",
+                           #             "total", "answered", "correct", "xp_earned"}
+
+DAILY_QUIZ_TOTAL_COUNT = 15   # random questions per year, per day
+
+# ═══════════════════════════════════════════════════════════════
+# DAILY QUIZ LEADERBOARD — deliberately RAM-only, unlike everything else
+# in this file. It resets every day anyway (today's ranking is
+# meaningless once a new day's questions exist), so there's no reason to
+# spend backup/restore machinery keeping it alive across a bot restart —
+# worst case, a restart mid-day just clears today's board a little
+# early, which is harmless. Contrast with daily_medals on the ANALYTICS
+# entry (_blank_entry), which IS persistent — that's the lifetime medal
+# count this board hands out before resetting, and that has to survive.
+#
+# One board PER YEAR — since every user in a year plays the exact same
+# shared run (see DAILY QUIZ above), ranking is only meaningful within a
+# year, not across years.
+# ═══════════════════════════════════════════════════════════════
+DAILY_QUIZ_LEADERBOARD_DATE: str | None = None   # which day's date the boards below are for
+DAILY_QUIZ_LEADERBOARD: dict[str, dict[int, dict]] = {}   # year -> user_id -> {"name", "correct", "total", "duration"}
+
+def _finalize_daily_leaderboard() -> None:
+    """Awards lifetime medals (ANALYTICS[uid]['daily_medals']) to the top 3
+    of each year's board, then clears every board. Called explicitly at
+    the start of _daily_quiz_push_job (the 2pm-Cairo push) — so medals for
+    a day's Daily Quiz are handed out right as the NEXT one goes out,
+    not lazily whenever someone happens to open the leaderboard."""
+    global DAILY_QUIZ_LEADERBOARD
+    any_ranked = False
+    for year in list(DAILY_QUIZ_LEADERBOARD):
+        ranked = _rank_daily_leaderboard(year)
+        for i, medal_key in enumerate(("gold", "silver", "bronze")):
+            if i >= len(ranked):
+                break
+            entry = _get_entry(ranked[i]["user_id"])
+            entry["daily_medals"][medal_key] += 1
+            any_ranked = True
+    if any_ranked:
+        _mark_analytics_dirty()
+    DAILY_QUIZ_LEADERBOARD = {}
+
+def _ensure_daily_leaderboard_fresh() -> None:
+    """Call before any read or write of DAILY_QUIZ_LEADERBOARD. Just rolls
+    the tracked date forward and clears stale boards on a day change —
+    medal-awarding itself does NOT happen here (see _finalize_daily_leaderboard,
+    called explicitly by _daily_quiz_push_job right as the next Daily Quiz
+    goes out), so this is safe to call at any time of day without handing
+    out medals early."""
+    global DAILY_QUIZ_LEADERBOARD_DATE, DAILY_QUIZ_LEADERBOARD
+    today = _today()
+    if DAILY_QUIZ_LEADERBOARD_DATE == today:
+        return
+    DAILY_QUIZ_LEADERBOARD_DATE = today
+    DAILY_QUIZ_LEADERBOARD = {}
+
+def _rank_daily_leaderboard(year: str, limit: int = 20) -> list[dict]:
+    """Today's Daily Quiz finishers for one year, ranked the same way as
+    the year leaderboard: correct count highest first, total duration
+    lowest first as the tiebreaker."""
+    rows = list(DAILY_QUIZ_LEADERBOARD.get(year, {}).values())
+    rows.sort(key=lambda r: (-r["correct"], r["duration"]))
+    return rows[:limit]
+
+def _record_daily_leaderboard_finish(user_id: int, year: str, correct: int, total: int, duration: float) -> None:
+    """Records this user's (one-per-day) finish on today's board for
+    `year`."""
+    _ensure_daily_leaderboard_fresh()
+    board = DAILY_QUIZ_LEADERBOARD.setdefault(year, {})
+    board[user_id] = {
+        "user_id":  user_id,
+        "name":     get_nickname(user_id) or f"مستخدم #{user_id % 10000}",
+        "correct":  correct,
+        "total":    total,
+        "duration": duration,
+    }
+
+# Push time for the daily 💥Daily Quiz💥 button (see job_queue.run_daily in
+# MAIN, and next_daily_quiz_time() / /time below — all three read from
+# these two so the schedule only ever needs to change in one place).
+DAILY_QUIZ_TZ   = ZoneInfo("Africa/Cairo")
+DAILY_QUIZ_HOUR = 14
+DAILY_QUIZ_MIN  = 0
+
+# Push time for the daily zipped-backup export (see _daily_backup_export_job
+# and job_queue.run_daily in MAIN). Off-peak hour, well clear of the Daily
+# Quiz push, in DAILY_QUIZ_TZ.
+DAILY_BACKUP_EXPORT_HOUR = 3
+DAILY_BACKUP_EXPORT_MIN  = 0
+
+def next_daily_quiz_time() -> datetime:
+    """The next upcoming 2pm-Cairo push moment — today's if it hasn't
+    happened yet, otherwise tomorrow's."""
+    now = datetime.now(DAILY_QUIZ_TZ)
+    today_push = now.replace(hour=DAILY_QUIZ_HOUR, minute=DAILY_QUIZ_MIN, second=0, microsecond=0)
+    return today_push if now < today_push else today_push + timedelta(days=1)
+
+_DAILY_QUIZ_POOL_CACHE: dict[str, dict] = {}   # year -> {"pool", "built_at", "scope_key"}
+_DAILY_QUIZ_POOL_CACHE_TTL_SECONDS = 120
+
+# Each year's Daily Quiz is restricted to ONE currently-active module by
+# default — whatever's currently being taught — rather than that year's
+# whole curriculum. Update this whenever the active module changes; an
+# admin can also temporarily override a given year via /daily_module
+# (see get_daily_quiz_scope), which takes priority over this default.
+DAILY_QUIZ_ACTIVE_MODULE = {
+    "y1": "Foundation (1)",
+    "y2": "Respiratory",
+    "y3": "Endocrine",
+}
+
+# Rebuilding this pool means: for every (module, subject) pair, scanning
+# the ENTIRE year's QUIZ_INDEX to find lectures matching that pair (see
+# ready_lecture_keys), on top of a QUIZ_POLL_STATUS scan. That's fine once
+# — it's expensive when 700 students all tap "Daily Quiz" inside the same
+# push window and each one triggers a fresh rebuild. The pool doesn't
+# depend on which student is asking, so it's cached (per year) for a
+# couple of minutes; a lecture that gets closed mid-window just joins the
+# pool the next time the cache refreshes rather than instantly, which is
+# fine for a once-a-day quiz. Invalidated early if the admin changes
+# /daily_module scope, so a scope change is never stuck behind a stale
+# cache.
+def _daily_quiz_subject_pool(year: str) -> dict:
+    """Every ready (closed-poll) question mid for ONE year, grouped by
+    (module, subject) — the pool _build_daily_quiz_questions draws its random
+    questions from (any subject can contribute more than one; this is
+    just how the mids are organized so a scope filter can narrow it
+    before picking). Restricted to that year's DAILY_QUIZ_ACTIVE_MODULE by
+    default; if the admin has set a /daily_module scope for this same
+    year, that overrides the default instead. Cached briefly per year —
+    see _DAILY_QUIZ_POOL_CACHE_TTL_SECONDS."""
+    scope = get_daily_quiz_scope()
+    if scope and scope["year"] == year:
+        scoped_module = scope["module"]
+    else:
+        scoped_module = DAILY_QUIZ_ACTIVE_MODULE.get(year)
+
+    now = time.monotonic()
+    cache = _DAILY_QUIZ_POOL_CACHE.setdefault(year, {"pool": None, "built_at": 0.0, "scope_key": None})
+    if (cache["pool"] is not None
+            and cache["scope_key"] == scoped_module
+            and now - cache["built_at"] < _DAILY_QUIZ_POOL_CACHE_TTL_SECONDS):
+        return cache["pool"]
+
+    pool = {}   # (module, subject) -> [mid, ...]
+    if year in configured_years():
+        closed_message_ids = {v["message_id"] for v in QUIZ_POLL_STATUS[year].values() if v["closed"]}
+        modules = [scoped_module] if scoped_module else ready_modules(year)
+        for module in modules:
+            for subject in ready_subjects(year, module):
+                mids = []
+                for lecture_key in ready_lecture_keys(year, module, subject):
+                    ids = QUIZ_INDEX[year][lecture_key]["ids"]
+                    mids.extend(mid for mid in ids if mid in closed_message_ids)
+                if mids:
+                    pool[(module, subject)] = mids
+
+    cache["pool"] = pool
+    cache["built_at"] = now
+    cache["scope_key"] = scoped_module
+    return pool
+
+POLL_DESCRIPTION_LIMIT = 1024   # Telegram's cap on a native poll description
+
+def _poll_description(poll) -> str | None:
+    """The native description text of a Telegram poll (the block shown
+    above the question, where part of a long question is often placed),
+    or None if there isn't one. Reads Poll.description when the installed
+    python-telegram-bot knows the field, else falls back to the raw
+    Bot API dict PTB keeps in poll.api_kwargs for unknown fields."""
+    desc = getattr(poll, "description", None)
+    if not desc:
+        desc = (getattr(poll, "api_kwargs", None) or {}).get("description")
+    desc = (desc or "").strip()
+    return desc[:POLL_DESCRIPTION_LIMIT] or None
+
+def _with_poll_description(poll_kwargs: dict, description: str | None) -> dict:
+    """Adds a native description to send_poll kwargs (in place, and
+    returned). Goes through api_kwargs so it works regardless of whether
+    the installed PTB version has an explicit `description` parameter."""
+    if description:
+        poll_kwargs["api_kwargs"] = {
+            **(poll_kwargs.get("api_kwargs") or {}),
+            "description": description[:POLL_DESCRIPTION_LIMIT],
+        }
+    return poll_kwargs
+
+async def _snapshot_from_mid(context: ContextTypes.DEFAULT_TYPE, year: str, mid: int, module: str, subject: str,
+                              status_by_mid: dict | None = None) -> dict | None:
+    """Builds a self-contained question dict (same shape as a
+    MISTAKES_BANK entry) from a channel poll's captured content. Returns
+    None if the content was never captured and couldn't be recovered
+    (very old lecture, or the message is gone) — callers skip it.
+
+    status_by_mid, if given, is a {message_id: status} map for this year
+    (built once by the caller) used instead of scanning
+    QUIZ_POLL_STATUS[year] here — callers that resolve many mids in a row
+    (e.g. build_daily_quiz_questions) should pass one in so N lookups cost
+    O(N) total instead of O(N * len(QUIZ_POLL_STATUS[year]))."""
+    if status_by_mid is not None:
+        status = status_by_mid.get(mid)
+    else:
+        status = next((v for v in QUIZ_POLL_STATUS[year].values() if v["message_id"] == mid), None)
+    question    = status.get("question")           if status else None
+    options     = status.get("options")             if status else None
+    correct_id  = status.get("correct_option_id")   if status else None
+    explanation = status.get("explanation")         if status else None
+    if not (question and options and correct_id is not None):
+        return None   # legacy/uncaptured content — skip rather than spend a forward+delete recovering it here
+    snap = {
+        "question": question, "options": options, "correct_option_id": correct_id,
+        "explanation": explanation, "year": year, "module": module, "subject": subject,
+        "source_mid": mid,
+    }
+    if status.get("description"):
+        snap["description"] = status["description"]
+    # Attach the question's photo / case study (stored on the lecture's
+    # QUIZ_INDEX entry, keyed by poll mid — see poll_images /
+    # poll_case_studies) so Daily Quiz / Mistakes retake can show them
+    # the same way lecture delivery does.
+    lecture_entry = QUIZ_INDEX.get(year, {}).get(status.get("lecture")) if status else None
+    if lecture_entry:
+        img = next((pi for pi in (lecture_entry.get("poll_images") or []) if pi.get("mid") == mid), None)
+        if img and img.get("file_id"):
+            snap["image_file_id"] = img["file_id"]
+        cs = next((c for c in (lecture_entry.get("poll_case_studies") or []) if c.get("mid") == mid), None)
+        if cs and cs.get("content"):
+            snap["case_study"] = cs["content"]
+    return snap
+
+def _attachment_index(year: str) -> dict:
+    """{mid: {"image_file_id"?, "case_study"?}} for every poll in `year`
+    that has a photo or case study bound to it (QUIZ_INDEX[year][*]
+    ["poll_images"] / ["poll_case_studies"]). Channel message ids are
+    unique per channel, so keying by mid alone across the whole year is
+    safe. Built fresh per call; callers resolving many mids should build
+    it once."""
+    out: dict = {}
+    for entry in QUIZ_INDEX.get(year, {}).values():
+        for pi in (entry.get("poll_images") or []):
+            if pi.get("mid") is not None and pi.get("file_id"):
+                out.setdefault(pi["mid"], {})["image_file_id"] = pi["file_id"]
+        for cs in (entry.get("poll_case_studies") or []):
+            if cs.get("mid") is not None and cs.get("content"):
+                out.setdefault(cs["mid"], {})["case_study"] = cs["content"]
+    return out
+
+def _scoped_mistakes_bank(user_id: int) -> list:
+    """Returns only this user's type="mistake" records. Bookmark records
+    live in the same bank but are never fed into Mistakes Bank retakes."""
+    scope = get_daily_quiz_scope()
+    user_entries = [
+        m for m in _MISTAKES_BY_USER.get(user_id, [])
+        if _entry_type(m) == MISTAKE_ENTRY_TYPE
+    ]
+    if not scope:
+        return list(user_entries)
+    return [m for m in user_entries if m["year"] == scope["year"] and m["module"] == scope["module"]]
+
+def _user_mistake_count(user_id: int) -> int:
+    """Counts only type="mistake" records for stats."""
+    return sum(1 for m in _MISTAKES_BY_USER.get(user_id, []) if _entry_type(m) == MISTAKE_ENTRY_TYPE)
+
+def _poll_status_index(year: str) -> dict:
+    """{message_id: status} for every poll tracked in QUIZ_POLL_STATUS[year].
+    Built fresh each call (QUIZ_POLL_STATUS is mutated in many places, so
+    this isn't cached) — the point is letting a caller that's about to
+    resolve several mids in the same year pay this scan once instead of
+    once per mid, not eliminating the scan altogether."""
+    return {v["message_id"]: v for v in QUIZ_POLL_STATUS[year].values()}
+
+# ── 🔎 Search Content ──────────────────────────────────────────────
+# A search sends ONE message: a numbered, paged list of every match
+# (question snippet + subject/lecture) with number buttons. Tapping a
+# number resends just that question as a fresh live quiz poll straight
+# into the chat (via deliver_quiz — the same single delivery path every
+# other quiz feature uses), NOT as a link into the quiz channel — that
+# channel is private, so a t.me/c/ link wouldn't reliably open for
+# everyone. The matches live in SEARCH_RESULTS (in-memory, one search per
+# chat, replaced by the next search) — see _send_search_results and the
+# srchpick:/srchpage: callbacks in button_handler.
+SEARCH_RESULTS_LIMIT = 100   # max matches listed per search (paged SEARCH_PAGE_SIZE at a time) — see _search_quiz_questions
+SEARCH_PAGE_SIZE      = 10   # questions shown per page of the results list
+SEARCH_SNIPPET_CHARS  = 90   # how much of each question's text the list shows
+
+def _search_quiz_questions(year: str, module: str | None, query_text: str,
+                            limit: int = SEARCH_RESULTS_LIMIT) -> tuple[list, int]:
+    """Searches every *ready* (closed, non-empty — same bar as
+    ready_lecture_keys) lecture in `year`, optionally narrowed to one
+    `module`, for quiz-channel poll questions containing `query_text`.
+
+    Matching is substring-based on the same Arabic-aware normalized form
+    the nickname filter uses (_normalize_for_filter) — tashkeel, alef/yaa/
+    taa-marbuta letter variants, case, and spacing differences between
+    the query and the stored question text don't cause a false miss.
+
+    Returns (matches, total_count): `matches` is capped at `limit` (in
+    posting order — insertion order of QUIZ_INDEX[year], then ids[] order
+    within each lecture), `total_count` is how many actually matched, so
+    the caller can tell the user "showing 8 of 23" instead of silently
+    truncating. Each match dict has everything deliver_quiz needs to
+    resend it as a poll — "question", "options", "correct_option_id",
+    "explanation" — plus "lecture_name"/"module"/"subject" for the
+    caption shown above each resent poll. A poll whose content was never
+    captured (very old, pre-tracking content) can't be resent and is
+    silently skipped, same bar _snapshot_from_mid uses."""
+    needle = _normalize_for_filter(query_text)
+    if not needle:
+        return [], 0
+    status_by_mid = _poll_status_index(year)
+    matches, total = [], 0
+    for entry in QUIZ_INDEX.get(year, {}).values():
+        if not entry.get("closed") or not entry.get("ids"):
+            continue
+        if module and entry.get("module") != module:
+            continue
+        for mid in entry["ids"]:
+            status = status_by_mid.get(mid)
+            question    = status.get("question")           if status else None
+            options     = status.get("options")             if status else None
+            correct_id  = status.get("correct_option_id")   if status else None
+            if not question or not options or correct_id is None:
+                continue   # uncaptured/legacy content — can't be resent as a poll
+            if needle not in _normalize_for_filter(question):
+                continue
+            total += 1
+            if len(matches) < limit:
+                matches.append({
+                    "question":          question,
+                    "options":           options,
+                    "correct_option_id": correct_id,
+                    "explanation":       status.get("explanation"),
+                    "description":       status.get("description"),
+                    "lecture_name":      entry.get("name", "؟"),
+                    "module":            entry.get("module", ""),
+                    "subject":           entry.get("subject", ""),
+                })
+    return matches, total
+
+SEARCH_MOD_ALL = "__ALL__"   # sentinel used in search_mod: callback_data for "search every module"
+
+def _search_scope_label(year: str, module: str | None) -> str:
+    scope = module_label(module) if module else "All Modules"
+    return f"{year_label(year)} — {scope}"
+
+def _search_again_markup(year: str, module: str | None) -> InlineKeyboardMarkup:
+    mod_token = module if module else SEARCH_MOD_ALL
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔎 Search Again", callback_data=f"search_mod:{year}:{mod_token}")],
+        [InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")],
+    ])
+
+SEARCH_RESULTS: dict[int, dict] = {}   # chat_id -> {"token", "year", "module", "query", "matches", "total", "page", "sent"}
+
+def _search_list_view(state: dict, page: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Builds one page of the results list: numbered questions in the text,
+    a grid of number buttons under it (✅ once that question was sent),
+    ⬅️/➡️ paging when there's more than one page, then Search Again / Home."""
+    matches, total = state["matches"], state["total"]
+    pages = max(1, (len(matches) + SEARCH_PAGE_SIZE - 1) // SEARCH_PAGE_SIZE)
+    page = max(0, min(page, pages - 1))
+    state["page"] = page
+    start = page * SEARCH_PAGE_SIZE
+    chunk = matches[start:start + SEARCH_PAGE_SIZE]
+
+    scope_line = f"📚 {_search_scope_label(state['year'], state['module'])}\n🔎 \"{html.escape(state['query'][:80])}\""
+    capped = f" (بعرض أول {len(matches)} — دقق البحث أكتر لو مش لاقي اللي عايزه)" if total > len(matches) else ""
+    page_note = f" — صفحة {page + 1}/{pages}" if pages > 1 else ""
+    lines = [scope_line, "", f"✅ لاقيت {total} سؤال{capped}{page_note}", "اختار رقم السؤال اللي عايز تبعته 👇", ""]
+    for i, m in enumerate(chunk, start + 1):
+        snippet = " ".join(str(m["question"]).split())
+        if len(snippet) > SEARCH_SNIPPET_CHARS:
+            snippet = snippet[:SEARCH_SNIPPET_CHARS].rstrip() + "…"
+        lines.append(f"<b>{i}.</b> {html.escape(snippet)}")
+        lines.append(f"     ↳ {subject_label(m['subject'])} — {html.escape(m['lecture_name'])}")
+
+    token = state["token"]
+    num_buttons = [
+        InlineKeyboardButton(
+            f"✅ {i}" if (i - 1) in state["sent"] else str(i),
+            callback_data=f"srchpick:{token}:{i - 1}",
+        )
+        for i in range(start + 1, start + len(chunk) + 1)
+    ]
+    rows = [num_buttons[j:j + 5] for j in range(0, len(num_buttons), 5)]
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("⬅️ السابق", callback_data=f"srchpage:{token}:{page - 1}"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton("التالي ➡️", callback_data=f"srchpage:{token}:{page + 1}"))
+        rows.append(nav)
+    rows.extend(_search_again_markup(state["year"], state["module"]).inline_keyboard)
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+async def _send_search_results(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
+                                 year: str, module: str | None, query_text: str):
+    """Runs the search, then sends ONE message listing every match with
+    number buttons to pick which question(s) to resend as live quiz polls
+    (see the srchpick:/srchpage: callbacks in button_handler). Nothing is
+    delivered until the user picks. With no matches, just the "no results"
+    message with Search Again / Home — see _search_again_markup."""
+    matches, total = _search_quiz_questions(year, module, query_text)
+
+    if not matches:
+        scope_line = f"📚 {_search_scope_label(year, module)}\n🔎 \"{html.escape(query_text[:80])}\""
+        await context.bot.send_message(
+            chat_id, scope_line + "\n\n📭 مفيش أسئلة اتطابقت مع البحث ده.",
+            parse_mode=ParseMode.HTML, reply_markup=_search_again_markup(year, module),
+        )
+        return
+
+    state = {
+        "token": secrets.token_hex(3), "year": year, "module": module, "query": query_text,
+        "matches": matches, "total": total, "page": 0, "sent": set(),
+    }
+    SEARCH_RESULTS[chat_id] = state   # replaces this chat's previous search; older lists now read as expired
+    text, markup = _search_list_view(state, 0)
+    await context.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+async def _resolve_mistake(context: ContextTypes.DEFAULT_TYPE, entry: dict, status_by_mid: dict | None = None) -> dict | None:
+    """Turns one lightweight MISTAKES_BANK entry ({mid, year, module,
+    subject}) into a full self-contained question dict via
+    _snapshot_from_mid. If the question no longer resolves (its message
+    was deleted since the mistake was recorded), the entry is pruned from
+    MISTAKES_BANK right here — a failed lookup means it'll never resolve
+    again, so there's no point keeping it around. Returns None in that
+    case; callers just skip it.
+
+    status_by_mid, if given, is passed straight through to
+    _snapshot_from_mid (see there) — pass one in when resolving several
+    entries from the same year in a row, e.g. via _resolve_mistakes."""
+    if not _is_valid_mistake_entry(entry):
+        # Malformed entry (missing a required key) — shouldn't happen
+        # given the load/restore-time filtering (see load_mistakes_bank /
+        # restore_mistakes_bank_from_channel), but this crashed the whole
+        # Daily Quiz build once already, so degrade to "prune and skip"
+        # rather than trust that filtering is airtight everywhere.
+        print(f"MISTAKES BANK: skipping and removing malformed entry: {entry!r}")
+        try:
+            MISTAKES_BANK.remove(entry)
+            _mistakes_index_remove(entry)
+            await save_mistakes_bank()
+        except ValueError:
+            pass
+        return None
+    snap = await _snapshot_from_mid(context, entry["year"], entry["mid"], entry["module"], entry["subject"], status_by_mid)
+    if snap is None:
+        try:
+            MISTAKES_BANK.remove(entry)
+            _mistakes_index_remove(entry)
+            await save_mistakes_bank()
+        except ValueError:
+            pass   # already removed by a concurrent lookup — harmless
+    return snap
+
+async def _resolve_mistakes(context: ContextTypes.DEFAULT_TYPE, entries: list) -> list:
+    """Resolves a list of MISTAKES_BANK entries to full question dicts,
+    silently dropping (and pruning) any that no longer resolve. Builds one
+    poll-status index per distinct year among the entries, rather than
+    scanning QUIZ_POLL_STATUS[year] again for every single entry."""
+    status_by_mid_by_year: dict = {}
+    resolved = []
+    for entry in entries:
+        if not _is_valid_mistake_entry(entry):
+            await _resolve_mistake(context, entry)   # logs + prunes it, returns None
+            continue
+        year = entry["year"]
+        if year not in status_by_mid_by_year:
+            status_by_mid_by_year[year] = _poll_status_index(year)
+        snap = await _resolve_mistake(context, entry, status_by_mid_by_year[year])
+        if snap:
+            resolved.append(snap)
+    return resolved
+
+# ── Per-day, per-year shared Daily Quiz questions ────────────────────
+# Built once per (year, day) — the first user of that year to tap Daily
+# Quiz that day pays the build cost, everyone else in that year that day
+# just reads the cached result. Persisted through the same session-
+# persistence channel as LECTURE_SESSIONS/DAILY_QUIZ_SESSIONS/
+# MISTAKES_RETAKE_SESSIONS (see _sessions_snapshot / _restore_sessions_dict
+# / SESSION PERSISTENCE below) so a mid-day restart or redeploy doesn't
+# hand out a different question set than whatever's already been played
+# that day — restore just loads the raw values back in and lets
+# _ensure_daily_quiz_questions_fresh's date check below discard them
+# normally once the day actually rolls over.
+_DAILY_QUIZ_QUESTIONS_DATE: str | None = None
+_DAILY_QUIZ_QUESTIONS: dict[str, list] = {}   # year -> [question dict, ...] (up to DAILY_QUIZ_TOTAL_COUNT)
+
+# One lock per year, created lazily via setdefault (sync, no await in between
+# check and creation, so this is safe despite concurrent_updates()). Without
+# it, every one of the day's first N concurrent Daily Quiz requests for a
+# year sees `year not in _DAILY_QUIZ_QUESTIONS` before any of them finishes
+# building, so all N pay the full build cost instead of 1 build + (N-1)
+# cheap cache reads.
+_DAILY_QUIZ_BUILD_LOCKS: dict[str, asyncio.Lock] = {}
+
+def _ensure_daily_quiz_questions_fresh() -> None:
+    """Call before any read of _DAILY_QUIZ_QUESTIONS. Clears every year's
+    cached questions the first time it's called on a new day, so the
+    day's first request per year rebuilds fresh content."""
+    global _DAILY_QUIZ_QUESTIONS_DATE, _DAILY_QUIZ_QUESTIONS
+    today = _today()
+    if _DAILY_QUIZ_QUESTIONS_DATE != today:
+        _DAILY_QUIZ_QUESTIONS = {}
+        _DAILY_QUIZ_QUESTIONS_DATE = today
+
+async def _build_daily_quiz_questions(context: ContextTypes.DEFAULT_TYPE, year: str) -> list:
+    """Up to DAILY_QUIZ_TOTAL_COUNT (15) questions, drawn
+    at random from `year`'s ready pool — no mistakes-bank content.
+    Respects the admin-set /daily_module scope if it's set for this year.
+    Falls short gracefully (a shorter, or empty, run) if there isn't
+    enough ready content yet."""
+    subject_pool = _daily_quiz_subject_pool(year)
+    # Flatten to one (module, subject, mid) tuple per ready question, so
+    # picking is a plain random sample over individual questions — not a
+    # pick-a-subject-then-one-question-from-it scheme, which would cap
+    # this at one question per subject.
+    all_mids = [
+        (module, subject, mid)
+        for (module, subject), mids in subject_pool.items()
+        for mid in mids
+    ]
+    random.shuffle(all_mids)
+
+    status_by_mid = _poll_status_index(year)   # one scan, reused for every pick below
+
+    questions = []
+    for module, subject, mid in all_mids:
+        if len(questions) >= DAILY_QUIZ_TOTAL_COUNT:
+            break
+        snap = await _snapshot_from_mid(context, year, mid, module, subject, status_by_mid)
+        if snap:
+            questions.append(snap)
+
+    return questions
+
+async def get_daily_quiz_questions(context: ContextTypes.DEFAULT_TYPE, year: str) -> list:
+    """Today's shared Daily Quiz questions for `year`, building and
+    caching them on first request of the day."""
+    _ensure_daily_quiz_questions_fresh()
+    if year not in _DAILY_QUIZ_QUESTIONS:
+        # Double-checked locking: the cheap path above (699 reads) never
+        # touches the lock at all. Only a genuine cache miss pays for the
+        # lock acquire, and only the first miss for this year pays for the
+        # build — everyone else queued behind the lock re-checks the cache
+        # (now warm) and returns immediately instead of building again.
+        lock = _DAILY_QUIZ_BUILD_LOCKS.setdefault(year, asyncio.Lock())
+        async with lock:
+            _ensure_daily_quiz_questions_fresh()  # guards against the day rolling over mid-wait
+            if year not in _DAILY_QUIZ_QUESTIONS:
+                _DAILY_QUIZ_QUESTIONS[year] = await _build_daily_quiz_questions(context, year)
+                # Persist right away rather than waiting for the next periodic
+                # sessions tick — this is the one moment (first build of the day
+                # for this year) a redeploy landing seconds later would otherwise
+                # regenerate a different set. See SESSION PERSISTENCE below.
+                await _flush_sessions_if_changed()
+                await backup_sessions_to_channel(context)
+    return _DAILY_QUIZ_QUESTIONS[year]
+
+def _shuffled_options(options: list, correct_option_id: int) -> tuple:
+    """Returns a shuffled copy of options plus the new index of the
+    correct one. Used per-delivery (not baked into the cached/shared
+    daily question dict) so every user gets their own independent choice
+    order for the same question, rather than everyone seeing option B
+    correct and being able to just compare letters."""
+    order = list(range(len(options)))
+    random.shuffle(order)
+    return [options[i] for i in order], order.index(correct_option_id)
+
+def _question_content_key(question: str, options: list, prefix: str = "quiz") -> str:
+    """Stable content-based key for a question, used to recognize 'the same
+    question' again later (bookmarks, mistakes bank, report matching)
+    regardless of which delivery/session it came from. NOT cryptographic —
+    just needs to be stable and collision-resistant for this purpose.
+    """
+    normalized = "\x1f".join([str(question or "")] + [str(o or "") for o in (options or [])])
+    digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()
+    return f"{prefix}:{digest}"
+
+async def _deliver_next_daily_question(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict) -> bool:
+    """Same idea as _deliver_next_lecture_question, but for a self-
+    contained Daily Quiz question dict — no mid/channel lookups needed,
+    everything required is already sitting in the queue entry. Sets
+    session['current_*']. Returns whether a question went out."""
+    if not session["queue"]:
+        session["current_poll_id"] = None
+        session["current_correct_id"] = None
+        session["current_option_count"] = None
+        session["current_message_id"] = None
+        session["current_delivered_at"] = None
+        return False
+    q = session["queue"].pop(0)
+    session["delivered_count"] = session.get("delivered_count", 0) + 1
+    timer_seconds = get_question_timer_seconds(user_id)
+    options, correct_option_id = _shuffled_options(q["options"], q["correct_option_id"])
+    if q.get("case_study"):
+        try:
+            await context.bot.send_message(
+                chat_id=user_id, text=html.escape(q["case_study"]), parse_mode=ParseMode.HTML,
+            )
+        except Exception as e:
+            print(f"Couldn't send case study for daily quiz question: {e}")
+    poll_kwargs = dict(
+        chat_id=user_id, question=_numbered_question(q["question"], session["delivered_count"]), options=options,
+        type="quiz", correct_option_id=correct_option_id, is_anonymous=False,
+        explanation=(q.get("explanation") or None),
+        open_period=(timer_seconds or None),
+    )
+    _with_poll_description(poll_kwargs, q.get("description"))
+    try:
+        if q.get("image_file_id"):
+            try:
+                msg = await context.bot.send_poll(**poll_kwargs, media=InputMediaPhoto(q["image_file_id"]))
+            except Exception as e:
+                # Same fallback as lecture delivery: separate photo, then the poll.
+                print(f"POLL MEDIA ERROR for daily quiz question (falling back to separate image message): {e}")
+                await context.bot.send_photo(chat_id=user_id, photo=q["image_file_id"])
+                msg = await context.bot.send_poll(**poll_kwargs)
+        else:
+            msg = await context.bot.send_poll(**poll_kwargs)
+    except Exception as e:
+        print(f"Couldn't send daily quiz question: {e}")
+        session["delivered_count"] -= 1   # this send never went out — don't burn a number on it
+        return await _deliver_next_daily_question(context, user_id, session)   # try the next one
+    daily_qkey = q.get("question_key") or _question_content_key(
+        q["question"], q.get("options", []), prefix="quiz"
+    )
+    daily_meta = {
+        "question": q.get("question", ""),
+        "options": list(q.get("options", []) or []),
+        "year": q.get("year"),
+        "module": q.get("module"),
+        "subject": q.get("subject"),
+        "source_mid": q.get("source_mid"),
+    }
+    _remember_bookmarkable_question(
+        user_id, msg.message_id, question_key=daily_qkey, metadata=daily_meta,
+    )
+    session["current_poll_id"]    = msg.poll.id
+    session["current_correct_id"] = correct_option_id
+    session["current_option_count"] = len(options)
+    session["current_message_id"] = msg.message_id
+    session["current_delivered_at"] = time.time()  # see _record_time_spent / year leaderboard
+    # q was popped off the queue above, so stash its module/subject on the
+    # session — _advance_daily_quiz_session / _advance_mistakes_retake_session
+    # read these back to credit the right subject in /mystats.
+    session["current_module"]  = q.get("module")
+    session["current_subject"] = q.get("subject")
+    _schedule_question_timeout(context, session.get("kind", "daily"), user_id, msg.poll.id, timer_seconds)
+    await _maybe_send_zikr_poll(context, user_id)
+    return True
+
+async def _advance_daily_quiz_session(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict, is_correct: bool, message_id: int | None, delivered_at: float | None = None):
+    """Daily Quiz's counterpart to _advance_lecture_session: same XP
+    (15/5/+25 completion) and same lecture_questions/lecture_streak
+    achievement tracking (a Daily Quiz question is still practice, so it
+    counts toward those same stats — and therefore toward the year
+    leaderboard's correct-count/duration ranking too) — but no
+    lecture_key, so no dead-poll pruning, no legacy-content recovery, and
+    no _record_lecture_result/PER-LECTURE leaderboard involvement; there's
+    no single lecture for this to be an "attempt" of."""
+    session["answered"] += 1
+    session["correct"] = session.get("correct", 0) + (1 if is_correct else 0)
+    if delivered_at is not None:
+        elapsed = time.time() - delivered_at
+        _record_time_spent(user_id, elapsed)
+        session["duration_seconds"] = session.get("duration_seconds", 0.0) + elapsed
+
+    sent_next = await _deliver_next_daily_question(context, user_id, session)
+    is_last   = not sent_next
+
+    per_question_xp = XP_LECTURE_CORRECT if is_correct else XP_LECTURE_INCORRECT
+    xp_delta = per_question_xp + (XP_LECTURE_COMPLETE_BONUS if is_last else 0)
+    session["xp_earned"] = session.get("xp_earned", 0) + xp_delta
+
+    events     = await _record_activity(user_id, persist=False)
+    user_entry = _get_entry(user_id)
+    prev_streak = user_entry.get("lecture_correct_streak_current", 0)
+    user_entry["lecture_questions_answered"]  += 1
+    user_entry["lecture_questions_correct"]   += 1 if is_correct else 0
+    user_entry["lecture_questions_incorrect"] += 0 if is_correct else 1
+    _record_weekly_answer(user_entry, is_correct)
+    _record_subject_answer(user_entry, session.get("current_module"), session.get("current_subject"), is_correct)
+    if is_correct:
+        user_entry["lecture_correct_streak_current"] += 1
+        if user_entry["lecture_correct_streak_current"] > user_entry["lecture_correct_streak_best"]:
+            user_entry["lecture_correct_streak_best"] = user_entry["lecture_correct_streak_current"]
+    else:
+        user_entry["lecture_correct_streak_current"] = 0
+
+    await _react_to_lecture_answer(
+        context, user_id, message_id,
+        is_correct=is_correct,
+        new_streak=user_entry["lecture_correct_streak_current"],
+        streak_broken=(not is_correct and prev_streak > 0),
+    )
+
+    events["achievements"] += _check_achievements(user_entry, "questions_answered")
+    events["achievements"] += _check_achievements(user_entry, "correct_streak")
+    events["achievements"] += _check_achievements(user_entry, "achievement_collector")
+
+    _award_xp(user_entry, xp_delta)
+    final_level = _xp_to_level(user_entry["xp"])
+    if final_level > user_entry["level"]:
+        user_entry["level"] = final_level
+        events["level_up"] = final_level
+    _mark_analytics_dirty()
+    await _announce_events(context, user_id, events)
+    await backup_analytics_to_channel(context)
+
+    if is_last:
+        total     = session["total"]
+        correct   = session["correct"]
+        incorrect = session["answered"] - correct
+        pct       = round(correct / session["answered"] * 100) if session["answered"] else 0
+        year      = session["year"]
+        duration  = session.get("duration_seconds", 0.0)
+        _record_daily_leaderboard_finish(user_id, year, correct, session["answered"], duration)
+
+        # Daily Quiz completion count + its tier achievement, plus the
+        # basmagy/insomniac Extras — all reuse data this block already
+        # has (duration/pct) or that _finalize_daily_leaderboard's medal
+        # tally elsewhere reuses the same DAILY_QUIZ_LEADERBOARD entry
+        # for, rather than tracking anything new.
+        user_entry["daily_quizzes_completed"] = user_entry.get("daily_quizzes_completed", 0) + 1
+        daily_events = _check_achievements(user_entry, "daily_quiz")
+        if duration > 0 and duration < 60 and session["answered"] > 0 and pct == 100:
+            ach = _check_extra_achievement(user_entry, "basmagy")
+            if ach:
+                daily_events.append(ach)
+        now_hour = datetime.now(DAILY_QUIZ_TZ).hour
+        if 2 <= now_hour < 5:
+            ach = _check_extra_achievement(user_entry, "insomniac")
+            if ach:
+                daily_events.append(ach)
+        daily_events += _check_achievements(user_entry, "achievement_collector")
+        daily_level = 0
+        final_level = _xp_to_level(user_entry["xp"])
+        if final_level > user_entry["level"]:
+            user_entry["level"] = final_level
+            daily_level = final_level
+        _mark_analytics_dirty()
+        await _announce_events(context, user_id, {"achievements": daily_events, "level_up": daily_level})
+        await backup_analytics_to_channel(context)
+
+        summary = (
+            f"💥 <b>خلصت الـ Daily Quiz!</b>\n\n"
+            f"✅ صح: {correct}\n"
+            f"❌ غلط: {incorrect}\n"
+            f"📊 نسبة: {pct}%\n"
+            f"📝 عدد الأسئلة: {session['answered']}/{total}\n"
+            f"✨ XP: <b>+{session['xp_earned']}</b>\n\n"
+            + (f"{QUIZZY_PERFECT_SCORE_LINE}\n\n" if session["answered"] > 0 and pct == 100 else "")
+            + f"{_next_daily_quiz_line()}"
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=user_id, text=summary, parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🏆 Daily Leaderboard", callback_data="daily_quiz"),
+                    InlineKeyboardButton("🏠 Back to Home", callback_data="back_home"),
+                ]]),
+            )
+        except Exception:
+            pass
+        DAILY_QUIZ_SESSIONS.pop(user_id, None)
+
+def get_daily_quiz_last_date(user_id: int) -> str | None:
+    return SETTINGS.get(str(user_id), {}).get("daily_quiz_last_date")
+
+# ── Admin-set Daily Quiz scope ──────────────────────────────────
+# By default the random-questions pool for each year's Daily Quiz draws
+# from that year's whole curriculum. An admin can narrow one year to a
+# specific module (e.g. whatever's currently being taught) via
+# /daily_module — see _daily_quiz_subject_pool. (The mistakes bank has
+# its own separate 🧠 Mistakes Bank retake flow — see _scoped_mistakes_bank —
+# no longer feeds into the Daily Quiz.)
+#
+# Stored under a reserved key in SETTINGS (not a per-user key — this is a
+# single global switch) so it rides on the exact same backup/restore path
+# as everything else there, with no new infrastructure needed.
+def get_daily_quiz_scope() -> dict | None:
+    """{"year": ..., "module": ...} to restrict the subject pool to one
+    module, or None for the default (every configured year/module)."""
+    return SETTINGS.get("_daily_quiz_scope")
+
+async def set_daily_quiz_scope(year: str | None, module: str | None) -> None:
+    if year and module:
+        SETTINGS["_daily_quiz_scope"] = {"year": year, "module": module}
+    else:
+        SETTINGS.pop("_daily_quiz_scope", None)
+    await save_settings()
+
+async def _prompt_daily_quiz_year_class(context: ContextTypes.DEFAULT_TYPE, user_id: int, message=None) -> None:
+    """Shown in place of the Daily Quiz hub when the user hasn't set a
+    Year/Class in Settings yet — we need it to know which year's shared
+    quiz to give them. Reuses the same picker as onboarding/Settings, its
+    own "dqyc:" callback prefix routes back into show_daily_quiz_menu
+    once they pick one instead of Settings or the onboarding welcome."""
+    text = "📚 محتاج تحدد سنتك/فرقتك الأول، عشان نجيبلك الـ Daily Quiz بتاع سنتك:"
+    keyboard = year_class_keyboard("dqyc")
+    if message:
+        await message.edit_text(text, reply_markup=keyboard)
+    else:
+        await context.bot.send_message(chat_id=user_id, text=text, reply_markup=keyboard)
+
+async def show_daily_quiz_menu(context: ContextTypes.DEFAULT_TYPE, user_id: int, message=None) -> None:
+    """The 💥Daily Quiz💥 main-menu button's destination: always shows
+    today's Daily Quiz leaderboard for the user's own Year/Class
+    (get_year_class — prompting them to set it first if they haven't),
+    plus a Start button if they haven't run today's quiz yet — this is
+    also where the leaderboard lives now, instead of its own separate
+    main-menu button."""
+    year_class = get_year_class(user_id)
+    if year_class not in YEAR_CLASS_NUMBER:
+        await _prompt_daily_quiz_year_class(context, user_id, message)
+        return
+
+    _ensure_daily_leaderboard_fresh()
+    rows = _rank_daily_leaderboard(year_class)
+    board_title = f"🏆 <b>Daily Quiz Leaderboard — {year_class_label(year_class)} — النهاردة</b>"
+    if not rows:
+        board_text = f"{board_title}\n\nمفيش حد خلص الـ Daily Quiz النهاردة لسه."
+    else:
+        medal = {0: "🥇", 1: "🥈", 2: "🥉"}
+        lines = [board_title, ""]
+        for i, r in enumerate(rows):
+            rank = medal.get(i, f"{i + 1}.")
+            lines.append(
+                f"{rank} {html.escape(r['name'])} — "
+                f"{r['correct']}/{r['total']} ✅ · ⏱️ {_format_duration(r['duration'])}"
+            )
+        board_text = "\n".join(lines)
+
+    board_text = f"{quizzy_block(QUIZZY_READY_ART, 'CHALLENGE YOURSELF!')}\n\n{board_text}"
+
+    already_done = get_daily_quiz_last_date(user_id) == _today()
+    status_line = (
+        f"✅ خلصت الـ Daily Quiz بتاع النهاردة خلاص.\n\n{_next_daily_quiz_line()}"
+        if already_done else
+        f"💥 اضغط تحت تبدأ الـ Daily Quiz بتاع النهاردة — {DAILY_QUIZ_TOTAL_COUNT} سؤال."
+    )
+    text = f"{board_text}\n\n{status_line}"
+
+    rows_buttons = []
+    if not already_done:
+        rows_buttons.append([InlineKeyboardButton("▶️ Start Daily Quiz", callback_data="daily_quiz_begin")])
+    rows_buttons.append([InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")])
+    keyboard = InlineKeyboardMarkup(rows_buttons)
+
+    if message:
+        await message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+    else:
+        await context.bot.send_message(chat_id=user_id, text=text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+async def start_daily_quiz(context: ContextTypes.DEFAULT_TYPE, user_id: int, message=None) -> None:
+    """Starts the user's own year's shared Daily Quiz run. message, if
+    given, gets edited with the "starting..." line instead of a fresh
+    message being sent (matches the lecture-start button pattern).
+    Once-per-day gating happens here, keyed off the caller's local
+    calendar date at the time they tap — not the push time — so someone
+    who gets the 2pm ping but taps it at 11pm still only gets today's
+    quiz once."""
+    year_class = get_year_class(user_id)
+    if year_class not in YEAR_CLASS_NUMBER:
+        await _prompt_daily_quiz_year_class(context, user_id, message)
+        return
+
+    today = _today()
+    if get_daily_quiz_last_date(user_id) == today:
+        # Already done — send them back to the hub (leaderboard + status)
+        # rather than re-starting it.
+        await show_daily_quiz_menu(context, user_id, message)
+        return
+
+    questions = await get_daily_quiz_questions(context, year_class)
+    if not questions:
+        text = "لسه مفيش أسئلة كفاية النهاردة — جرب تاني بعدين."
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")]])
+        if message:
+            await message.edit_text(text, reply_markup=keyboard)
+        else:
+            await context.bot.send_message(chat_id=user_id, text=text, reply_markup=keyboard)
+        return
+
+    entry = _get_settings_entry(user_id)
+    entry["daily_quiz_last_date"] = today
+    # Hot path (every Daily Quiz start, from every user) — defer the full
+    # SETTINGS file rewrite to the periodic flush instead of paying for one
+    # on every single tap. See _mark_settings_dirty above. The channel
+    # mirror call below is cheap regardless: it's already throttled to
+    # SETTINGS_BACKUP_MIN_INTERVAL and no-ops on most calls.
+    _mark_settings_dirty()
+    await backup_settings_to_channel(context)
+
+    session = {
+        "queue": list(questions), "current_poll_id": None, "current_correct_id": None,
+        "current_message_id": None, "total": len(questions), "answered": 0, "correct": 0,
+        "year": year_class, "kind": "daily",
+    }
+    DAILY_QUIZ_SESSIONS[user_id] = session
+
+    text = f"💥 <b>Daily Quiz</b> — {len(questions)} سؤال 👇"
+    if message:
+        await message.edit_text(text, parse_mode=ParseMode.HTML)
+    else:
+        await context.bot.send_message(chat_id=user_id, text=text, parse_mode=ParseMode.HTML)
+
+    sent = await _deliver_next_daily_question(context, user_id, session)
+    if not sent:
+        DAILY_QUIZ_SESSIONS.pop(user_id, None)
+        await context.bot.send_message(chat_id=user_id, text="⚠️ حصلت مشكلة في تجهيز الأسئلة — جرب تاني.")
+
+# ── Zikr poll — Settings toggle, ON by default ──────────────────────
+# Was a random one-line text message pushed once an hour to everyone
+# opted in. Now usage-based instead of time-based: a single FIXED
+# multiple-choice (non-quiz) poll, sent to a user every
+# ZIKR_POLL_QUESTION_INTERVAL (7) quiz questions they're delivered —
+# across every live-delivery path (deliver_quiz, lecture sessions,
+# Daily Quiz, spaced-repetition re-asks). Per-user count lives in
+# ANALYTICS[uid]["zikr_question_count"] (see _blank_entry), so it
+# persists across restarts same as every other analytics field. Same
+# opt-out toggle as before (Settings -> More Settings -> Zikr) and same
+# "skip sleeping users" behavior as the old push.
+ZIKR_POLL_QUESTION_INTERVAL = 7
+
+ZIKR_POLL_TITLE = "لا تنسى ذكر الله ❤️❤️"
+ZIKR_POLL_OPTIONS = [
+    "سبحان الله ❤️",
+    "الحمد لله ❤️",
+    "لا إله إلا الله ❤️",
+    "الله أكبر ❤️",
+    "ولا حول ولا قوة الا بالله ❤️",
+    "اللهم صلي وسلم وبارك على نبينا محمد ❤️",
+]
+
+async def _maybe_send_zikr_poll(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
+    """Call once after EVERY quiz question successfully delivered to
+    `user_id`, from any live-delivery path. Bumps that user's running
+    question count and, every ZIKR_POLL_QUESTION_INTERVAL questions,
+    resets the count and sends the fixed Zikr poll instead of counting
+    that delivery towards anything further."""
+    if user_id in SLEEPING or not get_zikr_enabled(user_id):
+        return
+    entry = _get_entry(user_id)
+    entry["zikr_question_count"] = entry.get("zikr_question_count", 0) + 1
+    if entry["zikr_question_count"] < ZIKR_POLL_QUESTION_INTERVAL:
+        _mark_analytics_dirty()
+        return
+    entry["zikr_question_count"] = 0
+    _mark_analytics_dirty()
+    try:
+        await context.bot.send_poll(
+            chat_id=user_id, question=ZIKR_POLL_TITLE, options=ZIKR_POLL_OPTIONS,
+            type="regular", allows_multiple_answers=True, is_anonymous=True,
+        )
+    except Exception as e:
+        print(f"Couldn't send Zikr poll to {user_id}: {e}")   # blocked the bot, deactivated account, etc.
+
+# ── Daily zipped backup export — a second, independent copy ────────
+# Every JSON file this bot maintains is already kept in sync with a
+# per-system pinned-message backup in its own channel/group (see the
+# backup_*_to_channel / restore_*_from_channel functions throughout this
+# file). This job is a belt-and-suspenders extra on top of that: once a
+# day it zips up every local data file that currently exists and drops
+# the archive straight into ERROR_LOG_GROUP_ID (a chat the admin already
+# watches), so there's a single flat file with everything in one place
+# even if a backup channel/group itself were ever lost or misconfigured.
+def _daily_backup_export_file_paths() -> list:
+    paths = [
+        USERS_FILE, ANALYTICS_FILE, SETTINGS_FILE, LECTURE_RESULTS_FILE,
+        MISTAKES_BANK_FILE, STORAGE_INDEX_FILE, STORAGE_BACKUP_STATE_FILE,
+        REPORT_THREADS_FILE, QUESTION_REPORTS_FILE,
+    ]
+    for year in YEAR_ORDER:
+        paths += [
+            QUIZ_INDEX_FILE_TMPL.format(year=year),
+            QUIZ_STATE_FILE_TMPL.format(year=year),
+            QUIZ_POLL_STATUS_FILE_TMPL.format(year=year),
+        ]
+    return paths
+
+async def _daily_backup_export_job(context: ContextTypes.DEFAULT_TYPE):
+    """Once a day (see job_queue.run_daily in MAIN, DAILY_BACKUP_EXPORT_HOUR/
+    MIN): zips every local data file that currently exists (a file that
+    was never created yet — e.g. a year with no channel configured — is
+    just skipped, not an error) and sends the archive to
+    ERROR_LOG_GROUP_ID. The zip is built off the event loop
+    (asyncio.to_thread) since zipping is blocking I/O, and the temp file
+    is always cleaned up afterwards, success or failure."""
+    if not ERROR_LOG_GROUP_ID:
+        return
+    existing = [p for p in _daily_backup_export_file_paths() if os.path.exists(p)]
+    if not existing:
+        return
+
+    date_str = datetime.now(DAILY_QUIZ_TZ).strftime("%Y-%m-%d")
+    zip_path = os.path.join(tempfile.gettempdir(), f"quizician_backup_{date_str}.zip")
+
+    def _make_zip():
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for p in existing:
+                zf.write(p, arcname=os.path.basename(p))
+
+    try:
+        await asyncio.to_thread(_make_zip)
+        with open(zip_path, "rb") as f:
+            await context.bot.send_document(
+                chat_id=ERROR_LOG_GROUP_ID,
+                document=InputFile(f, filename=os.path.basename(zip_path)),
+                caption=f"🗄 Daily backup export — {date_str} ({len(existing)} files)",
+            )
+    except Exception as e:
+        print(f"Daily backup export failed: {e}")
+    finally:
+        if os.path.exists(zip_path):
+            os.remove(zip_path)
+
+async def _daily_quiz_push_job(context: ContextTypes.DEFAULT_TYPE):
+    """The 2pm-Cairo push (see job_queue.run_daily in MAIN): just a
+    button in each user's chat, not an auto-started quiz — tapping it is
+    what calls start_daily_quiz and applies the once-per-day gate. Skips
+    anyone who's turned it off via Settings -> More Settings -> Daily
+    Notification (get_daily_notifs_enabled) — the quiz itself stays
+    reachable from the main menu either way, this only silences the ping.
+
+    Finalizes (awards medals for) the outgoing day's Daily Quiz
+    leaderboard FIRST, right as this next one goes out — so top-3
+    finishers get their medal exactly when the new quiz appears, instead
+    of whenever someone next happens to open the leaderboard screen."""
+    _finalize_daily_leaderboard()
+    _ensure_daily_leaderboard_fresh()   # rolls the tracked date forward for today's fresh board
+    for uid in list(USERS):
+        if not get_daily_notifs_enabled(uid):
+            continue
+        try:
+            await context.bot.send_message(
+                chat_id=uid,
+                text="💥 <b>Daily Quiz</b> !الكويز اليومي أتجدد",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("💥Daily Quiz💥", callback_data="daily_quiz"),
+                ]]),
+            )
+        except Exception:
+            pass   # blocked the bot, deactivated account, etc. — skip silently, same as broadcast_cmd
+
+# ═══════════════════════════════════════════════════════════════
+# MISTAKES BANK RETAKE — 🧠 Mistakes Bank menu button lets a user fire off
+# every question in the (module-scoped) MISTAKES_BANK as a one-shot
+# practice quiz. Same self-contained-question shape and delivery mechanics
+# as the Daily Quiz (_deliver_next_daily_question works unchanged here —
+# it only ever touches the passed-in session dict), just its own session
+# map and completion message so it doesn't collide with an in-flight Daily
+# Quiz for the same user.
+# ═══════════════════════════════════════════════════════════════
+MISTAKES_RETAKE_SESSIONS = {}   # user_id -> same session shape as DAILY_QUIZ_SESSIONS
+
+async def start_mistakes_retake(context: ContextTypes.DEFAULT_TYPE, user_id: int, message=None) -> None:
+    """Every question currently in this user's mistakes bank, restricted to
+    the admin-set /daily_module scope (or the whole bank if no scope is
+    set), sent one at a time. No once-per-day gate — unlike the Daily
+    Quiz, this is an on-demand review the user can retake as often as they
+    like."""
+    entries   = list(_scoped_mistakes_bank(user_id))
+    questions = await _resolve_mistakes(context, entries) if entries else []
+    if not questions:
+        text = "أما أنت كينج صحيح - 🎉 مفيش أخطاء متسجلة في بنك الأخطاء دلوقتي!"
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")]])
+        if message:
+            await message.edit_text(text, reply_markup=keyboard)
+        else:
+            await context.bot.send_message(chat_id=user_id, text=text, reply_markup=keyboard)
+        return
+
+    random.shuffle(questions)
+    session = {
+        "queue": questions, "current_poll_id": None, "current_correct_id": None,
+        "current_message_id": None, "total": len(questions), "answered": 0, "correct": 0,
+        "kind": "retake",
+    }
+    MISTAKES_RETAKE_SESSIONS[user_id] = session
+
+    text = f"🧠 <b>مراجعة بنك الأخطاء</b> — {len(questions)} سؤال، هيتبعتولك واحد واحد 👇"
+    if message:
+        await message.edit_text(text, parse_mode=ParseMode.HTML)
+    else:
+        await context.bot.send_message(chat_id=user_id, text=text, parse_mode=ParseMode.HTML)
+
+    sent = await _deliver_next_daily_question(context, user_id, session)
+    if not sent:
+        MISTAKES_RETAKE_SESSIONS.pop(user_id, None)
+        await context.bot.send_message(chat_id=user_id, text="⚠️ حصلت مشكلة في تجهيز الأسئلة — جرب تاني.")
+
+async def _advance_mistakes_retake_session(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict, is_correct: bool, message_id: int | None, delivered_at: float | None = None):
+    """Mistakes-retake counterpart to _advance_daily_quiz_session — same
+    XP/streak/achievement bookkeeping, its own completion summary text."""
+    session["answered"] += 1
+    session["correct"] = session.get("correct", 0) + (1 if is_correct else 0)
+    if delivered_at is not None:
+        _record_time_spent(user_id, time.time() - delivered_at)
+
+    sent_next = await _deliver_next_daily_question(context, user_id, session)
+    is_last   = not sent_next
+
+    per_question_xp = XP_LECTURE_CORRECT if is_correct else XP_LECTURE_INCORRECT
+    xp_delta = per_question_xp + (XP_LECTURE_COMPLETE_BONUS if is_last else 0)
+    session["xp_earned"] = session.get("xp_earned", 0) + xp_delta
+
+    events     = await _record_activity(user_id, persist=False)
+    user_entry = _get_entry(user_id)
+    prev_streak = user_entry.get("lecture_correct_streak_current", 0)
+    user_entry["lecture_questions_answered"]  += 1
+    user_entry["lecture_questions_correct"]   += 1 if is_correct else 0
+    user_entry["lecture_questions_incorrect"] += 0 if is_correct else 1
+    _record_weekly_answer(user_entry, is_correct)
+    _record_subject_answer(user_entry, session.get("current_module"), session.get("current_subject"), is_correct)
+    if is_correct:
+        user_entry["lecture_correct_streak_current"] += 1
+        if user_entry["lecture_correct_streak_current"] > user_entry["lecture_correct_streak_best"]:
+            user_entry["lecture_correct_streak_best"] = user_entry["lecture_correct_streak_current"]
+    else:
+        user_entry["lecture_correct_streak_current"] = 0
+
+    await _react_to_lecture_answer(
+        context, user_id, message_id,
+        is_correct=is_correct,
+        new_streak=user_entry["lecture_correct_streak_current"],
+        streak_broken=(not is_correct and prev_streak > 0),
+    )
+
+    events["achievements"] += _check_achievements(user_entry, "questions_answered")
+    events["achievements"] += _check_achievements(user_entry, "correct_streak")
+    events["achievements"] += _check_achievements(user_entry, "achievement_collector")
+
+    _award_xp(user_entry, xp_delta)
+    final_level = _xp_to_level(user_entry["xp"])
+    if final_level > user_entry["level"]:
+        user_entry["level"] = final_level
+        events["level_up"] = final_level
+    _mark_analytics_dirty()
+    await _announce_events(context, user_id, events)
+    await backup_analytics_to_channel(context)
+
+    if is_last:
+        total     = session["total"]
+        correct   = session["correct"]
+        incorrect = session["answered"] - correct
+        pct       = round(correct / session["answered"] * 100) if session["answered"] else 0
+        summary = (
+            f"🧠 <b>خلصت مراجعة بنك الأخطاء!</b>\n\n"
+            f"✅ صح: {correct}\n"
+            f"❌ غلط: {incorrect}\n"
+            f"📊 نسبة: {pct}%\n"
+            f"📝 عدد الأسئلة: {session['answered']}/{total}\n"
+            f"✨ XP: <b>+{session['xp_earned']}</b>"
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=user_id, text=summary, parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🏠 Back to Home", callback_data="back_home"),
+                ]]),
+            )
+        except Exception:
+            pass
+        MISTAKES_RETAKE_SESSIONS.pop(user_id, None)
+
+# ═══════════════════════════════════════════════════════════════
+# BOOKMARKS RETAKE — ❤️ Bookmarks menu's "🔁 Retake Questions" button
+# fires off every one of this user's type="bookmarked" entries as a
+# one-shot practice quiz, exactly the same delivery mechanics as the
+# Mistakes Bank retake above (same _deliver_next_daily_question, same
+# session shape). Its own session map/kind ("bmretake") so it can run
+# independently of an in-flight Daily Quiz / Mistakes Bank retake for the
+# same user. Unlike mistakes bank entries, bookmark entries already carry
+# a full question snapshot (see _bookmark_question) — no mid lookup /
+# resolve step needed, they're used as-is.
+# ═══════════════════════════════════════════════════════════════
+BOOKMARKS_RETAKE_SESSIONS = {}   # user_id -> same session shape as DAILY_QUIZ_SESSIONS
+
+def _resolved_bookmarks(user_id: int) -> list:
+    """This user's bookmark entries as self-contained question dicts ready
+    to resend as polls. Each is a COPY of the stored entry (the persisted
+    bank entry is never mutated, so images/cases don't bloat the bank).
+
+    Bookmarks saved from the ❤️ reaction don't store the correct answer or
+    explanation, and never store a photo or case study — so when the entry
+    has a year + source_mid, the missing pieces are looked up from
+    QUIZ_POLL_STATUS[year] / QUIZ_INDEX[year] by that mid (same source the
+    lecture and Daily Quiz deliveries use). Values the entry already has
+    win over the lookup. Entries without a source_mid (older
+    Daily-Quiz-saved bookmarks, ad-hoc questions) just use what they
+    stored: they retake fine if complete, without an image/case."""
+    status_by_year: dict = {}
+    attach_by_year: dict = {}
+    resolved = []
+    for entry in _bookmark_list(user_id):
+        item = dict(entry)
+        year, mid = item.get("year"), item.get("source_mid")
+        if year and mid is not None and year in QUIZ_POLL_STATUS:
+            if year not in status_by_year:
+                status_by_year[year] = _poll_status_index(year)
+                attach_by_year[year] = _attachment_index(year)
+            status = status_by_year[year].get(mid)
+            if status:
+                if not isinstance(item.get("correct_option_id"), int):
+                    item["correct_option_id"] = status.get("correct_option_id")
+                if not item.get("explanation"):
+                    item["explanation"] = status.get("explanation")
+                if not item.get("description") and status.get("description"):
+                    item["description"] = status["description"]
+            item.update(attach_by_year[year].get(mid, {}))
+        question = item.get("question")
+        options  = item.get("options") or []
+        correct  = item.get("correct_option_id")
+        if not question or len(options) < 2 or not isinstance(correct, int) or not (0 <= correct < len(options)):
+            continue
+        resolved.append(item)
+    return resolved
+
+async def start_bookmarks_retake(context: ContextTypes.DEFAULT_TYPE, user_id: int, message=None) -> None:
+    """Every question currently in this user's ❤️ Bookmarks, sent one at a
+    time. No once-per-day gate — like the Mistakes Bank retake, this is an
+    on-demand review the user can retake as often as they like."""
+    questions = _resolved_bookmarks(user_id)
+    if not questions:
+        text = "مفيش أسئلة محفوظة لسه! ❤️ اعمل ❤️ على أي سؤال عشان يتضاف هنا."
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")]])
+        if message:
+            await message.edit_text(text, reply_markup=keyboard)
+        else:
+            await context.bot.send_message(chat_id=user_id, text=text, reply_markup=keyboard)
+        return
+
+    random.shuffle(questions)
+    session = {
+        "queue": list(questions), "current_poll_id": None, "current_correct_id": None,
+        "current_message_id": None, "total": len(questions), "answered": 0, "correct": 0,
+        "kind": "bmretake",
+    }
+    BOOKMARKS_RETAKE_SESSIONS[user_id] = session
+
+    text = f"❤️ <b>مراجعة Bookmarks</b> — {len(questions)} سؤال، هيتبعتولك واحد واحد 👇"
+    if message:
+        await message.edit_text(text, parse_mode=ParseMode.HTML)
+    else:
+        await context.bot.send_message(chat_id=user_id, text=text, parse_mode=ParseMode.HTML)
+
+    sent = await _deliver_next_daily_question(context, user_id, session)
+    if not sent:
+        BOOKMARKS_RETAKE_SESSIONS.pop(user_id, None)
+        await context.bot.send_message(chat_id=user_id, text="⚠️ حصلت مشكلة في تجهيز الأسئلة — جرب تاني.")
+
+async def _advance_bookmarks_retake_session(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict, is_correct: bool, message_id: int | None, delivered_at: float | None = None):
+    """Bookmarks-retake counterpart to _advance_mistakes_retake_session —
+    same XP/streak/achievement bookkeeping, its own completion summary
+    text."""
+    session["answered"] += 1
+    session["correct"] = session.get("correct", 0) + (1 if is_correct else 0)
+    if delivered_at is not None:
+        _record_time_spent(user_id, time.time() - delivered_at)
+
+    sent_next = await _deliver_next_daily_question(context, user_id, session)
+    is_last   = not sent_next
+
+    per_question_xp = XP_LECTURE_CORRECT if is_correct else XP_LECTURE_INCORRECT
+    xp_delta = per_question_xp + (XP_LECTURE_COMPLETE_BONUS if is_last else 0)
+    session["xp_earned"] = session.get("xp_earned", 0) + xp_delta
+
+    events     = await _record_activity(user_id, persist=False)
+    user_entry = _get_entry(user_id)
+    prev_streak = user_entry.get("lecture_correct_streak_current", 0)
+    user_entry["lecture_questions_answered"]  += 1
+    user_entry["lecture_questions_correct"]   += 1 if is_correct else 0
+    user_entry["lecture_questions_incorrect"] += 0 if is_correct else 1
+    _record_weekly_answer(user_entry, is_correct)
+    _record_subject_answer(user_entry, session.get("current_module"), session.get("current_subject"), is_correct)
+    if is_correct:
+        user_entry["lecture_correct_streak_current"] += 1
+        if user_entry["lecture_correct_streak_current"] > user_entry["lecture_correct_streak_best"]:
+            user_entry["lecture_correct_streak_best"] = user_entry["lecture_correct_streak_current"]
+    else:
+        user_entry["lecture_correct_streak_current"] = 0
+
+    await _react_to_lecture_answer(
+        context, user_id, message_id,
+        is_correct=is_correct,
+        new_streak=user_entry["lecture_correct_streak_current"],
+        streak_broken=(not is_correct and prev_streak > 0),
+    )
+
+    events["achievements"] += _check_achievements(user_entry, "questions_answered")
+    events["achievements"] += _check_achievements(user_entry, "correct_streak")
+    events["achievements"] += _check_achievements(user_entry, "achievement_collector")
+
+    _award_xp(user_entry, xp_delta)
+    final_level = _xp_to_level(user_entry["xp"])
+    if final_level > user_entry["level"]:
+        user_entry["level"] = final_level
+        events["level_up"] = final_level
+    _mark_analytics_dirty()
+    await _announce_events(context, user_id, events)
+    await backup_analytics_to_channel(context)
+
+    if is_last:
+        total     = session["total"]
+        correct   = session["correct"]
+        incorrect = session["answered"] - correct
+        pct       = round(correct / session["answered"] * 100) if session["answered"] else 0
+        summary = (
+            f"❤️ <b>خلصت مراجعة Bookmarks!</b>\n\n"
+            f"✅ صح: {correct}\n"
+            f"❌ غلط: {incorrect}\n"
+            f"📊 نسبة: {pct}%\n"
+            f"📝 عدد الأسئلة: {session['answered']}/{total}\n"
+            f"✨ XP: <b>+{session['xp_earned']}</b>"
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=user_id, text=summary, parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🏠 Back to Home", callback_data="back_home"),
+                ]]),
+            )
+        except Exception:
+            pass
+        BOOKMARKS_RETAKE_SESSIONS.pop(user_id, None)
+
+# ═══════════════════════════════════════════════════════════════
+# PASSWORD-GATED STORAGE (private group)
+# ═══════════════════════════════════════════════════════════════
+# STORAGE_GROUP_ID is the vault: post any photo/video/document/album there
+# with a caption starting with a password word, and the bot indexes it.
+# A DM containing that exact word gets the item(s) copied to the user.
+STORAGE_INDEX_FILE = "storage_index.json"
+
+def load_storage_index():
+    return _load_json_safe(STORAGE_INDEX_FILE, dict, dict, "STORAGE INDEX")
+
+async def save_storage_index():
+    # See save_analytics for why this snapshot copy is required.
+    await _write_json_serialized(
+        STORAGE_INDEX_FILE, lambda: copy.deepcopy(STORAGE_INDEX), ensure_ascii=False)
+
+# password (lowercased) -> list of items; each item is a list of message_ids
+# (a single-message item is [id], an album is [id1, id2, ...]). Reusing the
+# same password just appends another item — both get delivered on unlock.
+STORAGE_INDEX: dict = load_storage_index()
+
+# media_group_id -> {"ids": [...], "caption": str|None, "task": asyncio.Task}
+# Albums arrive as several separate updates; we debounce them so the whole
+# album gets filed as one item under one password.
+ALBUM_BUFFER: dict = {}
+
+# ── Durable backup: the local JSON files above are only a same-host cache.
+# A bot can't scan a channel's history, but it CAN always read a chat's
+# currently pinned message on demand — restart, redeploy, or host switch
+# doesn't matter. So we mirror USERS + STORAGE_INDEX into one pinned
+# message in the storage group itself, and rebuild the local cache from
+# it on startup if the local files are ever missing/wiped.
+STORAGE_BACKUP_MARKER     = "🗄 QUIZICIAN_STORAGE_BACKUP"
+STORAGE_BACKUP_STATE_FILE = "storage_backup_state.json"
+
+def load_storage_backup_state():
+    return _load_json_safe(STORAGE_BACKUP_STATE_FILE, dict, dict, "STORAGE BACKUP STATE")
+
+async def save_storage_backup_state():
+    # Tiny dict, but kept consistent with every other save_* here — see
+    # save_analytics for why the snapshot copy matters.
+    await _write_json_serialized(
+        STORAGE_BACKUP_STATE_FILE, lambda: copy.deepcopy(STORAGE_BACKUP_STATE), ensure_ascii=False)
+
+STORAGE_BACKUP_STATE: dict = load_storage_backup_state()  # {"backup_msg_id": int}
+
+async def backup_storage_to_channel(context: ContextTypes.DEFAULT_TYPE):
+    if not STORAGE_GROUP_ID:
+        return
+    if not RESTORE_OK["storage"]:
+        print("STORAGE BACKUP SKIPPED — last restore failed, refusing to overwrite the channel backup.")
+        return
+    payload = {"users": list(USERS), "storage_index": STORAGE_INDEX}
+    data    = json.dumps(payload).encode("utf-8")
+    # A pinned document instead of a pinned text message: Bot API caps
+    # documents at 50MB vs ~4KB for a text message — effectively removes
+    # the size ceiling for any realistic amount of data this bot handles.
+    filename = _backup_filename("quizician_storage_backup.json")
+
+    try:
+        sent = await context.bot.send_document(
+            chat_id=STORAGE_GROUP_ID,
+            document=InputFile(BytesIO(data), filename=filename),
+            caption=STORAGE_BACKUP_MARKER,
+        )
+    except Exception as e:
+        print("STORAGE BACKUP ERROR:", e)
+        return
+
+    # Save the message id immediately — pinning is a nice-to-have on top,
+    # and its failure (e.g. bot isn't admin / lacks rights) must NOT stop
+    # us from remembering this new message id.
+    STORAGE_BACKUP_STATE["backup_msg_id"] = sent.message_id
+    await save_storage_backup_state()
+
+    try:
+        await context.bot.pin_chat_message(chat_id=STORAGE_GROUP_ID, message_id=sent.message_id, disable_notification=True)
+    except Exception as e:
+        print("STORAGE BACKUP PIN ERROR (message saved anyway, but won't be pinned — check bot is admin with pin rights):", e)
+
+    # Previous backups are no longer deleted — see the analytics backup
+    # function's comment for why.
+
+async def restore_storage_from_channel(app) -> str:
+    """Runs once on startup — rebuilds USERS + STORAGE_INDEX from the
+    storage group's pinned backup if the local cache is missing/stale."""
+    if not STORAGE_GROUP_ID:
+        return "not_configured"
+
+    async def _do():
+        chat   = await app.bot.get_chat(STORAGE_GROUP_ID)
+        pinned = chat.pinned_message
+        if not pinned or not pinned.document or (pinned.caption or "") != STORAGE_BACKUP_MARKER:
+            raise _RestoreNoBackup()
+        tg_file = await app.bot.get_file(pinned.document.file_id)
+        raw     = await tg_file.download_as_bytearray()
+        payload = json.loads(bytes(raw).decode("utf-8"))
+        if (
+            not isinstance(payload, dict)
+            or not isinstance(payload.get("users", []), list)
+            or not isinstance(payload.get("storage_index", {}), dict)
+        ):
+            raise _RestoreInvalidArchitecture('expected {"users": [...], "storage_index": {...}}')
+        USERS.update(payload.get("users", []))
+        STORAGE_INDEX.update(payload.get("storage_index", {}))
+        await save_users()
+        await save_storage_index()
+        STORAGE_BACKUP_STATE["backup_msg_id"] = pinned.message_id
+        await save_storage_backup_state()
+        print(f"Restored storage backup: {len(USERS)} user(s), {len(STORAGE_INDEX)} password(s).")
+
+    not_found_hint = (
+        f"Chat not found — STORAGE_GROUP_ID ({STORAGE_GROUP_ID}) isn't a real "
+        "group this bot knows about. Still the template placeholder, wrong ID, "
+        "or the bot was never added to that group. See the setup comment above "
+        "STORAGE_GROUP_ID."
+    )
+    return await _run_restore_with_retries(app, "storage", "Storage", _do, not_found_hint=not_found_hint)
+
+# ═══════════════════════════════════════════════════════════════
+# QUIZ CHANNELS (interactive quiz storage, organized by year -> lecture)
+# ═══════════════════════════════════════════════════════════════
+# Post plain text in a year's quiz channel to open/resume a lecture (that
+# text becomes the lecture's name), then post quiz polls one by one — each
+# gets filed under the currently-open lecture, in posting order. Post
+# "-END" to close the lecture. Users pick Year -> Module -> Subject ->
+# Lecture via /quiz and the bot delivers the ready questions as fresh,
+# independently-answerable polls (see _deliver_next_lecture_question).
+#
+# Everything below is keyed by year (one of YEARS' keys, e.g. "y1"/"y3"),
+# with a separate on-disk file and a separate pinned backup document per
+# year — that's the fix for the combined index eventually outgrowing
+# Telegram's practical JSON document size as lectures pile up.
+QUIZ_INDEX_FILE_TMPL = "quiz_index_{year}.json"
+
+def _is_valid_quiz_index_entry(e) -> bool:
+    """One QUIZ_INDEX[year][lecture_name] entry — checked against the
+    schema in the QUIZ_INDEX comment just below: ids must be a list,
+    closed a bool, and module/subject/lecture_number/name strings where
+    present. Doesn't require every key (older entries or in-progress
+    lectures may be missing one), just that whatever IS there is the
+    right type — the same "shape, not completeness" check as
+    _is_valid_analytics_entry, for the same reason: this is a guard
+    against corruption, not a schema-completeness enforcer."""
+    if not isinstance(e, dict):
+        return False
+    if "ids" in e and not isinstance(e["ids"], list):
+        return False
+    if "closed" in e and not isinstance(e["closed"], bool):
+        return False
+    for k in ("module", "subject", "lecture_number", "name"):
+        if k in e and not isinstance(e[k], str):
+            return False
+    return True
+
+def _clean_quiz_index_dict(year: str, raw: dict) -> dict:
+    """Filters a whole QUIZ_INDEX[year]-shaped dict, dropping any lecture
+    entry that fails _is_valid_quiz_index_entry. Used by both
+    load_quiz_index and restore_quiz_from_channel."""
+    if not isinstance(raw, dict):
+        print(f"QUIZ INDEX ({year}): top-level data wasn't a dict ({type(raw).__name__}) — ignoring entirely.")
+        return {}
+    clean = {k: v for k, v in raw.items() if _is_valid_quiz_index_entry(v)}
+    if len(clean) != len(raw):
+        print(f"QUIZ INDEX ({year}): dropped {len(raw) - len(clean)} malformed lecture entr(y/ies).")
+    return clean
+
+def load_quiz_index(year: str) -> dict:
+    path = QUIZ_INDEX_FILE_TMPL.format(year=year)
+    raw = _load_json_safe(path, dict, dict, f"QUIZ INDEX ({year})")
+    return _clean_quiz_index_dict(year, raw)
+
+async def save_quiz_index(year: str):
+    # See save_analytics for why this snapshot copy is required — this is
+    # one of the highest-traffic save_* calls in the file (fires on every
+    # dead-poll cleanup during lecture delivery), so it's one of the most
+    # likely places the load test's races actually came from.
+    path = QUIZ_INDEX_FILE_TMPL.format(year=year)
+    await _write_json_serialized(
+        path, lambda: copy.deepcopy(QUIZ_INDEX[year]), ensure_ascii=False)
+
+# year -> {lecture_name -> {"ids": [...], "closed": bool, "module": str, "subject": str, "lecture_number": str, "name": str}}
+QUIZ_INDEX: dict = {y: load_quiz_index(y) for y in YEARS}
+
+# Matches "<Subject> Lecture <number>", e.g. "Physiology Lecture 3"
+_LECTURE_TITLE_RE = re.compile(r"^(.*?)\s+Lecture\s+(\d+)\s*$", re.IGNORECASE)
+
+def parse_lecture_title(year: str, text: str):
+    """Parses "<Module> - <Subject> Lecture <number>: <name>" against this
+    year's curriculum (YEARS[year]["modules"]). Returns
+    (module, subject, lecture_number, name) on success, or
+    (None, None, None, error_message) on failure — matching is
+    case-insensitive but the canonical spelling from that year's modules
+    dict is returned."""
+    modules = year_modules(year)
+    if " - " not in text or ":" not in text:
+        return None, None, None, (
+            "⚠️ الصيغة غلط. لازم تكون:\n"
+            "<code>Module - Subject Lecture Number: Name</code>\n"
+            "مثال: <code>Endocrine - Physiology Lecture 3: Insulin Signaling</code>"
+        )
+    module_part, rest = text.split(" - ", 1)
+    subj_lec_part, name = rest.split(":", 1)
+    module_part, subj_lec_part, name = module_part.strip(), subj_lec_part.strip(), name.strip()
+
+    module_match = next((m for m in modules if m.lower() == module_part.lower()), None)
+    if not module_match:
+        valid = ", ".join(modules.keys())
+        return None, None, None, f"⚠️ الموديول \"{module_part}\" مش معروف. الموديولات المتاحة: {valid}"
+
+    m = _LECTURE_TITLE_RE.match(subj_lec_part)
+    if not m:
+        return None, None, None, (
+            "⚠️ الصيغة غلط بعد اسم الموديول. لازم تكون:\n"
+            "<code>Subject Lecture Number</code>\n"
+            "مثال: <code>Physiology Lecture 3</code>"
+        )
+    subject_part, lecture_number = m.group(1).strip(), m.group(2).strip()
+    subject_match = next((s for s in modules[module_match] if s.lower() == subject_part.lower()), None)
+    if not subject_match:
+        valid = ", ".join(modules[module_match])
+        return None, None, None, f"⚠️ المادة \"{subject_part}\" مش من موديول {module_match}. المواد المتاحة: {valid}"
+
+    return module_match, subject_match, lecture_number, name
+
+def ready_modules(year: str):
+    # Always show every configured module — even ones with zero lectures
+    # posted yet — so the curriculum structure is visible from day one.
+    return list(year_modules(year).keys())
+
+def ready_subjects(year: str, module: str):
+    # Same idea: every subject defined for this module shows up, regardless
+    # of whether any lecture has been posted for it yet.
+    return list(year_modules(year).get(module, []))
+
+def ready_lecture_keys(year: str, module: str, subject: str):
+    return [
+        name for name, v in QUIZ_INDEX[year].items()
+        if v["closed"] and v["ids"] and v["module"] == module and v["subject"] == subject
+    ]  # insertion order = numbering order
+
+QUIZ_STATE_FILE_TMPL = "quiz_state_{year}.json"
+
+def load_quiz_state(year: str) -> dict:
+    path = QUIZ_STATE_FILE_TMPL.format(year=year)
+    return _load_json_safe(path, dict, lambda: {"current_lecture": None}, f"QUIZ STATE ({year})")
+
+async def save_quiz_state(year: str):
+    # See save_analytics for why this snapshot copy is required.
+    path = QUIZ_STATE_FILE_TMPL.format(year=year)
+    await _write_json_serialized(
+        path, lambda: copy.deepcopy(QUIZ_STATE[year]), ensure_ascii=False)
+
+QUIZ_STATE: dict = {y: load_quiz_state(y) for y in YEARS}  # survives restarts mid-lecture, per year
+
+QUIZ_POLL_STATUS_FILE_TMPL = "quiz_poll_status_{year}.json"
+
+def load_quiz_poll_status(year: str) -> dict:
+    path = QUIZ_POLL_STATUS_FILE_TMPL.format(year=year)
+    return _load_json_safe(path, dict, dict, f"QUIZ POLL STATUS ({year})")
+
+async def save_quiz_poll_status(year: str):
+    # See save_analytics for why this snapshot copy is required — also
+    # high-traffic (fires on every question delivered), and this exact
+    # structure is what poll_status_by_mid is built from, read
+    # concurrently by every student's lecture session.
+    path = QUIZ_POLL_STATUS_FILE_TMPL.format(year=year)
+    await _write_json_serialized(
+        path, lambda: copy.deepcopy(QUIZ_POLL_STATUS[year]), ensure_ascii=False)
+
+# year -> {poll_id -> {"lecture": str, "message_id": int, "closed": bool, ...}}
+# Tracks whether each quiz-channel poll has been stopped yet — Telegram
+# only allows copying a quiz poll once its correct answer is known, i.e.
+# once it's been stopped, so this is what /quiz delivery checks against.
+QUIZ_POLL_STATUS: dict = {y: load_quiz_poll_status(y) for y in YEARS}
+
+# ── Durable backup: same pinned-message trick as the storage group, so
+# each year's lecture/quiz index survives a host switch or wiped local
+# disk — only the local JSON cache is fragile, the channel content itself
+# never was. One pinned backup document per year's own channel.
+QUIZ_BACKUP_MARKER          = "🗄 QUIZICIAN_QUIZ_BACKUP"
+QUIZ_BACKUP_STATE_FILE_TMPL = "quiz_backup_state_{year}.json"
+
+def load_quiz_backup_state(year: str) -> dict:
+    path = QUIZ_BACKUP_STATE_FILE_TMPL.format(year=year)
+    return _load_json_safe(path, dict, dict, f"QUIZ BACKUP STATE ({year})")
+
+async def save_quiz_backup_state(year: str):
+    # Tiny dict, but kept consistent — see save_analytics for why.
+    path = QUIZ_BACKUP_STATE_FILE_TMPL.format(year=year)
+    await _write_json_serialized(
+        path, lambda: copy.deepcopy(QUIZ_BACKUP_STATE[year]), ensure_ascii=False)
+
+QUIZ_BACKUP_STATE: dict = {y: load_quiz_backup_state(y) for y in YEARS}  # year -> {"backup_msg_id": int}
+
+async def backup_quiz_to_channel(context: ContextTypes.DEFAULT_TYPE, year: str):
+    channel_id = year_channel_id(year)
+    if not channel_id:
+        return
+    if not RESTORE_OK.get(f"quiz_{year}", True):
+        print(f"QUIZ BACKUP ({year}) SKIPPED — last restore failed, refusing to overwrite the channel backup.")
+        return
+    payload  = {
+        "quiz_index":       QUIZ_INDEX[year],
+        "quiz_state":       QUIZ_STATE[year],
+        "quiz_poll_status": QUIZ_POLL_STATUS[year],
+    }
+    data     = json.dumps(payload).encode("utf-8")
+    # NOTE: named Quizician_Quiz_Backup (not *_Storage_Backup) even though
+    # this is the file colloquially thought of as "the storage backup" for
+    # a year's questions — quizician_storage_backup.json (no year suffix)
+    # is a different, unrelated file: the password-gated media vault. Two
+    # files named near-identically would be a landmine for future greps.
+    filename = _backup_filename(f"Quizician_Quiz_Backup_{year.upper()}.json")
+
+    try:
+        sent = await context.bot.send_document(
+            chat_id=channel_id,
+            document=InputFile(BytesIO(data), filename=filename),
+            caption=QUIZ_BACKUP_MARKER,
+        )
+    except Exception as e:
+        print(f"QUIZ BACKUP ({year}) ERROR:", e)
+        return
+
+    # Persist the message id regardless of whether pinning succeeds, so we
+    # don't resend a fresh document on every single addition.
+    QUIZ_BACKUP_STATE[year]["backup_msg_id"] = sent.message_id
+    await save_quiz_backup_state(year)
+
+    try:
+        await context.bot.pin_chat_message(chat_id=channel_id, message_id=sent.message_id, disable_notification=True)
+    except Exception as e:
+        print(f"QUIZ BACKUP ({year}) PIN ERROR (message saved anyway, but won't be pinned — check bot is admin with pin rights):", e)
+
+    # Previous backups are no longer deleted — see the analytics backup
+    # function's comment for why.
+
+async def restore_quiz_from_channel(app, year: str) -> str:
+    """Runs once on startup per year — rebuilds that year's lecture/quiz
+    index from its quiz channel's pinned backup if the local cache is
+    missing/stale."""
+    channel_id = year_channel_id(year)
+    if not channel_id:
+        return "not_configured"
+
+    async def _do():
+        chat   = await app.bot.get_chat(channel_id)
+        pinned = chat.pinned_message
+        if not pinned or not pinned.document or (pinned.caption or "") != QUIZ_BACKUP_MARKER:
+            raise _RestoreNoBackup()
+        tg_file = await app.bot.get_file(pinned.document.file_id)
+        raw     = await tg_file.download_as_bytearray()
+        payload = json.loads(bytes(raw).decode("utf-8"))
+        if not isinstance(payload, dict) or not all(
+            isinstance(payload.get(k, {}), dict)
+            for k in ("quiz_index", "quiz_state", "quiz_poll_status")
+        ):
+            raise _RestoreInvalidArchitecture(
+                'expected {"quiz_index": {...}, "quiz_state": {...}, "quiz_poll_status": {...}}'
+            )
+        QUIZ_INDEX[year].update(_clean_quiz_index_dict(year, payload.get("quiz_index", {})))
+        QUIZ_STATE[year].update(payload.get("quiz_state", {}))
+        QUIZ_POLL_STATUS[year].update(payload.get("quiz_poll_status", {}))
+        await save_quiz_index(year)
+        await save_quiz_state(year)
+        await save_quiz_poll_status(year)
+        QUIZ_BACKUP_STATE[year]["backup_msg_id"] = pinned.message_id
+        await save_quiz_backup_state(year)
+        print(f"Restored quiz backup ({year}): {len(QUIZ_INDEX[year])} lecture(s).")
+
+    not_found_hint = (
+        f"Chat not found — {year}'s channel_id ({channel_id}) isn't a real "
+        "channel this bot knows about. Wrong ID, or the bot was never added "
+        "as an admin there. See the YEARS setup comment near the top of the file."
+    )
+    return await _run_restore_with_retries(app, f"quiz_{year}", f"Quiz index ({year})", _do, not_found_hint=not_found_hint)
+
+# ═══════════════════════════════════════════════════════════════
+# STATE
+# ═══════════════════════════════════════════════════════════════
+SLEEPING               = set()
+
+# ── /health support ──────────────────────────────────────────────
+# In-memory only, so it resets on restart — noted explicitly in the
+# /health output rather than papered over, since a restart is exactly the
+# kind of event this dashboard exists to surface.
+_BOT_STARTED_AT   = time.monotonic()
+# Timestamps of errors actually posted to ERROR_LOG_GROUP_ID (appended
+# only on a successful send — see global_error_handler) — NOT every
+# exception the handler saw, since a send that itself failed never made
+# it into that channel. This deliberately mirrors "what's actually in the
+# errors channel" rather than tracking exceptions independently, since
+# the Bot API has no way to read a channel's message history back to
+# verify the two ever matched. Self-trimmed to the last ~26h.
+_ERROR_LOG_TIMES: list = []
+_ERROR_LOG_MAX_AGE_SECONDS = 26 * 3600   # a bit over a day of headroom; /health itself filters to exactly 24h
+
+PENDING_IMAGE          = {}    # user_id -> local path of an image awaiting its question
+LECTURE_SESSIONS       = {}    # user_id -> {"year","module","subject","lecture_key","queue":[mid,...],
+                                #             "current_poll_id","total","answered",
+                                #             "poll_status_by_mid": {mid: QUIZ_POLL_STATUS[year][pid], ...}
+                                #             — scoped to this lecture's polls, built once at session
+                                #             start so _advance_lecture_session can look up a wrong
+                                #             answer's content in O(1) instead of scanning the whole
+                                #             year} — active one-at-a-time delivery
+# A user counts as an "active session" (/health + Dev Panel) only if they
+# answered a poll within this many seconds AND still have a live session.
+# The answer time lives inside the session dict itself ("last_answer_at"), so
+# it rides along with session persistence and survives a redeploy/restart.
+ACTIVE_SESSION_WINDOW_SECONDS = 10 * 60
+
+# Message IDs of question messages delivered by the bot, keyed by recipient.
+# The bounded list is enough to recognize later ❤️ reactions without letting
+# old questions grow memory usage forever.
+BOOKMARKABLE_QUESTION_MESSAGES = {}   # user_id -> [message_id, ...]
+BOOKMARKABLE_QUESTION_LIMIT = 500
+# user_id -> message_id -> metadata used by bookmark/report reactions.
+# Kept bounded by the same 500-question window as BOOKMARKABLE_QUESTION_MESSAGES.
+QUESTION_MESSAGE_META = {}
+
+# Persistent aggregate report counts, keyed by a stable question key.  A lecture
+# question uses its original year+channel-message id when available; ad-hoc/search
+# questions fall back to a content hash.
+QUESTION_REPORTS_FILE = "question_reports.json"
+QUESTION_REPORTS = _load_json_safe(QUESTION_REPORTS_FILE, dict, dict, "QUESTION REPORTS")
+
+async def save_question_reports():
+    await _write_json_serialized(
+        QUESTION_REPORTS_FILE, lambda: copy.deepcopy(QUESTION_REPORTS), ensure_ascii=False
+    )
+
+# Personal bookmarks are stored INSIDE MISTAKES_BANK as type="bookmarked".
+# There is intentionally no separate bookmarks.json source of truth anymore.
+BOOKMARKS_PER_USER_LIMIT = 200
+LEGACY_BOOKMARKS_FILE = "bookmarks.json"  # read once for migration only
+
+def _bookmark_entries(user_id: int) -> list:
+    """Returns this user's type="bookmarked" entries from the shared bank."""
+    return [
+        entry for entry in _MISTAKES_BY_USER.get(user_id, [])
+        if _entry_type(entry) == BOOKMARK_ENTRY_TYPE
+    ]
+
+def _bookmark_list(user_id: int) -> list:
+    return list(_bookmark_entries(user_id))
+
+def _bookmark_question(user_id: int, meta: dict) -> bool:
+    """Save/update a full question snapshot as type="bookmarked" in
+    QUIZICIAN_MISTAKES_BANK. Returns True only when newly added."""
+    question = str(meta.get("question", "") or "").strip()
+    options = list(meta.get("options", []) or [])
+    if not question:
+        return False
+
+    question_key = meta.get("question_key") or _question_content_key(
+        question, options, prefix="bookmark"
+    )
+    for item in _bookmark_entries(user_id):
+        if item.get("question_key") == question_key:
+            item.update({
+                "type": BOOKMARK_ENTRY_TYPE,
+                "question": question,
+                "options": options,
+                "correct_option_id": meta.get("correct_option_id"),
+                "explanation": meta.get("explanation"),
+                "year": meta.get("year"),
+                "module": meta.get("module"),
+                "subject": meta.get("subject"),
+                "lecture": meta.get("lecture"),
+                "source_mid": meta.get("source_mid"),
+                "mid": meta.get("source_mid"),
+            })
+            _mark_mistakes_bank_dirty()
+            return False
+
+    entry = {
+        "user_id": user_id,
+        "type": BOOKMARK_ENTRY_TYPE,
+        "mid": meta.get("source_mid"),
+        "year": meta.get("year"),
+        "module": meta.get("module"),
+        "subject": meta.get("subject"),
+        "lecture": meta.get("lecture"),
+        "source_mid": meta.get("source_mid"),
+        "question_key": question_key,
+        "question": question,
+        "options": options,
+        "correct_option_id": meta.get("correct_option_id"),
+        "explanation": meta.get("explanation"),
+        "saved_at": int(time.time()),
+    }
+    MISTAKES_BANK.append(entry)
+    _mistakes_index_add(entry)
+
+    bookmarks = _bookmark_entries(user_id)
+    if len(bookmarks) > BOOKMARKS_PER_USER_LIMIT:
+        oldest = sorted(bookmarks, key=lambda x: x.get("saved_at", 0))[:-BOOKMARKS_PER_USER_LIMIT]
+        for old in oldest:
+            try:
+                MISTAKES_BANK.remove(old)
+            except ValueError:
+                pass
+            _mistakes_index_remove(old)
+    _mark_mistakes_bank_dirty()
+    return True
+
+def _unbookmark_question(user_id: int, meta: dict) -> bool:
+    """Delete the matching type="bookmarked" record from the shared bank."""
+    question_key = meta.get("question_key") or _question_content_key(
+        str(meta.get("question", "") or ""),
+        list(meta.get("options", []) or []),
+        prefix="bookmark",
+    )
+    doomed = [
+        item for item in _bookmark_entries(user_id)
+        if item.get("question_key") == question_key
+    ]
+    if not doomed:
+        return False
+    for item in doomed:
+        try:
+            MISTAKES_BANK.remove(item)
+        except ValueError:
+            pass
+        _mistakes_index_remove(item)
+    _mark_mistakes_bank_dirty()
+    return True
+
+def _clear_user_bookmarks(user_id: int) -> int:
+    """Deletes ALL of this user's type="bookmarked" entries from the shared
+    bank (never touches their mistakes or anyone else's entries). Matched
+    by object identity so the removal is exact. Returns how many were
+    removed; the caller saves + backs up the bank."""
+    doomed = {id(e) for e in _bookmark_entries(user_id)}
+    if not doomed:
+        return 0
+    MISTAKES_BANK[:] = [m for m in MISTAKES_BANK if id(m) not in doomed]
+    remaining = [m for m in _MISTAKES_BY_USER.get(user_id, []) if id(m) not in doomed]
+    if remaining:
+        _MISTAKES_BY_USER[user_id] = remaining
+    else:
+        _MISTAKES_BY_USER.pop(user_id, None)
+    _mark_mistakes_bank_dirty()
+    return len(doomed)
+
+def _remember_bookmarkable_question(
+    user_id: int,
+    message_id: int | None,
+    *,
+    question_key: str | None = None,
+    metadata: dict | None = None,
+) -> None:
+    if message_id is None:
+        return
+    ids = BOOKMARKABLE_QUESTION_MESSAGES.setdefault(user_id, [])
+    if message_id not in ids:
+        ids.append(message_id)
+    meta = QUESTION_MESSAGE_META.setdefault(user_id, {})
+    if question_key is not None or metadata is not None:
+        payload = dict(metadata or {})
+        if question_key is not None:
+            payload["question_key"] = question_key
+        meta[message_id] = payload
+    if len(ids) > BOOKMARKABLE_QUESTION_LIMIT:
+        stale = ids[:-BOOKMARKABLE_QUESTION_LIMIT]
+        del ids[:-BOOKMARKABLE_QUESTION_LIMIT]
+        for stale_mid in stale:
+            meta.pop(stale_mid, None)
+
+def _is_bookmarkable_question(user_id: int, message_id: int | None) -> bool:
+    return message_id is not None and message_id in BOOKMARKABLE_QUESTION_MESSAGES.get(user_id, [])
+
+def _question_message_meta(user_id: int, message_id: int | None) -> dict | None:
+    if message_id is None:
+        return None
+    return QUESTION_MESSAGE_META.get(user_id, {}).get(message_id)
+
+RETAKE_STAGING         = {}    # user_id -> {"year","module","subject","lecture_key","mids":[mid,...]}
+                                # — wrong-question mids from a just-finished lecture, offered via the
+                                # "🔁 Retake incorrect questions!" button; consumed (popped) once tapped
+AWAITING_NICKNAME      = {}    # user_id -> True, while the Settings flow is waiting on a nickname reply
+ONBOARDING_PROMPT_MSG  = {}    # real_uid -> (chat_id, message_id) of the first-ever /start's "what's
+                                # your name?" prompt, so the nickname reply can edit it in place into
+                                # the Year/Class step instead of sending a new message. Onboarding-only
+                                # (Settings' nickname re-ask isn't tracked here, nothing to flow into).
+PENDING_LECTURE_LINK   = {}    # real_uid -> quick-link payload (see _build_lecture_quicklink_payload),
+                                # stashed when someone taps a lecture quick-link before finishing
+                                # onboarding. Consumed at the true end of onboarding (the "onboard_go"
+                                # tap) instead of the normal welcome menu — see start() and onboard_go.
+
+async def _flow_onboarding_message(update, context, real_uid: int, text: str, **kwargs):
+    """Edits the tracked onboarding prompt (ONBOARDING_PROMPT_MSG) in place
+    with `text`/`kwargs` (parse_mode, reply_markup, ...) instead of sending a
+    new message, so the whole first-ever /start walkthrough reads as one
+    message updating step to step rather than a pile of separate ones.
+    Falls back to a fresh reply_text (and starts tracking THAT message
+    instead) if there's nothing tracked yet or the edit fails (message too
+    old/deleted) — onboarding must never dead-end over this."""
+    prompt = ONBOARDING_PROMPT_MSG.get(real_uid)
+    if prompt:
+        prompt_chat_id, prompt_msg_id = prompt
+        try:
+            await context.bot.edit_message_text(
+                chat_id=prompt_chat_id, message_id=prompt_msg_id, text=text, **kwargs
+            )
+            return
+        except Exception:
+            pass  # fall through to a fresh send below
+    sent = await update.message.reply_text(text, **kwargs)
+    ONBOARDING_PROMPT_MSG[real_uid] = (sent.chat_id, sent.message_id)
+PENDING_QUIZ_DELETE    = {}    # admin_id -> (year, lecture_key), set by /quiz_delete while waiting on
+                                # the confirm/cancel tap (see quizdel_yes/quizdel_no in button_handler)
+
+# ── Dev Panel support (/dev_panel — Creator-only control panel) ─────
+# The panel's "🔢 Set year" and "👥 Users" buttons need a free-text
+# nickname/ID that a button tap can't supply, so tapping either one
+# just arms one of these (admin_id -> True) and prompts for that text;
+# the next text message from that admin is consumed by the matching
+# AWAITING check near the top of handle() instead of anything else it
+# would normally do. Same RAM-only, restart-is-harmless convention as
+# every other AWAITING_*/PENDING_* dict here. See _resolve_user_ref for
+# how the typed nickname/ID gets turned into a user_id.
+AWAITING_DEVPANEL_SETYEAR = {}    # admin_id -> True
+AWAITING_DEVPANEL_MYSTATS = {}    # admin_id -> True
+
+# ── 🔎 Search Content support ────────────────────────────────────
+# Set by the search_mod: callback (see button_handler) once the user has
+# picked a year (always their locked year_class in practice) and a
+# module (or "search all modules"); the next text message from that
+# real_uid is treated as the search query instead of anything else the
+# text handler would normally do with it — see the AWAITING_SEARCH_QUERY
+# check near the top of handle(). Same RAM-only, restart-is-harmless
+# convention as every other AWAITING_*/PENDING_* dict here.
+AWAITING_SEARCH_QUERY  = {}    # real_uid -> {"year": str, "module": str|None}
+
+# Armed by eqedq:/eqedo:/eqedex: (see the /edit_quiz eqedit: submenu below)
+# to catch the admin's next typed message as the new question/options/
+# explanation for the poll they picked. Popped as soon as it's consumed,
+# same pattern as AWAITING_SEARCH_QUERY above.
+# /edit_quiz 🔎 search: AWAITING_EQ_SEARCH is armed by eqsrch:<year>:<mod_idx|all>
+# and consumed by the admin's next typed message (see handle()); the matches
+# then live in EQ_SEARCH_RESULTS (one search per admin, replaced by the
+# next one) behind the eqsrchpick:/eqsrchdel:/eqsrchpage: buttons.
+AWAITING_EQ_SEARCH = {}   # real_uid -> {"year": str, "mod_idx": int | None}
+
+# /edit_quiz 📎 Add case / image on an EXISTING question: armed by eqattc:/eqatti:
+# and consumed by the admin's next text message (kind "case") or photo (kind
+# "image") — see handle() / handle_image(). Stored on the lecture entry in the
+# same poll_case_studies / poll_images lists /add_lecture fills, so delivery
+# (_deliver_next_lecture_question) needs no changes.
+AWAITING_EQ_ATTACH = {}   # real_uid -> {"kind": "case"|"image", "year", "mid", "mod_idx", "subj_idx", "lec_idx"}
+EQ_SEARCH_RESULTS  = {}   # real_uid -> {"token","year","mod_idx","query","matches","page"}
+
+AWAITING_EQEDIT = {}    # real_uid -> {"kind": "question"|"options"|"explanation",
+                         #              "year", "mid", "mod_idx", "subj_idx", "lec_idx"}
+
+# Multiselect-delete staging for /edit_quiz (eqmsstart:/eqmstoggle:/
+# eqmsconfirm/eqmscancel below). Ephemeral UI state only — never
+# persisted, same as the AWAITING_* dicts above; a bot restart mid-
+# selection just means the admin has to start the selection over.
+EQMS_SELECTED = {}    # real_uid -> {"year","mod_idx","subj_idx","lec_idx","lecture_key","mids": set[int]}
+
+# ── /add_lecture: DM-based authoring (polls captured straight from the
+# forwarded poll's hidden answer, without waiting on a Stop Poll — but
+# see below, an image+poll pair does get an archival copy posted to the
+# year's channel) ──────────────────────────────────────────────────────
+# Armed step by step by alyr:/almod:/alsubj: below. AWAITING_ADD_LECTURE_NAME
+# holds the chosen year/module while waiting for the typed "number: name"
+# reply; once that's parsed, ADD_LECTURE_STATE takes over for the actual
+# authoring session (forwarded quiz polls + final -END), and also sets
+# QUIZ_STATE[year]["current_lecture"] so it shares the same single-flight
+# lock the channel-authoring flow already uses — the two can't clash.
+AWAITING_ADD_LECTURE_NAME = {}    # real_uid -> {"year", "module", "subject"}
+ADD_LECTURE_STATE         = {}    # real_uid -> {"year", "lecture_key", ...}
+
+# Minimum character length for a plain-text message sent during an
+# /add_lecture DM session to be treated as a "case study" bound to the
+# next forwarded poll, rather than rejected as a stray/misplaced message —
+# see the case-study branch in handle(). Picked well above any normal typo
+# or one-word reply.
+ADD_LECTURE_CASE_STUDY_MIN_LEN = 40
+
+# ── /broadcast support ────────────────────────────────────────────
+# See the BROADCAST section (grep the banner) further down for the full
+# interactive composer this backs — audience picker, message entry,
+# live preview, estimated recipient count, then SEND with a progress
+# bar. BROADCAST_DRAFTS holds the in-progress composition per admin
+# (only one at a time each); AWAITING_BROADCAST_MESSAGE mirrors the
+# AWAITING_NICKNAME pattern above for capturing the next free-text
+# message as the broadcast body. Deliberately RAM-only, same as every
+# other AWAITING_*/PENDING_* dict here — a restart mid-compose just
+# means starting the /broadcast draft over, which is harmless.
+BROADCAST_DRAFTS            = {}    # admin_id -> {"audience": "all"|"y1"|"y2"|"y3"|"active"|"inactive", "text": str|None,
+                                    #   "media": None | {"chat_id","message_id","kind","caption","entities","html"}} — media = an attachment
+                                    #   the admin sent/replied to; broadcast via copy_message (see _deliver_broadcast_item)
+AWAITING_BROADCAST_MESSAGE  = {}    # admin_id -> True, while waiting for the next text message to become the broadcast body
+
+# ── /edit_quiz support ────────────────────────────────────────────
+# QUIZ_INSERT_AFTER[year][lecture_key] = message_id (or None), set right
+# before an admin is sent back into the quiz channel to add question(s)
+# via the normal "post polls, then -END" flow, from the "➕ Insert new
+# poll after" button in /edit_quiz. While this is set, incoming polls for
+# that lecture in handle_quiz_channel_message are SPLICED into ids[] right
+# after that message_id instead of being appended at the end — and the
+# marker is advanced to each newly-inserted mid in turn, so posting
+# several polls in a row keeps them in the order they were sent. Cleared
+# on -END/-FIN alongside the normal lecture-close logic. None value =
+# insert at the very start of ids[] (not currently reachable from the UI,
+# but supported by the splice logic below for completeness).
+QUIZ_INSERT_AFTER: dict = {y: {} for y in YEARS}
+# NOTE: /edit_quiz's "➕ Insert new poll after" no longer uses this (it
+# opens a DM ADD_LECTURE_STATE session with "insert_after" instead); the
+# channel-side splice still works if something sets it.
+
+# ── Pre-question images for quiz-channel authoring ─────────────────
+# QUIZ_PENDING_POLL_IMAGE[year][lecture_key] = {"file_id", "file_unique_id"}
+# A photo posted in the quiz channel with NO "w:" written-question marker
+# is held here until the very next poll question is posted for that same
+# lecture — at that point it's consumed and filed onto that poll's entry
+# in QUIZ_INDEX[year][lecture]["poll_images"] (see handle_quiz_channel_message),
+# so a sequence like "Q1, Q2, <image>, Q3" attaches the image to Q3 as
+# that poll's native media once it's delivered to students (see
+# _deliver_next_lecture_question). file_unique_id is the immutable part —
+# stable for this exact photo regardless of how many times its file_id
+# gets reissued — kept alongside file_id (needed to actually resend it)
+# mostly as a stable reference/debugging aid, since QUIZ_INDEX itself is
+# what's durably saved/backed up (this dict is just the RAM-only "waiting
+# for its question" staging area, cleared on -END/-FIN same as
+# QUIZ_INSERT_AFTER above).
+QUIZ_PENDING_POLL_IMAGE: dict = {y: {} for y in YEARS}
+
+# ── /report_issue support ────────────────────────────────────────
+# REPORT_THREADS mirrors the MISTAKES_BANK persistence pattern exactly:
+# local JSON file, plus a pinned backup in REPORT_ISSUE_GROUP_ID that gets
+# replaced (upload + pin + delete old pin) on every change and restored
+# from on startup. See restore_report_threads_from_channel /
+# backup_report_threads_to_channel below, and their registration
+# alongside every other system's restore/backup calls near MAIN.
+AWAITING_REPORT_ISSUE  = {}    # user_id -> float (time.time() when /report_issue ran). The next
+                                # text OR photo from this user is staged as a draft report (see
+                                # _stage_report_draft) — UNLESS more than REPORT_ISSUE_AWAIT_TIMEOUT
+                                # has passed, in which case it's left alone and that message is
+                                # handled normally instead. Also cleared by /cancel.
+                                #
+                                # Both the timeout and /cancel exist to fix the same bug: this used
+                                # to be a plain `True` with no expiry and no way out, so ANY message
+                                # sent any time after /report_issue — even an unrelated one hours or
+                                # days later, after the person forgot they'd typed the command —
+                                # got silently shipped to admins as a bogus report, and there was no
+                                # way for the person to back out once they'd started.
+REPORT_ISSUE_AWAIT_TIMEOUT   = 10 * 60   # seconds — how long /report_issue "listens" for the report
+REPORT_DRAFTS = {}   # user_id -> {"text": str, "photo_file_id": str|None, "created_at": float}
+                      # — a report the user has typed/sent but not yet confirmed via the Send/Cancel
+                      # preview. See _stage_report_draft (creates it) and the report_draft_send /
+                      # report_draft_cancel callback branches in button_handler (consume it).
+REPORT_DRAFT_CONFIRM_TIMEOUT = 30 * 60   # seconds — a Send tap older than this is rejected rather
+                                          # than silently posting a stale draft
+AWAITING_REPORT_REPLY  = {}    # admin_id -> {"group_message_id": int}
+                                # — set when the admin taps "↩️ Reply" on a report in REPORT_ISSUE_GROUP_ID;
+                                # the admin's next text message there becomes the reply sent back to that user
+AWAITING_USER_FOLLOWUP = {}    # reporter_user_id -> {"group_message_id": int}
+                                # — set when the reporter taps "↩️ Reply" on the admin's reply DM'd to
+                                # them; their next text message becomes a follow-up appended to the
+                                # same thread (see _append_report_message) and shown to the admin
+
+REPORT_THREADS_FILE          = "report_threads.json"
+REPORT_THREADS_BACKUP_MARKER = "📩 QUIZICIAN_REPORT_THREADS_BACKUP"
+
+def load_report_threads() -> dict:
+    raw = _load_json_safe(REPORT_THREADS_FILE, dict, dict, "REPORT THREADS")
+    out = {}
+    for k, v in raw.items():   # JSON keys are always strings — back to int here
+        try:
+            out[int(k)] = v
+        except (TypeError, ValueError):
+            print(f"REPORT THREADS: dropped entry with non-integer key {k!r}.")
+    return out
+
+async def save_report_threads():
+    # JSON object keys must be strings, so REPORT_THREADS (keyed by an
+    # int message_id) needs the same str(k)/int(k) round-trip on the way
+    # out and back in — see load_report_threads above.
+    #
+    # deepcopy, not just the str-keyed dict comprehension below: the
+    # comprehension only copies the OUTER dict — each thread dict (and
+    # its "messages" list) would still be the same live object the event
+    # loop can keep mutating (e.g. a reply landing) while a background
+    # thread is mid-serializing it. See save_analytics for the general
+    # explanation of why to_thread needs a frozen snapshot.
+    await _write_json_serialized(
+        REPORT_THREADS_FILE,
+        lambda: {str(k): v for k, v in copy.deepcopy(REPORT_THREADS).items()},
+        indent=2, ensure_ascii=False,
+    )
+
+REPORT_THREADS: dict = load_report_threads()   # group_message_id -> {"user_id","name","username","user_text","messages","closed"}
+                                                # — "messages": [{"from": "admin"|"user", "text": str}, ...] in
+                                                # chronological order (see _append_report_message /
+                                                # _report_thread_text); "replies" is the pre-follow-up shape,
+                                                # still read as a fallback for threads that predate this field
+                                                # — one entry per report ever filed, so the report message can be
+                                                # rebuilt (user text + every reply so far) each time it's edited
+                                                #
+                                                # "latest_group_message_id" / "latest_user_message_id": the
+                                                # message id of the most recent full-thread message on each
+                                                # side (group card / reporter's DM) — see _refresh_report_thread.
+                                                # Both start out equal to the dict key (the very first card IS
+                                                # the first full-thread message) and get reassigned on every
+                                                # reply; missing/None on a thread that predates this field or
+                                                # hasn't had its user-side DM refreshed yet.
+
+_report_threads_backup_msg_id: int | None = None
+_last_report_threads_backup_at: float = 0.0
+REPORT_THREADS_BACKUP_MIN_INTERVAL = 30   # seconds — same debounce as mistakes bank; local save is never throttled
+
+async def backup_report_threads_to_channel(context):
+    global _report_threads_backup_msg_id, _last_report_threads_backup_at
+    if not REPORT_ISSUE_GROUP_ID:
+        return
+    if not RESTORE_OK.get("report_threads", True):
+        print("REPORT THREADS BACKUP SKIPPED — last restore failed, refusing to overwrite the channel backup.")
+        return
+    now = time.monotonic()
+    if now - _last_report_threads_backup_at < REPORT_THREADS_BACKUP_MIN_INTERVAL:
+        return   # backed up recently enough — local save_report_threads() already has the latest data
+    _last_report_threads_backup_at = now
+    data = json.dumps({str(k): v for k, v in REPORT_THREADS.items()}, indent=2, ensure_ascii=False).encode("utf-8")
+    try:
+        sent = await context.bot.send_document(
+            chat_id=REPORT_ISSUE_GROUP_ID,
+            document=InputFile(BytesIO(data), filename=_backup_filename("report_threads.json")),
+            caption=REPORT_THREADS_BACKUP_MARKER,
+        )
+    except Exception as e:
+        print("REPORT THREADS BACKUP ERROR:", e)
+        return
+    try:
+        await context.bot.pin_chat_message(
+            chat_id=REPORT_ISSUE_GROUP_ID,
+            message_id=sent.message_id,
+            disable_notification=True,
+        )
+    except Exception as e:
+        print("REPORT THREADS PIN ERROR:", e)
+    # Previous backups are no longer deleted — see the analytics backup
+    # function's comment for why.
+    _report_threads_backup_msg_id = sent.message_id
+
+async def restore_report_threads_from_channel(app) -> str:
+    global _report_threads_backup_msg_id
+    if not REPORT_ISSUE_GROUP_ID:
+        return "not_configured"
+
+    async def _do():
+        global _report_threads_backup_msg_id
+        chat   = await app.bot.get_chat(REPORT_ISSUE_GROUP_ID)
+        pinned = chat.pinned_message
+        if not pinned or not pinned.document or (pinned.caption or "") != REPORT_THREADS_BACKUP_MARKER:
+            raise _RestoreNoBackup()
+        tg_file = await app.bot.get_file(pinned.document.file_id)
+        raw     = await tg_file.download_as_bytearray()
+        restored = json.loads(bytes(raw).decode("utf-8"))
+        if not isinstance(restored, dict):
+            raise _RestoreInvalidArchitecture('expected a JSON object mapping thread_id -> thread data')
+        try:
+            cleaned = {int(k): v for k, v in restored.items()}
+        except (TypeError, ValueError):
+            raise _RestoreInvalidArchitecture('thread keys must be integer-like ids')
+        REPORT_THREADS.clear()
+        REPORT_THREADS.update(cleaned)
+        await save_report_threads()
+        _report_threads_backup_msg_id = pinned.message_id
+        print(f"Restored report threads: {len(REPORT_THREADS)} thread(s).")
+
+    return await _run_restore_with_retries(app, "report_threads", "Report threads", _do)
+
+# ═══════════════════════════════════════════════════════════════
+# SESSION PERSISTENCE — LECTURE_SESSIONS / DAILY_QUIZ_SESSIONS /
+# MISTAKES_RETAKE_SESSIONS were previously purely in-memory (see the file
+# index note at the top of this file) — a restart mid-quiz dropped every
+# active session, which is exactly the "الجلسة دي اتقفلت" path in
+# handle_poll_answer. This mirrors REPORT_THREADS' persistence pattern
+# (local JSON + a pinned backup in its own channel, restored on startup)
+# but tuned for much hotter, throwaway data:
+#
+#   - Change detection is a content hash taken once per tick, not a
+#     dirty flag set at each mutation site. Sessions are mutated from
+#     many call sites across lecture/daily-quiz/mistakes-retake delivery
+#     (_deliver_next_lecture_question, _advance_lecture_session,
+#     _deliver_next_daily_question, _advance_daily_quiz_session, and
+#     their mistakes-retake counterparts, plus the two session-creation
+#     sites) — flagging every one individually risks silently missing a
+#     spot as the file changes. A hash comparison of the whole snapshot
+#     costs one json.dumps per tick, which is cheap at this data's size.
+#   - The channel backup is throttled to once every
+#     SESSIONS_BACKUP_MIN_INTERVAL seconds (30s), same idea as every
+#     other backup_*_to_channel — but unlike analytics/settings/
+#     lecture_results/mistakes_bank/report_threads, which now keep every
+#     backup ever taken (see backup_analytics_to_channel's comment), this
+#     ONE deletes the previous pinned message on each new upload. A 30s
+#     cadence keeping full history would post thousands of documents a
+#     day for data nobody needs a history of.
+#   - A session older than SESSIONS_MAX_AGE_SECONDS (48h) is dropped on
+#     restore rather than revived — see _cleanup_stale_sessions_job's own
+#     6h idle-based cleanup, which already reclaims abandoned sessions
+#     during normal operation; this 48h check is just what keeps a
+#     restored snapshot from ever reviving something that old.
+#   - _sessions_stale_sweep_job additionally re-runs that same 48h check
+#     against the LIVE in-memory dicts every 48h, as an independent
+#     backstop in case _cleanup_stale_sessions_job's hourly job was ever
+#     down for an extended stretch (e.g. a JobQueue outage) — it only
+#     removes entries already past 48h old, never active sessions, so it
+#     can't interrupt anyone mid-quiz.
+# ═══════════════════════════════════════════════════════════════
+SESSIONS_FILE                = "sessions.json"
+SESSIONS_BACKUP_MARKER       = "🧩 QUIZICIAN_SESSIONS_BACKUP"
+SESSIONS_BACKUP_MIN_INTERVAL = 30          # seconds
+SESSIONS_MAX_AGE_SECONDS     = 48 * 3600   # 48 hours
+
+def _sessions_snapshot() -> dict:
+    """A plain-dict, JSON-safe snapshot of all three session stores.
+    Int keys (user_id, and poll_status_by_mid's message_id) become
+    strings here — see _restore_sessions_dict for the reverse. Shallow
+    per-session copies only (not a deep copy of the whole store): each
+    session dict is replaced wholesale by its owning function rather than
+    mutated field-by-field across an await, so this is safe against the
+    same kind of mid-serialization mutation save_analytics's comment
+    warns about — there's no in-place list/dict mutation left exposed
+    once a session is captured here except poll_status_by_mid, which is
+    built once at session start and never mutated afterward."""
+    def _clean(sessions: dict) -> dict:
+        out = {}
+        for uid, session in sessions.items():
+            s = dict(session)
+            if "poll_status_by_mid" in s:
+                s["poll_status_by_mid"] = {str(k): v for k, v in s["poll_status_by_mid"].items()}
+            if "sr_asked" in s:
+                # Spaced-repetition tracking (see _maybe_deliver_spaced_
+                # repetition) — a live set, not JSON-safe as-is. json.dumps
+                # raises TypeError on a bare set with no try/except around
+                # it anywhere in this chain (_flush_sessions_if_changed /
+                # backup_sessions_to_channel), so this isn't just cosmetic:
+                # left unconverted, every tick after the first lecture
+                # session with a spaced-repetition miss would throw here
+                # and silently break session persistence entirely for
+                # everyone, not just that one user — sort() keeps it
+                # deterministic in the change-detection JSON (see
+                # _last_sessions_snapshot_json above).
+                s["sr_asked"] = sorted(s["sr_asked"])
+            out[str(uid)] = s
+        return out
+    return {
+        "lecture_sessions":          _clean(LECTURE_SESSIONS),
+        "daily_quiz_sessions":       _clean(DAILY_QUIZ_SESSIONS),
+        "mistakes_retake_sessions":  _clean(MISTAKES_RETAKE_SESSIONS),
+        "bookmarks_retake_sessions": _clean(BOOKMARKS_RETAKE_SESSIONS),
+        # Shared per-day Daily Quiz question sets — see the "Per-day,
+        # per-year shared Daily Quiz questions" section above for why
+        # these ride along in the same snapshot/backup as the sessions.
+        "daily_quiz_questions_date": _DAILY_QUIZ_QUESTIONS_DATE,
+        "daily_quiz_questions":      _DAILY_QUIZ_QUESTIONS,
+    }
+
+def _session_age_seconds(session: dict) -> float:
+    """Best-effort age for the 48h checks above. Lecture sessions have
+    started_at; Daily Quiz / mistakes-retake sessions don't, so this
+    falls back to current_delivered_at (when the in-flight question was
+    sent). If neither is present, treat it as already-ancient rather
+    than immortal, so a malformed entry can never survive indefinitely."""
+    anchor = session.get("started_at") or session.get("current_delivered_at")
+    if anchor is None:
+        return SESSIONS_MAX_AGE_SECONDS + 1
+    return time.time() - anchor
+
+_last_sessions_snapshot_json: str | None = None   # change-detection only, never persisted itself
+
+async def _flush_sessions_if_changed() -> None:
+    """Writes sessions.json locally only if the snapshot actually changed
+    since the last tick. Called every SESSIONS_BACKUP_MIN_INTERVAL seconds
+    by _sessions_backup_job, and once more on a clean shutdown."""
+    global _last_sessions_snapshot_json
+    # The change-detection check AND the write both live inside the file's
+    # lock: two overlapping flushes (the periodic tick racing the clean-
+    # shutdown flush) must not both pass the "changed?" check against the
+    # same stale _last_sessions_snapshot_json and then land out of order.
+    # _last_sessions_snapshot_json also only advances AFTER a successful
+    # write now — previously it advanced first, so a write that raised
+    # left it claiming the data was saved and the next tick would skip it.
+    async with _get_file_write_lock(SESSIONS_FILE):
+        snapshot = _sessions_snapshot()
+        as_json  = json.dumps(snapshot, sort_keys=True)
+        if as_json == _last_sessions_snapshot_json:
+            return
+        await asyncio.to_thread(_atomic_write_json, SESSIONS_FILE, snapshot, indent=2, ensure_ascii=False)
+        _last_sessions_snapshot_json = as_json
+
+def _restore_sessions_dict(raw: dict) -> None:
+    """Populates LECTURE_SESSIONS/DAILY_QUIZ_SESSIONS/MISTAKES_RETAKE_SESSIONS/
+    BOOKMARKS_RETAKE_SESSIONS in place from a loaded snapshot (channel backup or local file),
+    dropping anything already past SESSIONS_MAX_AGE_SECONDS. Also
+    restores the shared per-day Daily Quiz question cache (see the
+    "Per-day, per-year shared Daily Quiz questions" section) — loaded
+    as-is, with no date check here, since _ensure_daily_quiz_questions_fresh
+    already discards it the next time it's read if the date has since
+    rolled over."""
+    global _DAILY_QUIZ_QUESTIONS_DATE, _DAILY_QUIZ_QUESTIONS
+    targets = {
+        "lecture_sessions":          LECTURE_SESSIONS,
+        "daily_quiz_sessions":       DAILY_QUIZ_SESSIONS,
+        "mistakes_retake_sessions":  MISTAKES_RETAKE_SESSIONS,
+        "bookmarks_retake_sessions": BOOKMARKS_RETAKE_SESSIONS,
+    }
+    restored, dropped_stale = 0, 0
+    for key, target in targets.items():
+        target.clear()
+        for uid_str, session in raw.get(key, {}).items():
+            if _session_age_seconds(session) > SESSIONS_MAX_AGE_SECONDS:
+                dropped_stale += 1
+                continue
+            if "poll_status_by_mid" in session:
+                session["poll_status_by_mid"] = {int(k): v for k, v in session["poll_status_by_mid"].items()}
+            if "sr_asked" in session:
+                session["sr_asked"] = set(session["sr_asked"])   # reverse of the sorted-list conversion in _sessions_snapshot's _clean
+            target[int(uid_str)] = session
+            restored += 1
+    _DAILY_QUIZ_QUESTIONS_DATE = raw.get("daily_quiz_questions_date")
+    _DAILY_QUIZ_QUESTIONS      = raw.get("daily_quiz_questions") or {}
+    print(f"Restored {restored} session(s) ({dropped_stale} dropped as stale), "
+          f"daily quiz questions for {len(_DAILY_QUIZ_QUESTIONS)} year(s) dated {_DAILY_QUIZ_QUESTIONS_DATE}.")
+
+def load_sessions() -> dict | None:
+    # None (not {}) for a missing file is load-bearing: callers use it to tell
+    # "never persisted anything" apart from "persisted an empty snapshot".
+    if not os.path.exists(SESSIONS_FILE):
+        return None
+    return _load_json_safe(SESSIONS_FILE, dict, dict, "SESSIONS")
+
+_sessions_backup_msg_id: int | None = None
+_last_sessions_backup_at: float = 0.0
+_last_sessions_backup_snapshot_json: str | None = None   # what was last actually uploaded — separate
+                                                           # from _last_sessions_snapshot_json (local-disk
+                                                           # flush's own change-detection), since the two
+                                                           # run on different schedules/call sites
+
+async def backup_sessions_to_channel(context, force: bool = False) -> None:
+    """Same shape as every other backup_*_to_channel, but throttled AND —
+    unlike the others — deletes the previous pinned backup instead of
+    keeping it forever. See the section banner above for why.
+
+    Also skips the upload entirely when the snapshot is identical to the
+    last one actually sent — most ticks land between quizzes with nobody
+    mid-session, so this turns "upload every ~30s no matter what" into
+    "upload only when session state actually moved." force=True bypasses
+    both this check and the throttle; used by the reconcile job, which
+    calls this specifically because the channel's pin is missing or wrong
+    and needs a fresh upload regardless of whether anything changed."""
+    global _sessions_backup_msg_id, _last_sessions_backup_at, _last_sessions_backup_snapshot_json
+    if not SESSIONS_GROUP_ID:
+        return
+    if not RESTORE_OK.get("sessions", True):
+        print("SESSIONS BACKUP SKIPPED — last restore failed, refusing to overwrite the channel backup.")
+        return
+    now = time.monotonic()
+    if not force and now - _last_sessions_backup_at < SESSIONS_BACKUP_MIN_INTERVAL:
+        return
+    snapshot = _sessions_snapshot()
+    as_json  = json.dumps(snapshot, sort_keys=True)
+    if not force and as_json == _last_sessions_backup_snapshot_json:
+        return   # nothing changed since the last successful upload
+    _last_sessions_backup_at = now
+    data = json.dumps(snapshot, indent=2, ensure_ascii=False).encode("utf-8")
+    try:
+        sent = await context.bot.send_document(
+            chat_id=SESSIONS_GROUP_ID,
+            document=InputFile(BytesIO(data), filename=_backup_filename("sessions.json")),
+            caption=SESSIONS_BACKUP_MARKER,
+        )
+    except Exception as e:
+        print("SESSIONS BACKUP ERROR:", e)
+        return
+    try:
+        await context.bot.pin_chat_message(
+            chat_id=SESSIONS_GROUP_ID, message_id=sent.message_id, disable_notification=True,
+        )
+    except Exception as e:
+        print("SESSIONS PIN ERROR:", e)
+    _last_sessions_backup_snapshot_json = as_json
+    old_msg_id = _sessions_backup_msg_id
+    _sessions_backup_msg_id = sent.message_id
+    if old_msg_id and old_msg_id != sent.message_id:
+        try:
+            await context.bot.delete_message(chat_id=SESSIONS_GROUP_ID, message_id=old_msg_id)
+        except Exception:
+            pass   # already gone, too old to delete, etc. — fine either way, next tick re-syncs
+
+async def restore_sessions_from_channel(app) -> None:
+    global _sessions_backup_msg_id
+    if not SESSIONS_GROUP_ID:
+        return
+
+    async def _do():
+        global _sessions_backup_msg_id, _last_sessions_backup_snapshot_json
+        chat   = await app.bot.get_chat(SESSIONS_GROUP_ID)
+        pinned = chat.pinned_message
+        if not pinned or not pinned.document or (pinned.caption or "") != SESSIONS_BACKUP_MARKER:
+            return
+        tg_file = await app.bot.get_file(pinned.document.file_id)
+        raw     = await tg_file.download_as_bytearray()
+        restored = json.loads(bytes(raw).decode("utf-8"))
+        _restore_sessions_dict(restored)
+        await _flush_sessions_if_changed()
+        _last_sessions_backup_snapshot_json = json.dumps(_sessions_snapshot(), sort_keys=True)
+        _sessions_backup_msg_id = pinned.message_id
+
+    await _run_restore_with_retries(app, "sessions", "Sessions", _do)
+
+async def _sessions_backup_job(context: ContextTypes.DEFAULT_TYPE):
+    """Periodic tick, registered alongside every other job in _post_init:
+    flushes sessions.json locally if changed, then pushes the channel
+    backup (itself separately throttled to SESSIONS_BACKUP_MIN_INTERVAL)."""
+    await _flush_sessions_if_changed()
+    await backup_sessions_to_channel(context)
+
+SESSIONS_STALE_SWEEP_INTERVAL = 48 * 3600  # seconds
+
+async def _sessions_stale_sweep_job(context: ContextTypes.DEFAULT_TYPE):
+    """Independent backstop alongside _cleanup_stale_sessions_job's normal
+    6h idle-based cleanup — see the section banner above. Only removes
+    entries already older than SESSIONS_MAX_AGE_SECONDS; never touches an
+    active session, so this can't interrupt anyone mid-quiz."""
+    removed = 0
+    for sessions in (LECTURE_SESSIONS, DAILY_QUIZ_SESSIONS, MISTAKES_RETAKE_SESSIONS):
+        for user_id, session in list(sessions.items()):
+            if _session_age_seconds(session) > SESSIONS_MAX_AGE_SECONDS:
+                sessions.pop(user_id, None)
+                removed += 1
+    if removed:
+        print(f"SESSIONS — 48h stale sweep removed {removed} session(s).")
+        await _flush_sessions_if_changed()
+        await backup_sessions_to_channel(context)
+
+# ═══════════════════════════════════════════════════════════════
+# QUESTION TIMEOUT — unsticking a timed quiz nobody's answering
+# ═══════════════════════════════════════════════════════════════
+# Auto-next delivery (Daily Quiz / lecture-auto / mistakes-retake /
+# wrong-answer-retake — anywhere a single question is in flight at a
+# time via session["current_poll_id"]) only ever advances from
+# handle_poll_answer, which only fires when the user actually taps an
+# option. A timed question's open_period makes Telegram auto-close the
+# poll once it expires, but Telegram never tells the bot "nobody
+# answered" — so with nothing else in place, a person who lets a timer
+# run out just leaves their own quiz stuck forever, waiting on a
+# poll_answer update that's never coming.
+#
+# The fix: _schedule_question_timeout books a one-off job a couple of
+# seconds after the question's own open_period should have elapsed. If
+# it's still the question the session is waiting on when that job fires
+# (the person hasn't answered — handle_poll_answer would have moved
+# current_poll_id on if they had), _handle_question_timeout treats it as
+# a miss: the first one in a row is skipped exactly like a wrong answer
+# and the quiz carries on as normal. A SECOND miss in a row instead
+# pauses the session (rather than silently auto-skipping through
+# whatever's left) and asks the person whether to resume or abandon it —
+# see the qresume:/qabandon: handlers in button_handler.
+#
+# Batch-mode lecture sessions (every question sent up front, answerable
+# in any order) have no single "current" question to time out this way,
+# so this deliberately does nothing there — see the mode=="batch" check
+# below.
+QUESTION_TIMEOUT_GRACE_SECONDS = 2   # buffer past the timer's own open_period, so we're never racing an answer landing right as Telegram auto-closes the poll
+
+_SESSION_STORE_BY_KIND = {
+    "daily":    DAILY_QUIZ_SESSIONS,
+    "retake":   MISTAKES_RETAKE_SESSIONS,
+    "bmretake": BOOKMARKS_RETAKE_SESSIONS,
+    "lecture":  LECTURE_SESSIONS,
+}
+_QUIZ_KIND_LABEL = {"daily": "Daily Quiz", "retake": "Retake", "bmretake": "Bookmarks Retake", "lecture": "Lecture"}
+
+def _schedule_question_timeout(context: ContextTypes.DEFAULT_TYPE, kind: str, user_id: int, poll_id: str, timer_seconds: int | None) -> None:
+    """Call right after sending a timed poll as part of single-question
+    auto-next delivery. No-op if the question isn't timed (timer_seconds
+    falsy) or there's no JobQueue to schedule against."""
+    if not timer_seconds or context.job_queue is None:
+        return
+    context.job_queue.run_once(
+        _question_timeout_job, when=timer_seconds + QUESTION_TIMEOUT_GRACE_SECONDS,
+        data={"kind": kind, "user_id": user_id, "poll_id": poll_id},
+        name=f"qtimeout:{kind}:{user_id}:{poll_id}",
+    )
+
+async def _question_timeout_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    d = context.job.data
+    await _handle_question_timeout(context, d["kind"], d["user_id"], d["poll_id"])
+
+async def _advance_session_for_kind(context: ContextTypes.DEFAULT_TYPE, kind: str, user_id: int, session: dict, is_correct: bool) -> None:
+    """Dispatches to the right advance function for this session's kind,
+    reading the pending question's own message_id/mid/delivered_at
+    straight off the session — the same way handle_poll_answer's three
+    branches already do for a real answer, just with is_correct forced
+    by the caller (used here to skip a timed-out question as wrong)."""
+    message_id   = session.get("current_message_id")
+    delivered_at = session.get("current_delivered_at")
+    if kind == "daily":
+        await _advance_daily_quiz_session(context, user_id, session, is_correct, message_id, delivered_at)
+    elif kind == "retake":
+        await _advance_mistakes_retake_session(context, user_id, session, is_correct, message_id, delivered_at)
+    elif kind == "bmretake":
+        await _advance_bookmarks_retake_session(context, user_id, session, is_correct, message_id, delivered_at)
+    elif kind == "lecture":
+        await _advance_lecture_session(context, user_id, session, is_correct, message_id, session.get("current_mid"), delivered_at)
+
+async def _handle_question_timeout(context: ContextTypes.DEFAULT_TYPE, kind: str, user_id: int, poll_id: str) -> None:
+    store   = _SESSION_STORE_BY_KIND.get(kind)
+    session = store.get(user_id) if store is not None else None
+    if not session or session.get("current_poll_id") != poll_id:
+        return   # already answered, session finished/replaced/abandoned, or a stale job surviving a restart
+    if session.get("mode") == "batch":
+        return   # no single "current" question to time out in batch mode — see section banner above
+
+    session["timeout_streak"] = session.get("timeout_streak", 0) + 1
+    if session["timeout_streak"] == 1:
+        await _advance_session_for_kind(context, kind, user_id, session, is_correct=False)
+        return
+
+    # Second consecutive miss — pause instead of skipping again, so an
+    # absent user doesn't just get auto-skipped through their whole quiz
+    # unattended.
+    session["paused"] = True
+    label = _QUIZ_KIND_LABEL.get(kind, "Quiz")
+    try:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text="It seems you have stopped quizzing, do wish to abandon the current session? (Quizzy will be sad)",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"▶️ Resume {label}", callback_data=f"qresume:{kind}")],
+                [InlineKeyboardButton(f"🥀 Abandon {label}", callback_data=f"qabandon:{kind}")],
+            ]),
+        )
+    except Exception:
+        pass
+
+# ═══════════════════════════════════════════════════════════════
+# CONSTANTS
+# ═══════════════════════════════════════════════════════════════
+MAX_QUESTIONS_PER_MSG = 50
+TELEGRAM_Q_LIMIT      = 300   # max chars in poll question field
+TELEGRAM_DESC_LIMIT   = 200   # max chars in poll description (shown above question)
+TELEGRAM_EX_LIMIT     = 200   # max chars in poll explanation (shown after answering)
+
+# ═══════════════════════════════════════════════════════════════
+# PER-USER SERIALIZATION
+#
+# Now that concurrent_updates() lets updates from different users run at
+# the same time (see the ApplicationBuilder call near the bottom of this
+# file), two updates from the SAME user in quick succession (a fast
+# double-tap, or a poll-answer racing a button tap) could otherwise
+# interleave mid-handler and corrupt shared per-user state — e.g. two
+# coroutines both reading LECTURE_SESSIONS[user_id], each unaware the
+# other is also about to mutate it, with real await points (Telegram API
+# calls, disk writes) in between the read and the write.
+#
+# @_serialize_per_user fixes this without touching either handler's body:
+# it runs everything from the same user_id through a private asyncio.Lock,
+# so a user's own updates are still handled one-at-a-time, in order — but
+# different users remain fully concurrent with each other, which is what
+# actually matters at 500+ simultaneous users.
+# ═══════════════════════════════════════════════════════════════
+_user_locks: dict[int, asyncio.Lock] = {}
+
+def _get_user_lock(user_id: int) -> asyncio.Lock:
+    lock = _user_locks.get(user_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _user_locks[user_id] = lock
+    return lock
+
+def _serialize_per_user(handler):
+    """Decorator for update handlers: serializes concurrent updates from
+    the same user_id through a per-user lock. No-ops (calls straight
+    through) if the update has no identifiable user."""
+    @functools.wraps(handler)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        user = update.effective_user
+        if user is None:
+            return await handler(update, context, *args, **kwargs)
+        async with _get_user_lock(user.id):
+            return await handler(update, context, *args, **kwargs)
+    return wrapper
+
+# ═══════════════════════════════════════════════════════════════
+# HELPERS
+# ═══════════════════════════════════════════════════════════════
+def clean_option(line: str) -> str:
+    line = line.strip()
+    line = re.sub(r"^[A-Ea-e1-5][).\-]\s*", "", line)
+    line = re.sub(r"^[-•]\s*", "", line)
+    return line.strip()
+
+def strip_leading_letter_prefix(option: str) -> str:
+    return re.sub(r"^[A-Ea-e]\)\s*", "", option).strip()
+
+_MCQ_OPTION_PREFIX_RE = re.compile(r"^[A-Ea-e1-5][).\-]\s*")
+
+def _looks_like_mcq_attempt(lines: list) -> bool:
+    """True if at least one line looks like someone attempting an MCQ
+    option (starts with a "a)"/"b)"/"1." style prefix — same pattern
+    clean_option() strips), even though the block as a whole fell short
+    of the 3+ lines normalize_mcq_block needs to treat it as a real
+    question. Used to tell an ordinary chat message ("مساء الخير", "شكرا")
+    apart from a genuine-but-broken question attempt — only the second
+    case gets the "wrong format!" warning; see its call site."""
+    return any(_MCQ_OPTION_PREFIX_RE.match(l) for l in lines)
+
+def normalize_mcq_block(block: str):
+    block = block.strip()
+    if "\n" in block:
+        return [l.strip() for l in block.split("\n") if l.strip()]
+    match = re.search(r"\b([A-Ea-e1-5])[).]", block)
+    if not match:
+        return [block]
+    question     = block[:match.start()].strip()
+    options_part = block[match.start():]
+    parts = re.split(r"(?=\b[A-Ea-e1-5][).])", options_part)
+    return [question] + [p.strip() for p in parts if p.strip()]
+
+def strip_spoiler_markers(text: str) -> str:
+    return re.sub(r"\|\|(.+?)\|\|", r"\1", text, flags=re.DOTALL)
+
+def parse_mcq_lines(lines: list):
+    """
+    Given already-normalized MCQ lines (question line + option lines),
+    extracts (question, raw_options, correct_index, explanation).
+    correct_index is None if no option was marked correct.
+    Shared by the text handler and the image-caption parser so the
+    MCQ grammar only lives in one place.
+    """
+    question      = lines[0]
+    options       = []
+    correct_index = None
+    explanation   = None
+
+    for line in lines[1:]:
+        ex_match = re.match(r"^ex:\s*(.+)", line, re.IGNORECASE)
+        if ex_match:
+            explanation = ex_match.group(1).strip()
+            continue
+
+        opt       = clean_option(line)
+        has_z_end = re.search(r"\s+[zZ]\s*$", opt)
+        has_check = "✅" in opt
+
+        if has_z_end or has_check:
+            opt           = opt.replace("✅", "")
+            opt           = re.sub(r"\s+[zZ]\s*$", "", opt).strip()
+            correct_index = len(options)
+
+        if opt:
+            options.append(opt)
+
+    return question, options, correct_index, explanation
+
+def parse_mcq_block(block: str):
+    """
+    Full validation on top of parse_mcq_lines: returns
+    (question, raw_options, correct_index, explanation) only if the block
+    is a COMPLETE, valid MCQ (>=3 lines, a correct answer marked).
+    Returns None otherwise. Used to detect a fully-formed question in an
+    image caption so we don't need to ask the user to resend it.
+    """
+    lines = normalize_mcq_block(block.strip())
+    if len(lines) < 3:
+        return None
+    question, options, correct_index, explanation = parse_mcq_lines(lines)
+    if correct_index is None or correct_index >= len(options):
+        return None
+    return question, options, correct_index, explanation
+
+def parse_written_strict(block: str):
+    block = strip_spoiler_markers(block)
+    lines = [l.rstrip() for l in block.split("\n") if l.strip()]
+    if len(lines) < 2:
+        return None
+    title   = lines[0]
+    content = "\n".join(lines[1:]).strip()
+    if content.startswith(".") and content.endswith("."):
+        return title, content[1:-1].strip()
+    return None
+
+def parse_written_channel_block(text: str):
+    """Quiz-CHANNEL written-question marker: a message (or photo caption)
+    whose first line starts with 'w:' (case-insensitive). Everything after
+    the marker on that first line is the title; every following line is
+    the (unscored) content shown to students behind a spoiler. A photo
+    with only a title ("w: some diagram") is valid — content is just "".
+    Returns (title, content) or None if the text doesn't start with the
+    marker or has no title text after it. This is deliberately separate
+    from parse_written_strict (the '.'-wrapped DM personal-quiz-builder
+    format) — different authoring surface, different grammar."""
+    m = re.match(r"^w\s*:\s*(.*)", text.strip(), re.IGNORECASE | re.DOTALL)
+    if not m:
+        return None
+    rest  = m.group(1)
+    lines = rest.split("\n", 1)
+    title = lines[0].strip()
+    if not title:
+        return None
+    content = lines[1].strip() if len(lines) > 1 else ""
+    return title, content
+
+def _utf16_offset_to_py_index(text: str, offset: int) -> int:
+    """Convert Telegram's UTF-16 code-unit offset to a Python string index."""
+    target = max(0, int(offset))
+    units = 0
+    for index, char in enumerate(text):
+        if units >= target:
+            return index
+        units += len(char.encode("utf-16-le")) // 2
+    return len(text)
+
+def _parse_spoiler_written_parts(text: str, entity_map: dict | None):
+    """Recognize the automatic written-question format:
+
+    Question text + exactly one Telegram spoiler containing the answer.
+    Everything outside the spoiler becomes the question/title. A leading
+    optional W: is stripped so the old explicit marker remains compatible.
+    """
+    text = (text or "").strip()
+    if not text or not entity_map:
+        return None
+    spoilers = [(entity, value) for entity, value in entity_map.items()
+                if getattr(entity, "type", None) == "spoiler"]
+    if len(spoilers) != 1:
+        return None
+    entity, answer = spoilers[0]
+    try:
+        start = _utf16_offset_to_py_index(text, entity.offset)
+        end = _utf16_offset_to_py_index(text, entity.offset + entity.length)
+    except Exception:
+        return None
+    question = (text[:start] + text[end:]).strip()
+    answer = (answer or "").strip()
+    question = re.sub(r"^w\s*:\s*", "", question, count=1, flags=re.IGNORECASE).strip()
+    if not question or not answer:
+        return None
+    return question, answer
+
+def parse_spoiler_written_message(message) -> tuple[str, str] | None:
+    if not message or not message.text:
+        return None
+    try:
+        entities = message.parse_entities(types=["spoiler"])
+    except Exception:
+        return None
+    return _parse_spoiler_written_parts(message.text, entities)
+
+def parse_spoiler_written_caption(message) -> tuple[str, str] | None:
+    if not message or not message.caption:
+        return None
+    try:
+        entities = message.parse_caption_entities(types=["spoiler"])
+    except Exception:
+        return None
+    return _parse_spoiler_written_parts(message.caption, entities)
+
+def split_question_for_telegram(question: str):
+    """
+    Returns (main_q, description_overflow) where:
+    - main_q fits in TELEGRAM_Q_LIMIT
+    - description_overflow goes into the 'description' field (shown above question)
+      and is capped at TELEGRAM_DESC_LIMIT
+    If question fits in Q_LIMIT, description_overflow is None.
+    """
+    if len(question) <= TELEGRAM_Q_LIMIT:
+        return question, None
+    # Try to split at a sentence boundary
+    cutoff    = TELEGRAM_Q_LIMIT - 3
+    split_pos = question.rfind(". ", 0, cutoff)
+    if split_pos == -1:
+        split_pos = question.rfind(" ", 0, cutoff)
+    if split_pos == -1:
+        split_pos = cutoff
+    main     = question[:split_pos].strip() + "…"
+    overflow = "…" + question[split_pos:].strip()
+    # Cap overflow to TELEGRAM_DESC_LIMIT
+    if len(overflow) > TELEGRAM_DESC_LIMIT:
+        overflow = overflow[:TELEGRAM_DESC_LIMIT - 1] + "…"
+    return main, overflow
+
+def _prefixed_question(question: str, prefix: str) -> str:
+    """Prepends prefix to a question, truncating the question itself
+    (never the prefix) if the combination would exceed Telegram's poll
+    question limit — shared by _numbered_question (quiz sequence
+    numbers) and the spaced-repetition re-ask's '🔁 Review:' tag."""
+    if len(prefix) + len(question) <= TELEGRAM_Q_LIMIT:
+        return prefix + question
+    return prefix + question[:TELEGRAM_Q_LIMIT - len(prefix) - 1].rstrip() + "…"
+
+def _numbered_question(question: str, number: int) -> str:
+    """Prefixes a question with its 1-based position in the quiz it's
+    being delivered as part of ('1) ...', '2) ...') — see
+    _deliver_next_daily_question / _deliver_next_lecture_question, which
+    number every question of every quiz (Daily Quiz, lecture, mistakes-
+    bank retake, wrong-answer retake) this way via a per-session
+    delivered_count counter. Truncates the question itself (never the
+    prefix) if the combination would exceed Telegram's poll question
+    limit — only ever triggers for a question already sitting right at
+    that cap, since the prefix only adds a few characters."""
+    return _prefixed_question(question, f"{number}) ")
+
+def options_too_long(options: list) -> bool:
+    """Check if any single option exceeds Telegram's 100-char option limit."""
+    return any(len(o) > 100 for o in options)
+
+def make_letter_only_options(count: int) -> list:
+    """Return ['A', 'B', 'C', ...] for poll when answers are too long."""
+    return [string.ascii_uppercase[i] for i in range(count)]
+
+def _clear_pending_image(user_id: int):
+    """Drop any image that's still waiting for a question, deleting its file."""
+    path = PENDING_IMAGE.pop(user_id, None)
+    if path and os.path.exists(path):
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+# ═══════════════════════════════════════════════════════════════
+# QUIZ DELIVERY  (single source of truth for sending a live quiz poll)
+# ═══════════════════════════════════════════════════════════════
+async def _send_quiz_poll(
+    context,
+    poll_kwargs: dict,
+    image_path: str = None,
+    *,
+    question_key: str | None = None,
+    question_meta: dict | None = None,
+):
+    """Send a quiz poll and remember the resulting message as bookmark/reportable.
+    The optional question metadata lets reaction reports identify the same source
+    question across different student deliveries.
+    """
+    metadata = dict(question_meta or {})
+    metadata.setdefault("question", poll_kwargs.get("question", ""))
+    metadata.setdefault("options", list(poll_kwargs.get("options", []) or []))
+    qkey = question_key or _question_content_key(
+        metadata.get("question", ""), metadata.get("options", []), prefix="quiz"
+    )
+    if image_path:
+        try:
+            with open(image_path, "rb") as f:
+                msg = await context.bot.send_poll(**poll_kwargs, media=InputMediaPhoto(f))
+            _remember_bookmarkable_question(
+                poll_kwargs["chat_id"], msg.message_id, question_key=qkey, metadata=metadata,
+            )
+            await _maybe_send_zikr_poll(context, poll_kwargs["chat_id"])
+            return msg
+        except Exception as e:
+            print("POLL MEDIA ERROR (falling back to separate image message):", e)
+            with open(image_path, "rb") as f:
+                image_msg = await context.bot.send_photo(chat_id=poll_kwargs["chat_id"], photo=f)
+            _remember_bookmarkable_question(
+                poll_kwargs["chat_id"], image_msg.message_id, question_key=qkey, metadata=metadata,
+            )
+    msg = await context.bot.send_poll(**poll_kwargs)
+    _remember_bookmarkable_question(
+        poll_kwargs["chat_id"], msg.message_id, question_key=qkey, metadata=metadata,
+    )
+    await _maybe_send_zikr_poll(context, poll_kwargs["chat_id"])
+    return msg
+
+# ═══════════════════════════════════════════════════════════════
+# QZ WATERMARK — silent anti-theft fingerprint applied only when a
+# question is CREATED through the typed-text format (parse_mcq_lines /
+# parse_mcq_block), never on delivery/re-render of already-stored
+# content, and never on questions authored as native polls in a quiz
+# channel (that pipeline is untouched — see handle_quiz_channel_message).
+#
+# Encodes the 16-bit ASCII pattern for "QZ" (01010001 01011010) across
+# every FOUR consecutive questions a given creator writes, one nibble
+# per question, one bit per option A-D: a trailing "." on the option =
+# 1, no trailing "." = 0.
+#     Q1 -> 0101   Q2 -> 0001   Q3 -> 0101   Q4 -> 1010   (then repeats)
+# The FIRST question of each 4-question cycle also gets a trailing "."
+# on its stem (a start-of-cycle marker); the other three never do.
+#
+# Alignment is per QUESTION, not per option, so it can't drift:
+#   • only the first four options carry bits — a 5th option (E) is left
+#     untouched, so 4- and 5-option questions decode identically;
+#   • a question with fewer than 4 options can't carry a nibble, so it
+#     is skipped entirely and does NOT advance the cycle;
+#   • the position counter is kept per creator (their own Telegram id),
+#     so different people's questions never interleave into each
+#     other's sequences; persisted to WATERMARK_STATE_FILE.
+# A natural trailing "." in the original text is normalized (dropped for
+# a 0 bit / kept for a 1 bit) so the pattern always reads back cleanly.
+# ═══════════════════════════════════════════════════════════════
+QZ_WATERMARK_BITS    = "".join(format(ord(c), "08b") for c in "QZ")   # "0101000101011010"
+WATERMARK_STATE_FILE = "watermark_state.json"
+
+_watermark_state = _load_json_safe(WATERMARK_STATE_FILE, dict, dict, "WATERMARK STATE")
+if not isinstance(_watermark_state.get("counters"), dict):
+    _watermark_state = {"counters": {}}   # fresh / old single-stream format — start each creator's cycle over
+
+async def _save_watermark_state() -> None:
+    await _write_json_serialized(WATERMARK_STATE_FILE, lambda: {"counters": dict(_watermark_state["counters"])})
+
+def _apply_qz_watermark(question: str, raw_options: list, creator_id: int) -> tuple[str, list]:
+    """Call exactly once per freshly-CREATED typed-text question, right
+    after parsing and before it's delivered/stored. Returns
+    (possibly-dotted question, possibly-dotted options) — never mutates
+    the inputs. Caller persists the new position via
+    _save_watermark_state()."""
+    if len(raw_options) < 4:
+        return question, list(raw_options)   # can't carry a nibble — skip, cycle position unchanged
+    counters = _watermark_state["counters"]
+    n      = counters.get(str(creator_id), 0)
+    k      = n % 4                                  # which question of the 4-question cycle this is
+    nibble = QZ_WATERMARK_BITS[4 * k: 4 * k + 4]
+
+    def _norm(text: str, dot: bool) -> str:
+        text = str(text).rstrip()
+        has_dot = text.endswith(".") and not text.endswith("..")
+        if dot and not text.endswith("."):
+            return text + "."
+        if not dot and has_dot:
+            return text[:-1].rstrip()
+        return text
+
+    stem = _norm(question, dot=(k == 0))
+    options = [
+        _norm(opt, dot=(nibble[i] == "1")) if i < 4 else str(opt)
+        for i, opt in enumerate(raw_options)
+    ]
+    counters[str(creator_id)] = n + 1
+    return stem, options
+
+async def deliver_quiz(
+    context, chat_id: int, question: str, raw_options: list, correct_index: int,
+    explanation: str = None, image_path: str = None,
+    always_show_question_text: bool = False, header_label: str = "📋 <b>السؤال:</b>",
+    question_key: str | None = None, question_meta: dict | None = None,
+    description: str | None = None,
+):
+    """
+    Sends a single live quiz poll to chat_id, handling Telegram's field-length
+    limits consistently (question <=300, options <=100, explanation <=200).
+    If image_path is given, it's attached as the quiz's native photo
+    attachment (Bot API 10.0+), so it shows up inside the quiz itself.
+
+    always_show_question_text=True forces the original question text to be
+    shown as a message even when it fits inside the poll's question field —
+    used for forwarded quizzes so the original wording is always visible.
+
+    This is the ONLY place that builds/sends quiz polls, so forwarded
+    polls, typed MCQs, and image-paired MCQs all share one code path.
+    """
+    labeled_options = [
+        f"{string.ascii_uppercase[i]}) {opt}" for i, opt in enumerate(raw_options)
+    ]
+    # One combined check: doesn't matter WHICH part overflows (question or
+    # any option) — either way we fall back to the same "plain text +
+    # bare-letter poll" delivery below.
+    fits = len(question) <= TELEGRAM_Q_LIMIT and not options_too_long(labeled_options)
+
+    # chat_id is always the user's own DM here, so it doubles as their user_id.
+    timer_seconds = get_question_timer_seconds(chat_id)
+    open_period   = timer_seconds if timer_seconds else None
+    metadata = dict(question_meta or {})
+    metadata.setdefault("question", question)
+    metadata.setdefault("options", list(raw_options or []))
+    qkey = question_key or _question_content_key(question, raw_options, prefix="quiz")
+
+    if fits:
+        main_q, desc_overflow = split_question_for_telegram(question)
+
+        if always_show_question_text:
+            stem_msg = await context.bot.send_message(
+                chat_id=chat_id, text=f"{header_label}\n{question}", parse_mode=ParseMode.HTML,
+            )
+            _remember_bookmarkable_question(chat_id, stem_msg.message_id, question_key=qkey, metadata=metadata)
+
+        if desc_overflow:
+            overflow_msg = await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"📋 <b>تكملة السؤال:</b>\n{desc_overflow}",
+                parse_mode=ParseMode.HTML,
+            )
+            _remember_bookmarkable_question(chat_id, overflow_msg.message_id, question_key=qkey, metadata=metadata)
+
+        poll_kwargs = dict(
+            chat_id=chat_id, question=main_q, options=labeled_options,
+            type="quiz", correct_option_id=correct_index, is_anonymous=True,
+            open_period=open_period,
+        )
+        _with_poll_description(poll_kwargs, description)
+        if explanation:
+            poll_kwargs["explanation"] = explanation[:TELEGRAM_EX_LIMIT]
+        await _send_quiz_poll(
+            context, poll_kwargs, image_path,
+            question_key=qkey, question_meta=metadata,
+        )
+
+    else:
+        # Either the question (>300 chars) or at least one option (>100
+        # chars) overflows Telegram's poll field limits — doesn't matter
+        # which, the fallback is the same. Send the question + all options
+        # together as ONE plain text message (no correct-answer marker —
+        # that would spoil the answer before the poll opens), then deliver
+        # a poll with bare A/B/C/D options so the student just taps a
+        # letter against what they just read.
+        answer_lines = "\n".join(
+            f"{string.ascii_uppercase[i]}) {opt}"
+            for i, opt in enumerate(raw_options)
+        )
+        stem_msg = await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"{header_label}\n{question}\n\n{answer_lines}",
+            parse_mode=ParseMode.HTML,
+        )
+        _remember_bookmarkable_question(chat_id, stem_msg.message_id, question_key=qkey, metadata=metadata)
+
+        letter_opts = make_letter_only_options(len(raw_options))
+        poll_kwargs = dict(
+            chat_id=chat_id, question=".", options=letter_opts,
+            type="quiz", correct_option_id=correct_index, is_anonymous=True,
+            open_period=open_period,
+        )
+        _with_poll_description(poll_kwargs, description)
+        if explanation:
+            poll_kwargs["explanation"] = explanation[:TELEGRAM_EX_LIMIT]
+        await _send_quiz_poll(
+            context, poll_kwargs, image_path,
+            question_key=qkey, question_meta=metadata,
+        )
+
+# ═══════════════════════════════════════════════════════════════
+# KEYBOARD HELPERS
+# ═══════════════════════════════════════════════════════════════
+def start_menu_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🦦 How To Use", callback_data="menu_how"),
+            InlineKeyboardButton("Quizzes ⁉️",    callback_data="menu_quizzes"),
+        ],
+        [
+            InlineKeyboardButton("📊 My Stats", callback_data="menu_mystats"),
+            InlineKeyboardButton("⚙️ Settings",  callback_data="menu_settings"),
+        ],
+        [
+            InlineKeyboardButton("❤️ Bookmarks", callback_data="menu_bookmarks"),
+            InlineKeyboardButton("💥Daily Quiz💥", callback_data="daily_quiz"),
+        ],
+        [
+            InlineKeyboardButton("🧠 Mistakes Bank", callback_data="mistakes_bank_menu"),
+        ],
+        [
+            InlineKeyboardButton("🏆 Leaderboard", callback_data="leaderboard_menu"),
+        ],
+        [
+            InlineKeyboardButton("🔥COMING SOON🔥", callback_data="coming_soon"),
+        ],
+    ])
+
+def settings_menu_keyboard(user_id: int, page: int = 1) -> InlineKeyboardMarkup:
+    def _tag(on: bool) -> str:
+        return "🟢 On" if on else "🔴 Off"
+
+    if page == 2:
+        reactions    = get_reactions_enabled(user_id)
+        ach_notifs   = get_achievement_notifs_enabled(user_id)
+        daily_notifs = get_daily_notifs_enabled(user_id)
+        zikr         = get_zikr_enabled(user_id)
+        rows = [
+            [InlineKeyboardButton(f"🎭 Reactions: {_tag(reactions)}", callback_data="toggle_reactions")],
+            [InlineKeyboardButton(f"🏆 Achievement Alerts: {_tag(ach_notifs)}", callback_data="toggle_achievement_notifs")],
+            [InlineKeyboardButton(f"🔔 Daily Notification: {_tag(daily_notifs)}", callback_data="toggle_daily_notifs")],
+            [InlineKeyboardButton(f"📿 Zikr: {_tag(zikr)}", callback_data="toggle_zikr")],
+            [InlineKeyboardButton("ℹ️ About Us", callback_data="settings_about_us")],
+            [InlineKeyboardButton("🫶 Support Us", callback_data="settings_support_us")],
+            [InlineKeyboardButton("📜 Terms of Service", callback_data="settings_terms")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="settings_page:1")],
+            [InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")],
+        ]
+        return InlineKeyboardMarkup(rows)
+
+    auto_next    = get_auto_next_enabled(user_id)
+    randomize    = get_randomize_enabled(user_id)
+    mix_written  = get_mix_written_enabled(user_id)
+    spaced_rep = get_spaced_repetition_enabled(user_id)
+    timer      = get_question_timer_seconds(user_id)
+    timer_tag  = "🔴 Off" if timer == 0 else f"🟢 {timer}s"
+    rows = [
+        [InlineKeyboardButton("✏️ Edit Nickname", callback_data="edit_nickname")],
+        [InlineKeyboardButton("📚 Change Year", callback_data="settings_year")],
+        [InlineKeyboardButton(f"⏭️ Auto-Next: {_tag(auto_next)}", callback_data="toggle_auto_next")],
+        [InlineKeyboardButton(f"🔀 Randomize: {_tag(randomize)}", callback_data="toggle_randomize")],
+        [InlineKeyboardButton(f"🔀 Mix Written: {_tag(mix_written)}", callback_data="toggle_mix_written")],
+        [InlineKeyboardButton(f"🔁 Spaced Repetition: {_tag(spaced_rep)}", callback_data="toggle_spaced_repetition")],
+        [InlineKeyboardButton(f"⏱️ Question Timer: {timer_tag}", callback_data="toggle_question_timer")],
+        [InlineKeyboardButton("➡️ More Settings", callback_data="settings_page:2")],
+        [InlineKeyboardButton("🏠 Back to Home",  callback_data="back_home")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+# ═══════════════════════════════════════════════════════════════
+# MENU TEXT CONTENT
+# ═══════════════════════════════════════════════════════════════
+HOW_TO_USE_TEXT = (
+    "🦦 <b>ازاي تستخدم Quizician؟</b>\n\n"
+    "<b>📝 Quizzes ⁉️</b>\n"
+    "اختار السنة، بعدين الموديول، بعدين المادة، وبعدين المحاضرة — وابدأ تجاوب. "
+    "كل سؤال بيتصحح على طول، وبتاخد XP على كل إجابة صح.\n\n"
+    "<b>💥 Daily Quiz</b>\n"
+    "10 أسئلة عشوائية من منهج سنتك، بتتجدد كل يوم الساعة 2 الضهر. "
+    "أول مرة تستخدمه هيطلب منك تحدد سنتك/فرقتك — ومحاولة واحدة بس في اليوم.\n\n"
+    "<b>🧠 Mistakes Bank</b>\n"
+    "أي سؤال تغلط فيه بيتسجل هنا تلقائي، عشان ترجعله وتراجعه تاني وقت ما تحب.\n\n"
+    "<b>📊 My Stats</b>\n"
+    "شوف الـ XP والـ Level بتاعك، عدد الأسئلة الصح والغلط، والـ achievements اللي فتحتها.\n\n"
+    "<b>🏆 Leaderboard</b>\n"
+    "ترتيبك بين زمايلك في نفس السنة/الفرقة، حسب عدد الإجابات الصح ونسبة الدقة.\n\n"
+    "<b>⚙️ Settings</b>\n"
+    "غيّر اسمك المستعار، سنتك/فرقتك، أو شغّل/قفّل حاجات زي الـ Auto-Next، "
+    "الـ Randomize، تذكير الـ Daily Quiz، وتذكير الزكر كل ساعة.\n\n"
+    "😴 /sleep — يوقف تفاعل البوت مؤقتًا لحد ما تبعت /start تاني\n"
+    "🆘 /report_issue — لو فيه مشكلة أو سؤال غلط، ابعتلنا بلاغ"
+)
+
+# ═══════════════════════════════════════════════════════════════
+# REACTIONS
+# ═══════════════════════════════════════════════════════════════
+TOAST_DELETE_SECONDS = 8      # every toast-style message deletes itself after this many seconds
+_TOAST_TASKS: set = set()     # strong refs so the background delete tasks aren't garbage-collected
+
+async def _send_toast_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, *, delay: float = TOAST_DELETE_SECONDS):
+    """Toast as a real (silent) message that deletes itself after `delay`
+    seconds. Used for every toast in the bot: button-tap toasts (see
+    _tap_toast / button_handler) and reaction acknowledgements. The delete
+    runs in a background task so it never blocks the handler that sent it."""
+    try:
+        sent = await context.bot.send_message(
+            chat_id=chat_id, text=text, disable_notification=True,
+        )
+    except Exception:
+        return
+    async def _remove():
+        await asyncio.sleep(delay)
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=sent.message_id)
+        except Exception:
+            pass
+    task = asyncio.create_task(_remove())
+    _TOAST_TASKS.add(task)
+    task.add_done_callback(_TOAST_TASKS.discard)
+
+async def _reaction_toast(context: ContextTypes.DEFAULT_TYPE, user_id: int, text: str, *, delay: float = TOAST_DELETE_SECONDS):
+    """Toast-like acknowledgement for reaction-driven actions.
+
+    Telegram's reaction update has no callback-query toast API, so this is a
+    tiny silent message that disappears shortly afterward.
+    """
+    await _send_toast_message(context, user_id, text, delay=delay)
+
+async def _record_question_report(
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    chat_id: int,
+    message_id: int,
+    meta: dict,
+    reaction_emoji: str,
+):
+    question_key = meta.get("question_key") or _question_content_key(meta.get("question", ""), meta.get("options", []))
+    entry = QUESTION_REPORTS.setdefault(question_key, {
+        "count": 0,
+        "question": meta.get("question", ""),
+        "options": list(meta.get("options", []) or []),
+        "year": meta.get("year"),
+        "module": meta.get("module"),
+        "subject": meta.get("subject"),
+        "lecture": meta.get("lecture"),
+        "source_mid": meta.get("source_mid"),
+    })
+    entry["count"] = int(entry.get("count", 0)) + 1
+    entry["last_reported_at"] = int(time.time())
+    if not entry.get("question"):
+        entry["question"] = meta.get("question", "")
+    if not entry.get("options"):
+        entry["options"] = list(meta.get("options", []) or [])
+    await save_question_reports()
+
+    location_bits = [
+        meta.get("year"),
+        meta.get("module"),
+        meta.get("subject"),
+        meta.get("lecture"),
+    ]
+    location = " — ".join(str(x) for x in location_bits if x) or "Unscoped question"
+    source = meta.get("source_mid")
+    source_line = f"\n🆔 Source question: <code>{source}</code>" if source is not None else ""
+    options_text = "\n".join(
+        f"{string.ascii_uppercase[i]}) {html.escape(str(opt))}"
+        for i, opt in enumerate(meta.get("options", []) or [])
+    )
+    report_text = (
+        f"🚨 <b>QUESTION REPORT</b>\n"
+        f"⚠️ Reaction: <b>{html.escape(reaction_emoji)}</b>\n"
+        f"👤 User: <code>{user_id}</code>\n"
+        f"📍 {html.escape(location)}\n"
+        f"🔢 Reports for this question: <b>{entry['count']}</b>"
+        f"{source_line}\n\n"
+        f"<b>Question:</b>\n{html.escape(meta.get('question', '—'))}"
+    )
+    if options_text:
+        report_text += f"\n\n<b>Options:</b>\n{options_text}"
+
+    if ERROR_LOG_GROUP_ID:
+        try:
+            await context.bot.send_message(
+                chat_id=ERROR_LOG_GROUP_ID, text=report_text, parse_mode=ParseMode.HTML,
+                disable_notification=True,
+            )
+        except Exception as e:
+            print(f"QUESTION REPORT LOG ERROR for user {user_id}, message {message_id}: {e}")
+    else:
+        print(report_text.replace("<b>", "").replace("</b>", "").replace("<code>", "").replace("</code>", ""))
+
+async def handle_message_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles user reactions on questions delivered by Quizician.
+
+    ❤️ = bookmark toggle; removing ❤️ removes the bookmark from the shared bank.
+    😢 / 😭 = report this question as potentially wrong; the bot reacts 🫡,
+    aggregate count is
+    persisted and the report is copied to ERROR_LOG_GROUP_ID.
+
+    We only act on fresh additions of these reactions and only on question
+    messages remembered by the delivery layer, so ordinary message reactions
+    elsewhere in the chat are ignored.
+    """
+    reaction = update.message_reaction
+    if reaction is None or reaction.user is None:
+        return
+
+    user_id = reaction.user.id
+    chat_id = reaction.chat.id
+    if chat_id != user_id:
+        return
+
+    meta = _question_message_meta(user_id, reaction.message_id)
+    if meta is None:
+        return
+
+    def _emoji_set(reactions):
+        out = set()
+        for item in (reactions or ()):
+            emoji = getattr(item, "emoji", None)
+            if emoji:
+                out.add(emoji)
+        return out
+
+    old_emojis = _emoji_set(reaction.old_reaction)
+    new_emojis = _emoji_set(reaction.new_reaction)
+
+    report_emojis = {"😢", "😭"}
+    old_report = bool(old_emojis & report_emojis)
+    new_report = bool(new_emojis & report_emojis)
+
+    # Report first: it is the more important action if a client replaces an
+    # existing reaction with 😢/😭. Do not double-count a 😢 -> 😭 switch.
+    if new_report and not old_report:
+        chosen = "😭" if "😭" in new_emojis else "😢"
+        await _record_question_report(
+            context, user_id, chat_id, reaction.message_id, meta, chosen,
+        )
+        try:
+            await context.bot.set_message_reaction(
+                chat_id=chat_id,
+                message_id=reaction.message_id,
+                reaction=[ReactionTypeEmoji("🫡")],
+                is_big=False,
+            )
+        except Exception as e:
+            print(f"REPORT REACTION ERROR for user {user_id}, message {reaction.message_id}: {e}")
+        await _reaction_toast(context, user_id, "Report sent! ^-^")
+        return
+
+    heart_present = bool({"❤️", "❤"} & new_emojis)
+    heart_was_present = bool({"❤️", "❤"} & old_emojis)
+    if heart_present and not heart_was_present:
+        saved_new = _bookmark_question(user_id, meta)
+        try:
+            await save_mistakes_bank()
+            await backup_mistakes_bank_to_channel(context)
+        except Exception as e:
+            print(f"BOOKMARK SAVE ERROR for user {user_id}, message {reaction.message_id}: {e}")
+        try:
+            await context.bot.set_message_reaction(
+                chat_id=chat_id,
+                message_id=reaction.message_id,
+                reaction=[ReactionTypeEmoji("✍️")],
+                is_big=False,
+            )
+        except Exception as e:
+            print(f"BOOKMARK REACTION ERROR for user {user_id}, message {reaction.message_id}: {e}")
+        await _reaction_toast(
+            context, user_id,
+            "Question bookmarked! ^-^" if saved_new else "Already bookmarked! ^-^",
+        )
+        return
+
+    if heart_was_present and not heart_present:
+        removed = _unbookmark_question(user_id, meta)
+        if removed:
+            try:
+                await save_mistakes_bank()
+                await backup_mistakes_bank_to_channel(context)
+            except Exception as e:
+                print(f"BOOKMARK REMOVE SAVE ERROR for user {user_id}, message {reaction.message_id}: {e}")
+        await _reaction_toast(context, user_id, "Bookmark removed! ^-^" if removed else "Bookmark not found.")
+
+async def react_random(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id if update.effective_user else update.effective_chat.id
+    if not get_reactions_enabled(user_id):
+        return
+    try:
+        roll  = random.randint(1, 20)
+        emoji = "🫡" if roll <= 15 else "❤️" if roll <= 19 else "🏆"
+        await context.bot.set_message_reaction(
+            chat_id=update.effective_chat.id,
+            message_id=update.message.message_id,
+            reaction=[ReactionTypeEmoji(emoji)],
+            is_big=False,
+        )
+    except Exception:
+        pass
+
+async def _react_to_lecture_answer(
+    context: ContextTypes.DEFAULT_TYPE, user_id: int, message_id: int | None,
+    is_correct: bool, new_streak: int, streak_broken: bool,
+) -> None:
+    """Quizzy's reaction to a single lecture-quiz poll answer, based on
+    correctness and the user's current lecture correct-streak:
+      - correct, streak > 15  → 🏆
+      - correct, streak > 10  → 😍
+      - correct, streak > 5   → ❤️‍🔥
+      - correct, otherwise    → ❤️
+      - wrong, broke a streak → 💔
+      - wrong, no streak lost → 😢
+    Respects the Reactions setting and no-ops if there's no message to
+    react to (e.g. the poll message couldn't be sent/found)."""
+    if message_id is None or not get_reactions_enabled(user_id):
+        return
+    if is_correct:
+        if new_streak > 15:
+            emoji = "🏆"
+        elif new_streak > 10:
+            emoji = "😍"
+        elif new_streak > 5:
+            emoji = "❤️‍🔥"
+        else:
+            emoji = "❤️"
+    else:
+        emoji = "💔" if streak_broken else "😢"
+    try:
+        await context.bot.set_message_reaction(
+            chat_id=user_id,
+            message_id=message_id,
+            reaction=[ReactionTypeEmoji(emoji)],
+            is_big=False,
+        )
+    except Exception:
+        pass
+
+# ═══════════════════════════════════════════════════════════════
+# SLEEP / WAKE COMMANDS
+# ═══════════════════════════════════════════════════════════════
+async def sleep_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_chat.id
+    SLEEPING.add(user_id)
+    await update.message.reply_text(
+        f"{quizzy_block(QUIZZY_SLEEPING_ART, 'قوزي نام، وأنا نايم معاه 😴')}\n\n"
+        "نادينا بـ /start لما تحتاجنا تاني",
+        parse_mode=ParseMode.HTML,
+    )
+
+# ═══════════════════════════════════════════════════════════════
+# PASSIVE ANSWER BACKFILL
+# Telegram pushes a fresh Update.poll (with correct_option_ids filled in)
+# to any bot that has previously seen a poll, once that poll is stopped —
+# even for polls the bot didn't create. If the original quiz's creator
+# later ends it, we quietly backfill the answer with no user action needed.
+# ═══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
+# QUIZ POLL TIMEOUT — a session used to get stuck forever if a poll's
+# open_period (the Settings question-timer) expired with nobody voting.
+#
+# Root cause: session progression only ever happened inside
+# handle_poll_answer, which fires on a PollAnswer update — and Telegram
+# ONLY sends PollAnswer when someone actually votes. If the timer runs
+# out unanswered, Telegram still sends an Update.poll (is_closed=True —
+# same shape as any other poll closing) but NEVER a PollAnswer for it,
+# since nobody voted. Nothing was listening for that case, so the
+# session just sat there permanently waiting for an answer that could
+# never arrive.
+#
+# Fix: poll_update_handler (already registered for every Update.poll)
+# now also checks, on every closed poll, whether it's still the
+# in-flight question for a Daily Quiz / Mistakes Retake / lecture
+# session — i.e. nothing has advanced that session past it yet, which
+# is only possible if no PollAnswer ever came in for it. If so, treats
+# it exactly like an incorrect answer and advances the session, same
+# as handle_poll_answer would for any other wrong answer.
+#
+# If the user DID answer in time, handle_poll_answer has already
+# advanced the session (cleared current_poll_id / popped it out of
+# pending_polls) well before this ever runs, so the match below simply
+# fails and this is a no-op — it only ever fires for a genuine timeout.
+# ═══════════════════════════════════════════════════════════════
+async def _handle_quiz_poll_timeout(context: ContextTypes.DEFAULT_TYPE, poll) -> None:
+    poll_id = poll.id
+
+    for user_id, session in list(DAILY_QUIZ_SESSIONS.items()):
+        if session.get("current_poll_id") == poll_id:
+            await _advance_daily_quiz_session(
+                context, user_id, session, False, session.get("current_message_id"),
+                session.get("current_delivered_at"),
+            )
+            return
+
+    for user_id, session in list(MISTAKES_RETAKE_SESSIONS.items()):
+        if session.get("current_poll_id") == poll_id:
+            await _advance_mistakes_retake_session(
+                context, user_id, session, False, session.get("current_message_id"),
+                session.get("current_delivered_at"),
+            )
+            return
+
+    for user_id, session in list(BOOKMARKS_RETAKE_SESSIONS.items()):
+        if session.get("current_poll_id") == poll_id:
+            await _advance_bookmarks_retake_session(
+                context, user_id, session, False, session.get("current_message_id"),
+                session.get("current_delivered_at"),
+            )
+            return
+
+    for user_id, session in list(LECTURE_SESSIONS.items()):
+        if session.get("mode") == "batch":
+            pending = session.get("pending_polls", {})
+            if poll_id in pending:
+                _, message_id, mid, delivered_at = pending.pop(poll_id)
+                await _advance_lecture_session(context, user_id, session, False, message_id, mid, delivered_at)
+                return
+        elif session.get("current_poll_id") == poll_id:
+            await _advance_lecture_session(
+                context, user_id, session, False,
+                session.get("current_message_id"), session.get("current_mid"),
+                session.get("current_delivered_at"),
+            )
+            return
+
+async def _delayed_poll_timeout_check(context: ContextTypes.DEFAULT_TYPE, poll) -> None:
+    """A short grace window before treating a closed poll as a genuine
+    timeout. Without this, a vote cast in the same instant the timer
+    expires — poll_answer and the closing Update.poll landing almost
+    simultaneously, with no guaranteed order between them — could get
+    double-counted: once here as a timeout, once for real once its
+    poll_answer actually arrives. Waiting lets a same-instant real
+    answer land and advance the session first, which makes the match
+    in _handle_quiz_poll_timeout fail naturally, same as any other
+    already-answered poll."""
+    await asyncio.sleep(1.0)
+    try:
+        await _handle_quiz_poll_timeout(context, poll)
+    except Exception as e:
+        print(f"QUIZ POLL TIMEOUT: failed to advance a session for poll {poll.id}: {e}")
+
+async def poll_update_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    poll = update.poll
+
+    # Independent of everything else below (which is about the ORIGINAL
+    # channel poll an admin uploaded) — this is about whichever poll
+    # Telegram is telling us just closed, full stop, checking whether
+    # it's a per-user delivered lecture/Daily-Quiz/retake question that
+    # timed out unanswered. See the QUIZ POLL TIMEOUT section above.
+    if poll is not None and poll.is_closed:
+        asyncio.create_task(_delayed_poll_timeout_check(context, poll))
+
+    # ── Quiz-channel poll tracking: mark it closed once stopped ──
+    # poll.id is a Telegram-generated UUID, unique across all years, so a
+    # linear check across each year's QUIZ_POLL_STATUS is safe/cheap.
+    poll_year = None
+    if poll is not None:
+        poll_year = next((y for y in YEARS if poll.id in QUIZ_POLL_STATUS[y]), None)
+    if poll_year is not None and poll.is_closed:
+        entry = QUIZ_POLL_STATUS[poll_year][poll.id]
+        if not entry["closed"]:
+            entry["closed"] = True
+            if poll.correct_option_ids and entry.get("correct_option_id") is None:
+                entry["correct_option_id"] = poll.correct_option_ids[0]
+            # Capture full poll content too, not just the correct answer —
+            # lecture delivery needs to rebuild these as our own polls (see
+            # _deliver_next_lecture_question) so it can get real poll_answer
+            # events, since a straight copy of a channel poll stays
+            # anonymous forever and Telegram never sends those for it.
+            entry["question"]    = poll.question
+            entry["options"]     = [o.text for o in poll.options]
+            entry["explanation"] = poll.explanation
+            if _poll_description(poll):
+                entry["description"] = _poll_description(poll)
+            await save_quiz_poll_status(poll_year)
+            try:
+                await context.bot.set_message_reaction(
+                    chat_id=year_channel_id(poll_year), message_id=entry["message_id"],
+                    reaction=[ReactionTypeEmoji("✅")], is_big=False,
+                )
+            except Exception:
+                pass
+
+# ── XP for lecture quiz answers ───────────────────────────────
+XP_LECTURE_CORRECT        = 15   # per question answered correctly
+XP_LECTURE_INCORRECT      = 5    # per question answered incorrectly
+XP_LECTURE_COMPLETE_BONUS = 25   # extra, on top of the above, for the lecture's last question
+
+async def _deliver_written_item(context: ContextTypes.DEFAULT_TYPE, user_id: int, w: dict):
+    """Sends one written-question entry (see parse_written_channel_block /
+    QUIZ_INDEX[year][lecture]['written']): a title with its content hidden
+    behind a Telegram spoiler, same '||text||' MarkdownV2 convention as the
+    DM personal-quiz-builder's written blocks. Unscored — not a poll, never
+    touches session['answered']/['correct'], XP, or the mistakes bank."""
+    title   = w.get("title", "")
+    content = w.get("content", "")
+    # title/content are raw lecturer-authored text and almost always contain
+    # MarkdownV2 special chars (. - ( ) : etc.) — must be escaped or Telegram
+    # rejects the whole send with "can't parse entities", silently dropping
+    # both the question AND its image (same send_photo call).
+    safe_title = escape_markdown(title, version=2)
+    caption = f"*{safe_title}*"
+    if content:
+        caption += f"\n||{escape_markdown(content, version=2)}||"
+    image = w.get("image")
+    sent = None
+    try:
+        if image and image.get("file_id"):
+            sent = await context.bot.send_photo(
+                chat_id=user_id, photo=image["file_id"],
+                caption=caption, parse_mode=ParseMode.MARKDOWN_V2,
+                has_spoiler=bool(image.get("spoiler")),
+            )
+        else:
+            sent = await context.bot.send_message(
+                chat_id=user_id, text=caption, parse_mode=ParseMode.MARKDOWN_V2,
+            )
+    except Exception as e:
+        print(f"Couldn't send written question '{title}' (markdown parse failed, retrying plain): {e}")
+        # Never let a formatting error silently eat the question — resend
+        # as plain text (no spoiler, no bold) rather than dropping it.
+        plain = title + (f"\n{content}" if content else "")
+        try:
+            if image and image.get("file_id"):
+                sent = await context.bot.send_photo(chat_id=user_id, photo=image["file_id"], caption=plain)
+            else:
+                sent = await context.bot.send_message(chat_id=user_id, text=plain)
+        except Exception as e2:
+            print(f"Fallback plain-text send also failed for written question '{title}': {e2}")
+    if sent is not None:
+        written_key = f"written:{w.get('id', 0)}"
+        written_meta = {
+            "question": title,
+            "options": [],
+            "lecture": w.get("lecture"),
+            "module": w.get("module"),
+            "subject": w.get("subject"),
+            "year": w.get("year"),
+            "source_mid": w.get("id"),
+            "written_answer": content,
+        }
+        _remember_bookmarkable_question(
+            user_id, sent.message_id, question_key=written_key, metadata=written_meta,
+        )
+
+async def _deliver_next_lecture_question(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict) -> bool:
+    """Pops message ids off session['queue'] and sends them to the user one
+    at a time as the bot's own non-anonymous quiz polls (built from content
+    captured off the channel poll when it closed — see poll_update_handler),
+    skipping (and cleaning up) any that were deleted from the channel since
+    indexing, until one is delivered or the queue runs dry.
+
+    Why not just copy_message the original? Because channel polls (and
+    therefore any straight copy of one) are always anonymous, and Telegram
+    never sends poll_answer for anonymous polls — there'd be no way to tell
+    the question had been answered. Sending our own copy with
+    is_anonymous=False sidesteps that entirely.
+
+    For lecture questions closed before this content-capture existed, the
+    QUIZ_POLL_STATUS entry won't have "question"/"options" yet — those get
+    backfilled here via a one-time throwaway forward (read its poll
+    content, delete it, never shown to the user) the first time they're
+    delivered.
+
+    Sets session['current_poll_id']. Returns whether a question went out."""
+    year  = session["year"]
+    entry = QUIZ_INDEX[year].get(session["lecture_key"])
+    # Same index used by _advance_lecture_session for the mistakes-bank
+    # lookup — scoped to this lecture's polls, built once at session start.
+    # Falls back to a fresh year-wide scan only for sessions predating this
+    # field (shouldn't happen once a bot restart has run, but keeps old
+    # in-memory sessions from crashing rather than erroring).
+    poll_status_by_mid = session.get("poll_status_by_mid")
+    if poll_status_by_mid is None:
+        poll_status_by_mid = {
+            v["message_id"]: v
+            for v in QUIZ_POLL_STATUS[year].values()
+            if v["lecture"] == session["lecture_key"]
+        }
+        session["poll_status_by_mid"] = poll_status_by_mid
+
+    # mid -> {"file_id", "file_unique_id", "spoiler"} for any poll that had
+    # an image posted right before it in the channel (see
+    # QUIZ_PENDING_POLL_IMAGE / handle_quiz_channel_message). Rebuilt from
+    # entry each call (cheap, and always reflects live edits/deletions)
+    # rather than cached on the session like poll_status_by_mid is.
+    poll_images_by_mid = {
+        pi["mid"]: pi for pi in ((entry.get("poll_images") or []) if entry else [])
+    }
+
+    # mid -> case-study text for any poll a /add_lecture DM session bound
+    # one to (see ADD_LECTURE_STATE's "pending_case_study" field and
+    # _capture_add_lecture_poll, which does the binding). Sent as its own
+    # message right before the poll below.
+    poll_case_studies_by_mid = {
+        cs["mid"]: cs["content"] for cs in ((entry.get("poll_case_studies") or []) if entry else [])
+    }
+
+    async def _drop_dead(mid: int):
+        if entry and mid in entry.get("ids", []):
+            entry["ids"].remove(mid)
+            if not entry["ids"]:
+                QUIZ_INDEX[year].pop(session["lecture_key"], None)  # whole lecture was deleted
+        dead_status = poll_status_by_mid.pop(mid, None)
+        if dead_status is not None:
+            for pid, v in list(QUIZ_POLL_STATUS[year].items()):
+                if v is dead_status:
+                    QUIZ_POLL_STATUS[year].pop(pid, None)
+                    break
+        else:
+            # Not in our index (legacy session, or already gone) — fall back
+            # to the direct scan rather than silently leaving a stale entry.
+            for pid in [pid for pid, v in QUIZ_POLL_STATUS[year].items() if v["message_id"] == mid]:
+                QUIZ_POLL_STATUS[year].pop(pid, None)
+        await save_quiz_index(year)
+        await save_quiz_poll_status(year)
+
+    while session["queue"]:
+        item = session["queue"].pop(0)
+
+        # A written (unscored) entry — no poll, nothing to answer, so just
+        # send it and move straight on to the next real item in the same
+        # pass instead of returning (there's no answer to wait for).
+        if isinstance(item, dict) and item.get("type") == "written":
+            await _deliver_written_item(context, user_id, item["data"])
+            continue
+
+        mid = item
+        status = poll_status_by_mid.get(mid)
+
+        question    = status.get("question")    if status else None
+        options     = status.get("options")      if status else None
+        correct_id  = status.get("correct_option_id") if status else None
+        explanation = status.get("explanation")  if status else None
+        description = status.get("description")  if status else None
+
+        if not (question and options and correct_id is not None):
+            # Legacy entry (closed before content-capture existed) — grab
+            # the content via a throwaway forward, then delete it; the
+            # forward itself is never what gets answered. Must be
+            # forward_message here, not copy_message: copyMessage's API
+            # response is just a bare message_id with no poll content at
+            # all, so there'd be nothing here to read.
+            try:
+                probe = await context.bot.forward_message(chat_id=user_id, from_chat_id=year_channel_id(year), message_id=mid)
+            except Exception as e:
+                print(f"Quiz question {mid} in lecture '{session['lecture_key']}' ({year}) unreachable (likely deleted): {e}")
+                await _drop_dead(mid)
+                continue
+            if probe.poll and probe.poll.correct_option_ids:
+                question    = probe.poll.question
+                options     = [o.text for o in probe.poll.options]
+                correct_id  = probe.poll.correct_option_ids[0]
+                explanation = probe.poll.explanation
+                description = _poll_description(probe.poll)
+                if status is not None:
+                    status.update(question=question, options=options,
+                                   correct_option_id=correct_id, explanation=explanation,
+                                   description=description)
+                    await save_quiz_poll_status(year)
+                else:
+                    # No QUIZ_POLL_STATUS entry existed for this mid AT ALL
+                    # (fully legacy — predates poll-status tracking, not
+                    # just missing a field on an existing entry). Without
+                    # this branch the recovered content only lived in the
+                    # local variables above long enough to build and send
+                    # THIS poll, then vanished — poll_status_by_mid.get(mid)
+                    # would find nothing on the way back, so
+                    # _advance_lecture_session's mistakes-bank gate would
+                    # silently see status=None and never call
+                    # record_mistake for this question, even though it was
+                    # correctly delivered and correctly marked wrong. Keyed
+                    # by probe.poll.id to match how a normal entry is keyed
+                    # (see the QUIZ_POLL_STATUS[year][msg.poll.id] = {...}
+                    # assignment where entries are first created), so this
+                    # is indistinguishable from a normal entry afterwards.
+                    new_status = {
+                        "lecture": session["lecture_key"], "message_id": mid,
+                        "closed": True, "correct_option_id": correct_id,
+                        "question": question, "options": options,
+                        "explanation": explanation, "description": description,
+                    }
+                    QUIZ_POLL_STATUS[year][probe.poll.id] = new_status
+                    poll_status_by_mid[mid] = new_status
+                    await save_quiz_poll_status(year)
+            try:
+                await context.bot.delete_message(chat_id=user_id, message_id=probe.message_id)
+            except Exception:
+                pass
+            if not (question and options and correct_id is not None):
+                continue  # still couldn't recover real quiz content — skip it
+
+        timer_seconds = get_question_timer_seconds(user_id)
+        session["delivered_count"] = session.get("delivered_count", 0) + 1
+
+        case_study = poll_case_studies_by_mid.get(mid)
+        if case_study:
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id, text=html.escape(case_study), parse_mode=ParseMode.HTML,
+                )
+            except Exception as e:
+                print(f"Couldn't send case study for lecture question {mid}: {e}")
+
+        poll_kwargs = dict(
+            chat_id=user_id, question=_numbered_question(question, session["delivered_count"]), options=options,
+            type="quiz", correct_option_id=correct_id, is_anonymous=False,
+            explanation=(explanation or None),
+            open_period=(timer_seconds or None),
+        )
+        _with_poll_description(poll_kwargs, description)
+        pending_img = poll_images_by_mid.get(mid)
+        try:
+            if pending_img:
+                # Reuse the file_id captured straight off the channel photo —
+                # no download needed, it's already a valid Telegram file.
+                try:
+                    msg = await context.bot.send_poll(**poll_kwargs, media=InputMediaPhoto(pending_img["file_id"]))
+                except Exception as e:
+                    # Same defensive fallback as _send_quiz_poll: if native
+                    # poll media is ever rejected, still deliver the
+                    # question rather than silently dropping it — just as
+                    # a separate photo message right before the poll.
+                    print(f"POLL MEDIA ERROR for lecture question {mid} (falling back to separate image message):", e)
+                    await context.bot.send_photo(chat_id=user_id, photo=pending_img["file_id"])
+                    msg = await context.bot.send_poll(**poll_kwargs)
+            else:
+                msg = await context.bot.send_poll(**poll_kwargs)
+        except Exception as e:
+            print(f"Couldn't send lecture question {mid}: {e}")
+            session["delivered_count"] -= 1   # this send never went out — don't burn a number on it
+            continue
+
+        lecture_qkey = f"lecture:{year}:{mid}"
+        lecture_meta = {
+            "question": question,
+            "options": list(options or []),
+            "year": year,
+            "module": session.get("module"),
+            "subject": session.get("subject"),
+            "lecture": QUIZ_INDEX.get(year, {}).get(session.get("lecture_key"), {}).get("name", session.get("lecture_key")),
+            "source_mid": mid,
+        }
+        _remember_bookmarkable_question(
+            user_id, msg.message_id, question_key=lecture_qkey, metadata=lecture_meta,
+        )
+        session["current_poll_id"]    = msg.poll.id
+        session["current_correct_id"] = correct_id
+        session["current_option_count"] = len(options)
+        session["current_message_id"] = msg.message_id
+        session["current_mid"]        = mid
+        session["current_delivered_at"] = time.time()  # see _record_time_spent / year leaderboard
+        _schedule_question_timeout(context, session.get("kind", "lecture"), user_id, msg.poll.id, timer_seconds)
+        await _maybe_send_zikr_poll(context, user_id)
+        return True
+
+    session["current_poll_id"]    = None
+    session["current_correct_id"] = None
+    session["current_option_count"] = None
+    session["current_message_id"] = None
+    session["current_mid"]        = None
+    session["current_delivered_at"] = None
+    return False
+
+async def _deliver_all_lecture_questions(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict) -> int:
+    """Auto-Next OFF path: sends every remaining question in session['queue']
+    up front instead of one at a time. Reuses _deliver_next_lecture_question
+    for the actual send/skip-dead-poll/legacy-recovery logic, just calling it
+    repeatedly and recording each poll_id -> (correct_option_id, message_id,
+    mid) in session['pending_polls'] so handle_poll_answer can match any of
+    them, not just a single 'current' one. Returns how many were actually sent."""
+    session.setdefault("pending_polls", {})
+    sent_count = 0
+    while session["queue"]:
+        sent = await _deliver_next_lecture_question(context, user_id, session)
+        if not sent:
+            break
+        session["pending_polls"][session["current_poll_id"]] = (
+            session["current_correct_id"], session["current_message_id"],
+            session["current_mid"], session["current_delivered_at"],
+        )
+        sent_count += 1
+    # These are meaningless in batch mode (there's no single "current"
+    # question) — clear them so nothing downstream mistakes this for auto mode.
+    session["current_poll_id"]    = None
+    session["current_correct_id"] = None
+    session["current_message_id"] = None
+    session["current_mid"]        = None
+    return sent_count
+
+def _validated_option_id(answer, option_count: int | None = None) -> int | None:
+    """Return the single valid option index from a Telegram PollAnswer.
+
+    Telegram sends an empty option_ids list when a user retracts an answer.
+    Treat that, negative indices, non-integer values, multiple selections, and
+    indices outside the actual poll's option range as non-answers so they cannot
+    advance a session or increment analytics.
+    """
+    option_ids = getattr(answer, "option_ids", None)
+    if not isinstance(option_ids, (list, tuple)) or len(option_ids) != 1:
+        return None
+    chosen = option_ids[0]
+    if isinstance(chosen, bool) or not isinstance(chosen, int) or chosen < 0:
+        return None
+    if option_count is not None and chosen >= option_count:
+        return None
+    return chosen
+
+
+@_serialize_per_user
+async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fires when a user answers a poll the bot sent (our lecture-delivery
+    polls are always is_anonymous=False specifically so this reliably
+    fires). In auto-next mode there's a single question in flight at a
+    time, matched via current_poll_id. In batch mode (Auto-Next OFF) every
+    question was already sent, so any poll_id in pending_polls can come in,
+    in any order, as the user works through them."""
+    answer  = update.poll_answer
+    poll_id = answer.poll_id
+    user_id = answer.user.id
+    _update_telegram_name(user_id, answer.user)
+    _stamp_last_answer(user_id)
+
+    daily_session = DAILY_QUIZ_SESSIONS.get(user_id)
+    if daily_session and daily_session.get("current_poll_id") == poll_id:
+        chosen = _validated_option_id(answer, daily_session.get("current_option_count"))
+        if chosen is None:
+            return
+        daily_session["timeout_streak"] = 0
+        is_correct = chosen == daily_session.get("current_correct_id")
+        await _advance_daily_quiz_session(
+            context, user_id, daily_session, is_correct, daily_session.get("current_message_id"),
+            daily_session.get("current_delivered_at"),
+        )
+        return
+
+    retake_session = MISTAKES_RETAKE_SESSIONS.get(user_id)
+    if retake_session and retake_session.get("current_poll_id") == poll_id:
+        chosen = _validated_option_id(answer, retake_session.get("current_option_count"))
+        if chosen is None:
+            return
+        retake_session["timeout_streak"] = 0
+        is_correct = chosen == retake_session.get("current_correct_id")
+        await _advance_mistakes_retake_session(
+            context, user_id, retake_session, is_correct, retake_session.get("current_message_id"),
+            retake_session.get("current_delivered_at"),
+        )
+        return
+
+    bm_retake_session = BOOKMARKS_RETAKE_SESSIONS.get(user_id)
+    if bm_retake_session and bm_retake_session.get("current_poll_id") == poll_id:
+        chosen = _validated_option_id(answer, bm_retake_session.get("current_option_count"))
+        if chosen is None:
+            return
+        bm_retake_session["timeout_streak"] = 0
+        is_correct = chosen == bm_retake_session.get("current_correct_id")
+        await _advance_bookmarks_retake_session(
+            context, user_id, bm_retake_session, is_correct, bm_retake_session.get("current_message_id"),
+            bm_retake_session.get("current_delivered_at"),
+        )
+        return
+
+    session = LECTURE_SESSIONS.get(user_id)
+    if not session:
+        # No session at all for this user — most likely the bot restarted
+        # (all of LECTURE_SESSIONS/DAILY_QUIZ_SESSIONS/MISTAKES_RETAKE_SESSIONS/
+        # BOOKMARKS_RETAKE_SESSIONS are in-memory only, wiped on restart) while
+        # they were mid-quiz.
+        # We can't tell from here which kind of session this poll_id used
+        # to belong to, so this is deliberately generic rather than
+        # guessing "lecture" when it might have been a Daily Quiz or
+        # retake. Best-effort: if the send fails, still just return quietly.
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    "⚠️ يبدو إن الجلسة دي اتقفلت (البوت أعاد التشغيل لسه) — "
+                    "مينفعش نكمل من نفس السؤال. ابدأ تاني: /quiz للمحاضرات، "
+                    "أو من زرار 💥Daily Quiz💥."
+                ),
+            )
+        except Exception:
+            pass
+        return
+
+    if session.get("mode") == "batch":
+        pending = session.get("pending_polls", {})
+        pending_item = pending.get(poll_id)
+        if pending_item is None:
+            return   # not one of this lecture's questions (or already answered)
+        correct_id, message_id, mid, delivered_at = pending_item
+        status = session.get("poll_status_by_mid", {}).get(mid)
+        option_count = len(status.get("options") or []) if status else None
+        chosen = _validated_option_id(answer, option_count)
+        if chosen is None:
+            return
+        pending.pop(poll_id, None)
+        is_correct = chosen == correct_id
+        await _advance_lecture_session(context, user_id, session, is_correct, message_id, mid, delivered_at)
+        return
+
+    # ── Spaced Repetition re-ask answer ──────────────────────────
+    # Checked before the normal current_poll_id match below, since a
+    # re-ask's poll_id was never written into current_poll_id/
+    # current_correct_id — see _maybe_deliver_spaced_repetition. No-stakes:
+    # doesn't touch session["answered"]/["correct"], XP, or the mistakes
+    # bank — just the 🤩/😢 reaction — then falls through to delivering
+    # the actual next lecture question, same as a normal answer would.
+    if session.get("sr_pending_poll_id") == poll_id:
+        chosen = _validated_option_id(answer)
+        if chosen is None:
+            return
+        is_correct = chosen == session.get("sr_pending_correct_id")
+        sr_message_id = session.get("sr_pending_message_id")
+        session.pop("sr_pending", None)
+        session.pop("sr_pending_poll_id", None)
+        session.pop("sr_pending_correct_id", None)
+        session.pop("sr_pending_message_id", None)
+        if sr_message_id is not None:
+            try:
+                await context.bot.set_message_reaction(
+                    chat_id=user_id, message_id=sr_message_id,
+                    reaction=[ReactionTypeEmoji("🤩" if is_correct else "😢")], is_big=False,
+                )
+            except Exception:
+                pass
+        sent_sr = await _maybe_deliver_spaced_repetition(context, user_id, session)
+        if not sent_sr:
+            sent_next = await _deliver_next_lecture_question(context, user_id, session)
+            if not sent_next:
+                # Queue was already empty (or every remaining id was dead)
+                # by the time this re-ask came back — the lecture actually
+                # finished on the answer that triggered the re-ask, but
+                # the summary was deferred until the re-ask itself
+                # resolved so the two questions don't overlap in the chat.
+                await _finish_lecture_session(context, user_id, session)
+        return
+
+    if session.get("current_poll_id") != poll_id:
+        return   # not the question we're tracking for this user right now
+
+    chosen = _validated_option_id(answer, session.get("current_option_count"))
+    if chosen is None:
+        return
+    session["timeout_streak"] = 0
+    is_correct = chosen == session.get("current_correct_id")
+    await _advance_lecture_session(
+        context, user_id, session, is_correct,
+        session.get("current_message_id"), session.get("current_mid"),
+        session.get("current_delivered_at"),
+    )
+
+
+async def _maybe_deliver_spaced_repetition(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict) -> bool:
+    """Spaced Repetition (Settings toggle, on by default): every 5-8
+    questions (re-rolled each time so the interval isn't predictable), if
+    the user has a wrong answer from earlier in this lecture that hasn't
+    been re-asked yet, re-send it as an extra question before the next
+    fresh one. Auto-next mode only — batch mode sends every question
+    up front, so there's no "next question" moment to insert into.
+
+    The re-ask is no-stakes: it doesn't touch session['answered']/
+    ['correct'], XP, the mistakes bank, or the normal correctness
+    reactions — it's purely a memory check with its own reaction set
+    (👀 on send, 🤩 if they get it right this time, 😢 if not). Getting
+    it wrong again does NOT re-queue it; it stays in the mistakes bank
+    from its original miss (see _advance_lecture_session) and the user
+    can drill it properly later via the Mistakes Bank / retake flow —
+    this feature is a lightweight in-lecture nudge, not a full leitner
+    system.
+
+    Sets session['sr_pending'] = mid when a re-ask goes out, which
+    handle_poll_answer checks before treating an answer as a normal
+    lecture question. Returns whether a re-ask was actually sent."""
+    if session.get("mode") == "batch":
+        return False
+    if session.get("is_retake"):
+        return False   # the whole session IS already a re-ask of prior wrong answers — nothing to layer on top
+    if not get_spaced_repetition_enabled(user_id):
+        return False
+
+    pool = session.setdefault("sr_pool", [])          # wrong mids not yet re-asked, this lecture
+    asked = session.setdefault("sr_asked", set())      # wrong mids already re-asked once, this lecture
+    for wrong_mid in session.get("wrong_mids", []):
+        if wrong_mid not in pool and wrong_mid not in asked:
+            pool.append(wrong_mid)
+    if not pool:
+        return False
+
+    session["sr_counter"] = session.get("sr_counter", 0) + 1
+    threshold = session.get("sr_next_threshold")
+    if threshold is None:
+        threshold = random.randint(5, 8)
+        session["sr_next_threshold"] = threshold
+    if session["sr_counter"] < threshold:
+        return False
+
+    # Time to re-ask. Reset the counter/threshold for the next interval
+    # regardless of whether the send below actually succeeds — a poll
+    # send failure here shouldn't jam the trigger into firing again next
+    # question too.
+    session["sr_counter"] = 0
+    session["sr_next_threshold"] = random.randint(5, 8)
+
+    wrong_mid = pool.pop(0)
+    asked.add(wrong_mid)
+    status = session.get("poll_status_by_mid", {}).get(wrong_mid)
+    if not (status and status.get("question") and status.get("options") and status.get("correct_option_id") is not None):
+        return False   # content not resolvable (shouldn't normally happen — it was just answered) — skip quietly
+
+    try:
+        msg = await context.bot.send_poll(**_with_poll_description(dict(
+            chat_id=user_id, question=_prefixed_question(status["question"], "🔁 Review: "), options=status["options"],
+            type="quiz", correct_option_id=status["correct_option_id"], is_anonymous=False,
+            explanation=(status.get("explanation") or None),
+        ), status.get("description")))
+    except Exception as e:
+        print(f"Couldn't send spaced-repetition re-ask for mid {wrong_mid}: {e}")
+        return False
+
+    sr_qkey = f"lecture:{session.get('year')}:{wrong_mid}"
+    sr_meta = {
+        "question": status.get("question", ""),
+        "options": list(status.get("options", []) or []),
+        "year": session.get("year"),
+        "module": session.get("module"),
+        "subject": session.get("subject"),
+        "lecture": QUIZ_INDEX.get(session.get("year"), {}).get(session.get("lecture_key"), {}).get("name", session.get("lecture_key")),
+        "source_mid": wrong_mid,
+    }
+    _remember_bookmarkable_question(
+        user_id, msg.message_id, question_key=sr_qkey, metadata=sr_meta,
+    )
+    try:
+        await context.bot.set_message_reaction(
+            chat_id=user_id, message_id=msg.message_id,
+            reaction=[ReactionTypeEmoji("👀")], is_big=False,
+        )
+    except Exception:
+        pass
+
+    session["sr_pending"]            = wrong_mid
+    session["sr_pending_poll_id"]    = msg.poll.id
+    session["sr_pending_correct_id"] = status["correct_option_id"]
+    session["sr_pending_message_id"] = msg.message_id
+    return True
+
+async def _finish_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict) -> None:
+    """The lecture-complete summary message + retake-staging + leaderboard
+    write. Split out of _advance_lecture_session so the spaced-repetition
+    re-ask path (see handle_poll_answer) can reach the same completion
+    logic when a re-ask empties the queue, without re-running the
+    XP/streak/achievement bookkeeping that only applies to a real answer.
+
+    Also where lectures_completed gets incremented and the quick_thinker /
+    perfect_run Extras get checked — all three only for a real attempt
+    (not a retake), matching the leaderboard/results-file exclusion just
+    above."""
+    total     = session["total"]
+    correct   = session["correct"]
+    incorrect = session["answered"] - correct
+    pct       = round(correct / session["answered"] * 100) if session["answered"] else 0
+    year = session["year"]
+    lecture_name = QUIZ_INDEX[year].get(session["lecture_key"], {}).get("name", session["lecture_key"])
+    is_retake = session.get("is_retake", False)
+    extra_events = []
+    if not is_retake:
+        # Retakes are practice, not a new attempt at the lecture proper —
+        # they never touch the leaderboard or best-score file, and don't
+        # count toward lectures_completed or its Extras either.
+        await _record_lecture_result(user_id, _lr_key(year, session["lecture_key"]), correct, session["answered"])
+        await backup_lecture_results_to_channel(context)
+        user_entry = _get_entry(user_id)
+        user_entry["lectures_completed"] = user_entry.get("lectures_completed", 0) + 1
+        extra_events += _check_achievements(user_entry, "lectures_completed")
+        started_at = session.get("started_at")
+        if started_at is not None and (time.time() - started_at) <= 15 * 60:
+            ach = _check_extra_achievement(user_entry, "quick_thinker")
+            if ach:
+                extra_events.append(ach)
+        if session["answered"] > 0 and pct == 100:
+            ach = _check_extra_achievement(user_entry, "perfect_run")
+            if ach:
+                extra_events.append(ach)
+        now_hour = datetime.now(DAILY_QUIZ_TZ).hour
+        if 2 <= now_hour < 5:
+            ach = _check_extra_achievement(user_entry, "insomniac")
+            if ach:
+                extra_events.append(ach)
+        extra_events += _check_achievements(user_entry, "achievement_collector")
+        final_level = _xp_to_level(user_entry["xp"])
+        level_up = final_level if final_level > user_entry["level"] else 0
+        if level_up:
+            user_entry["level"] = final_level
+        _mark_analytics_dirty()
+        await _announce_events(context, user_id, {"achievements": extra_events, "level_up": level_up})
+        await backup_analytics_to_channel(context)
+    title = "خلصت مراجعة الأسئلة الغلط!" if is_retake else f"خلصت محاضرة {session['module']} - {session['subject']}: {lecture_name}!"
+    summary = (
+        f"🎓 <b>{title}</b>\n\n"
+        f"✅ صح: {correct}\n"
+        f"❌ غلط: {incorrect}\n"
+        f"📊 نسبة: {pct}%\n"
+        f"📝 عدد الأسئلة: {session['answered']}/{total}\n"
+        f"✨ XP: <b>+{session['xp_earned']}</b>"
+    )
+    if not is_retake:
+        summary = f"{quizzy_block(QUIZZY_VICTORY_ART, 'Nice one! 🎉')}\n\n{summary}"
+    result_buttons = [[
+        InlineKeyboardButton("🏠 Back to Home", callback_data="back_home"),
+        InlineKeyboardButton("📚 More Quizzes", callback_data="quiz_years"),
+    ]]
+    wrong_mids = session.get("wrong_mids", [])
+    if wrong_mids:
+        RETAKE_STAGING[user_id] = {
+            "year": year, "module": session["module"], "subject": session["subject"],
+            "lecture_key": session["lecture_key"], "mids": wrong_mids,
+        }
+        result_buttons.insert(0, [
+            InlineKeyboardButton(f"🔁 Retake incorrect questions! ({len(wrong_mids)})", callback_data="retake_wrong"),
+        ])
+    result_keyboard = InlineKeyboardMarkup(result_buttons)
+    try:
+        await context.bot.send_message(
+            chat_id=user_id, text=summary, parse_mode=ParseMode.HTML, reply_markup=result_keyboard,
+        )
+    except Exception:
+        pass
+    LECTURE_SESSIONS.pop(user_id, None)
+
+async def _advance_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict, is_correct: bool, message_id: int | None = None, mid: int | None = None, delivered_at: float | None = None):
+    """Called once handle_poll_answer confirms the user answered their
+    current lecture question, and whether it was right. Awards XP —
+    15 correct, 5 incorrect — silently (no per-question message) and
+    immediately forwards the next question. Once the lecture runs out,
+    tacks on a completion bonus and sends a single results summary with the
+    right/wrong count and the XP total accumulated across the lecture."""
+    session["answered"] += 1
+    session["correct"] = session.get("correct", 0) + (1 if is_correct else 0)
+    if delivered_at is not None:
+        _record_time_spent(user_id, time.time() - delivered_at)
+    if not is_correct and mid is not None:
+        session.setdefault("wrong_mids", []).append(mid)
+        # Also pool this question into the user's own mistakes bank, for
+        # the Daily Quiz's "questions you got wrong before" slice. Only
+        # store the question id (mid) here, not the full text — full
+        # content is resolved on demand later via _resolve_mistake, which
+        # reads QUIZ_POLL_STATUS[year] (see MISTAKES BANK schema note).
+        # Still check QUIZ_POLL_STATUS captured this poll's content before
+        # recording, same as before, so we never bank a reference that's
+        # already known to be unresolvable. Looked up via the session's own
+        # poll_status_by_mid index (built once at lecture-start, scoped to
+        # this lecture) instead of scanning every poll ever tracked for the
+        # year on every wrong answer.
+        year   = session["year"]
+        status = session.get("poll_status_by_mid", {}).get(mid)
+        if status and status.get("question") and status.get("options") and status.get("correct_option_id") is not None:
+            try:
+                if await record_mistake(user_id, mid, year, session["module"], session["subject"]):
+                    await backup_mistakes_bank_to_channel(context)
+            except Exception as e:
+                # Recording a mistake should never be able to break the
+                # user's flow to their next question — but it also should
+                # never fail silently (that's the exact bug being fixed
+                # here), so this prints a clear, specific line rather than
+                # relying on whatever the caller further up happens to do
+                # with an uncaught exception.
+                print(f"MISTAKES BANK: record_mistake failed for user {user_id}, mid {mid}, year {year}: {e}")
+        else:
+            # This is the other half of the bug this fixes: previously,
+            # ANY question that reached here without fully-populated
+            # status (question/options/correct_option_id) silently never
+            # got recorded — no exception, nothing printed, nothing to
+            # notice. Most of those cases are now prevented upstream (see
+            # the legacy-recovery branch in _deliver_next_lecture_question
+            # that persists recovered content instead of discarding it),
+            # but if this still triggers for some other reason, at least
+            # it's now visible instead of invisible.
+            print(f"MISTAKES BANK: skipped recording mistake for user {user_id}, mid {mid}, year {year} — status incomplete: {status!r}")
+
+    if session.get("mode") == "batch":
+        # Everything was already sent up front — "last" means every
+        # dispatched question has now been answered, not that the queue is
+        # dry (the queue was already drained back at dispatch time).
+        is_last = session["answered"] >= session["total"]
+    else:
+        sent_sr = await _maybe_deliver_spaced_repetition(context, user_id, session)
+        if sent_sr:
+            is_last = False   # a re-ask went out — lecture isn't over, and no fresh question was pulled this round
+        else:
+            sent_next = await _deliver_next_lecture_question(context, user_id, session)
+            is_last   = not sent_next   # queue ran dry (or every remaining id was dead) — lecture's done
+
+    per_question_xp = XP_LECTURE_CORRECT if is_correct else XP_LECTURE_INCORRECT
+    xp_delta         = per_question_xp + (XP_LECTURE_COMPLETE_BONUS if is_last else 0)
+    if not session.get("award_xp", True):
+        xp_delta = 0   # repeat attempt at a lecture already completed once — no XP farming
+    session["xp_earned"] = session.get("xp_earned", 0) + xp_delta
+
+    events     = await _record_activity(user_id, persist=False)
+    user_entry = _get_entry(user_id)
+    prev_streak = user_entry.get("lecture_correct_streak_current", 0)
+    user_entry["lecture_questions_answered"]  += 1
+    user_entry["lecture_questions_correct"]   += 1 if is_correct else 0
+    user_entry["lecture_questions_incorrect"] += 0 if is_correct else 1
+    _record_weekly_answer(user_entry, is_correct)
+    _record_subject_answer(user_entry, session.get("module"), session.get("subject"), is_correct)
+    if is_correct:
+        user_entry["lecture_correct_streak_current"] += 1
+        if user_entry["lecture_correct_streak_current"] > user_entry["lecture_correct_streak_best"]:
+            user_entry["lecture_correct_streak_best"] = user_entry["lecture_correct_streak_current"]
+    else:
+        user_entry["lecture_correct_streak_current"] = 0
+
+    await _react_to_lecture_answer(
+        context, user_id, message_id,
+        is_correct=is_correct,
+        new_streak=user_entry["lecture_correct_streak_current"],
+        streak_broken=(not is_correct and prev_streak > 0),
+    )
+
+    events["achievements"] += _check_achievements(user_entry, "questions_answered")
+    events["achievements"] += _check_achievements(user_entry, "correct_streak")
+    events["achievements"] += _check_achievements(user_entry, "achievement_collector")
+
+    _award_xp(user_entry, xp_delta)
+    # recompute from scratch rather than trust _award_xp's own return value —
+    # the achievement checks above may have just granted bonus XP of their
+    # own, so the true level-up (if any) has to account for all of it together
+    final_level = _xp_to_level(user_entry["xp"])
+    if final_level > user_entry["level"]:
+        user_entry["level"] = final_level
+        events["level_up"] = final_level
+    _mark_analytics_dirty()
+    await _announce_events(context, user_id, events)   # still immediate: level-ups/achievements are rare enough to be worth a heads-up mid-lecture
+
+    await backup_analytics_to_channel(context)
+
+    if is_last:
+        await _finish_lecture_session(context, user_id, session)
+
+
+# ═══════════════════════════════════════════════════════════════
+# FORWARDED POLL HANDLER
+# ═══════════════════════════════════════════════════════════════
+def _add_lecture_item_count(entry: dict) -> int:
+    return len(entry.get("ids", [])) + len(entry.get("written", []))
+
+# ── Debounced running-count message ─────────────────────────────────
+# handle_poll isn't serialized per user and concurrent_updates() is on, so when
+# an admin forwards a batch of polls at once every capture used to post its own
+# "✅ N سؤال اتسجل" message (each one read status_message_id before any of them
+# had stored the new id, so none deleted the others). Now each capture just
+# bumps a per-user generation counter and waits a moment; only the capture that
+# is still the newest after the delay posts the single message, with the count
+# read at that moment.
+ADD_LECTURE_STATUS_DELAY = 1.5   # seconds of quiet after the last capture before the count is posted
+_add_lecture_status_gen: dict[int, int] = {}
+_add_lecture_status_locks: dict[int, asyncio.Lock] = {}
+
+async def _refresh_add_lecture_status(context: ContextTypes.DEFAULT_TYPE, user_id: int, al_state: dict) -> None:
+    gen = _add_lecture_status_gen.get(user_id, 0) + 1
+    _add_lecture_status_gen[user_id] = gen
+    await asyncio.sleep(ADD_LECTURE_STATUS_DELAY)
+    if _add_lecture_status_gen.get(user_id) != gen:
+        return   # a newer capture arrived meanwhile; it will post the message instead
+    lock = _add_lecture_status_locks.setdefault(user_id, asyncio.Lock())
+    async with lock:
+        if _add_lecture_status_gen.get(user_id) != gen:
+            return
+        if ADD_LECTURE_STATE.get(user_id) is not al_state:
+            return   # session was ended/cancelled during the wait — don't post a stale status
+        year, current = al_state["year"], al_state["lecture_key"]
+        entry = QUIZ_INDEX.get(year, {}).get(current)
+        if not entry:
+            return
+        old_status_id = al_state.get("status_message_id")
+        if old_status_id:
+            try:
+                await context.bot.delete_message(chat_id=user_id, message_id=old_status_id)
+            except Exception:
+                pass
+        count = _add_lecture_item_count(entry)
+        sent = await context.bot.send_message(
+            chat_id=user_id,
+            text=f"📚 <b>{current}</b>\n✅ {count} سؤال/جزء اتسجل لحد دلوقتي.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_add_lecture_status_markup(),
+        )
+        al_state["status_message_id"] = sent.message_id
+
+async def _capture_add_lecture_written(context: ContextTypes.DEFAULT_TYPE, user_id: int, al_state: dict, title: str, content: str, message_id: int):
+    """Capture an auto-detected spoiler written question during /add_lecture."""
+    year = al_state["year"]
+    current = al_state["lecture_key"]
+    entry = QUIZ_INDEX[year].get(current)
+    if not entry or entry.get("closed"):
+        ADD_LECTURE_STATE.pop(user_id, None)
+        return
+    entry.setdefault("written", []).append({
+        "id": message_id, "title": title, "content": content, "image": None,
+    })
+    al_state.setdefault("session_written_ids", []).append(message_id)
+    await save_quiz_index(year)
+
+    await _refresh_add_lecture_status(context, user_id, al_state)
+
+async def _close_add_lecture(context: ContextTypes.DEFAULT_TYPE, real_uid: int, al_state: dict):
+    """Shared close logic for the End Lecture button and typed -END/-FIN.
+    Returns (summary_text, None) on success or (None, error_text)."""
+    year, current = al_state["year"], al_state["lecture_key"]
+    if current not in QUIZ_INDEX[year]:
+        ADD_LECTURE_STATE.pop(real_uid, None)
+        return None, "⚠️ المحاضرة دي اتشالت من حتة تانية."
+    count = _add_lecture_item_count(QUIZ_INDEX[year][current])
+    if count == 0:
+        return None, "⚠️ لسه مفيش أسئلة اتسجلت — ابعت Quiz poll أو سؤال مكتوب وإجابته مخفية بـ Spoiler قبل ما تقفل."
+    QUIZ_INDEX[year][current]["closed"] = True
+    await save_quiz_index(year)
+    QUIZ_STATE[year]["current_lecture"] = None
+    await save_quiz_state(year)
+    ADD_LECTURE_STATE.pop(real_uid, None)
+    # Single backup for the whole lecture, once it's actually closed —
+    # same "batched at close, not per-question" convention the
+    # channel-authoring -END uses.
+    await backup_quiz_to_channel(context, year)
+    return (
+        f"✅ اتقفلت محاضرة <b>{current}</b> — {count} سؤال، وكلهم جاهزين للإرسال على طول "
+        "(مفيش انتظار لإقفال بولات — الإجابات كانت معروفة من ساعة ما اتفورورد).",
+        None,
+    )
+
+async def _cancel_add_lecture(al_state: dict) -> int:
+    """Undoes exactly what this session added: removes only this
+    session's mids (session_ids), and either drops the lecture entry
+    entirely (if it didn't exist before this session) or restores it to
+    however it looked before (if this was a resumed lecture). Returns
+    how many questions were dropped."""
+    year, current = al_state["year"], al_state["lecture_key"]
+    session_ids = al_state.get("session_ids", [])
+    session_written_ids = set(al_state.get("session_written_ids", []))
+    removed_count = len(session_ids) + len(session_written_ids)
+    if current in QUIZ_INDEX[year]:
+        entry = QUIZ_INDEX[year][current]
+        session_id_set = set(session_ids)
+        for mid in session_ids:
+            if mid in entry["ids"]:
+                entry["ids"].remove(mid)
+            for pid in [p for p, v in QUIZ_POLL_STATUS[year].items() if v["message_id"] == mid]:
+                QUIZ_POLL_STATUS[year].pop(pid, None)
+        # Drop any image/case-study bound to one of this session's now-
+        # removed polls, so they don't linger as orphaned dead references.
+        if entry.get("poll_images"):
+            entry["poll_images"] = [pi for pi in entry["poll_images"] if pi["mid"] not in session_id_set]
+            if not entry["poll_images"]:
+                entry.pop("poll_images", None)
+        if entry.get("poll_case_studies"):
+            entry["poll_case_studies"] = [cs for cs in entry["poll_case_studies"] if cs["mid"] not in session_id_set]
+            if not entry["poll_case_studies"]:
+                entry.pop("poll_case_studies", None)
+        if session_written_ids:
+            entry["written"] = [
+                w for w in entry.get("written", [])
+                if w.get("id") not in session_written_ids
+            ]
+            if not entry["written"]:
+                entry.pop("written", None)
+        if al_state.get("existed_before"):
+            entry["closed"] = al_state.get("was_closed_before", False)
+        elif not entry.get("ids") and not entry.get("written"):
+            QUIZ_INDEX[year].pop(current, None)
+        await save_quiz_index(year)
+        await save_quiz_poll_status(year)
+    QUIZ_STATE[year]["current_lecture"] = None
+    await save_quiz_state(year)
+    return removed_count
+
+def _add_lecture_status_markup():
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🏁 End Lecture", callback_data="alend"),
+        InlineKeyboardButton("❌ Cancel Lecture", callback_data="alcancel"),
+    ]])
+
+async def _capture_add_lecture_poll(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, al_state: dict):
+    """Captures one forwarded (sender-hidden) quiz poll into QUIZ_INDEX/
+    QUIZ_POLL_STATUS during a /add_lecture DM session. correct_option_id
+    is trusted immediately and "closed" is set True on arrival — unlike
+    the channel flow, there's no waiting for a Stop Poll here, since
+    Telegram already revealed the answer the moment the poll landed in
+    this private chat (see ADD_LECTURE_STATE's comment for why).
+
+    Instead of one confirmation per question, a single running-count
+    message is deleted and resent after each capture, so it always stays
+    the newest message in the chat (right under whatever was just
+    forwarded) rather than getting buried above later forwards — with
+    End Lecture / Cancel Lecture buttons on it throughout.
+
+    Also claims any pending image / case study staged since the last
+    poll (see ADD_LECTURE_STATE's fields) and binds it to this question."""
+    msg     = update.message
+    poll    = msg.poll
+    year    = al_state["year"]
+    current = al_state["lecture_key"]
+
+    if current not in QUIZ_INDEX[year] or QUIZ_INDEX[year][current]["closed"]:
+        ADD_LECTURE_STATE.pop(user_id, None)
+        await msg.reply_text("⚠️ المحاضرة دي مقفولة أو اتشالت من حتة تانية — ابدأ من /add_lecture تاني.")
+        return
+
+    if poll.type != "quiz":
+        await msg.reply_text("⚠️ ده مش Quiz — لازم الـ poll يكون نوعه Quiz عشان يكون فيه إجابة صح.")
+        return
+
+    if not poll.correct_option_ids:
+        await msg.reply_text(
+            "⚠️ مش عارف الإجابة الصح للسؤال ده. تأكد إنك بتفورورد وشايل اسم المرسل "
+            "(Hide Sender's Name) — فورورد عادي مبيوريش الإجابة."
+        )
+        return
+
+    ids = QUIZ_INDEX[year][current]["ids"]
+    insert_after = al_state.get("insert_after")
+    if insert_after is not None and insert_after in ids:
+        # Opened from /edit_quiz's "➕ Insert new poll after" — splice in
+        # right after that question, then advance the marker so the next
+        # forwarded poll lands after THIS one, keeping send order.
+        ids.insert(ids.index(insert_after) + 1, msg.message_id)
+        al_state["insert_after"] = msg.message_id
+    else:
+        ids.append(msg.message_id)
+    al_state.setdefault("session_ids", []).append(msg.message_id)
+    await save_quiz_index(year)
+
+    QUIZ_POLL_STATUS[year][poll.id] = {
+        "lecture":           current,
+        "message_id":        msg.message_id,
+        "closed":            True,   # answer already known — deliverable right away
+        "correct_option_id": poll.correct_option_ids[0],
+        "question":          poll.question,
+        "options":           [o.text for o in poll.options],
+        "explanation":       poll.explanation,
+        # Part of the question can live in the poll's native description
+        # (the block above the question) — keep it so delivery re-sends it.
+        "description":       _poll_description(poll),
+    }
+    await save_quiz_poll_status(year)
+
+    # ── Claim any pending image / case study sent since the last poll ──
+    # (see ADD_LECTURE_STATE's "pending_image"/"pending_case_study"
+    # fields, set in handle_image and handle() respectively). A bound
+    # case study is read the same way, as "poll_case_studies", and sent
+    # as its own message right before the poll at delivery time.
+    pending_img  = al_state.pop("pending_image", None)
+    pending_case = al_state.pop("pending_case_study", None)
+
+    # A bound image is first reposted into the year's channel — same
+    # "durably hosted" guarantee the STORAGE_GROUP_ID vault gives the
+    # password-gated media, and the same thing the channel-authoring flow
+    # already gets for free (its images always live in the channel to
+    # begin with). We then store THIS channel copy's file_id, not the
+    # one from the admin's own DM upload, as "poll_images" — the shape
+    # _deliver_next_lecture_question already reads for the
+    # channel-authoring flow, so a bound image is attached as the poll's
+    # native media at delivery time with no extra delivery-side code
+    # needed, and it's backed by a real, permanent channel message the
+    # same way every other poll_images entry in this bot is. If the
+    # channel post fails, we fall back to the admin's own upload rather
+    # than losing the image outright — best-effort, since the question
+    # itself is already safely captured either way.
+    if pending_img:
+        channel_id = year_channel_id(year)
+        stored_img = pending_img
+        if channel_id:
+            try:
+                sent_photo = await context.bot.send_photo(
+                    chat_id=channel_id, photo=pending_img["file_id"],
+                    has_spoiler=pending_img.get("spoiler", False),
+                )
+                channel_photo = sent_photo.photo[-1]
+                stored_img = {
+                    "file_id":        channel_photo.file_id,
+                    "file_unique_id": channel_photo.file_unique_id,
+                    "spoiler":        pending_img.get("spoiler", False),
+                }
+                await context.bot.send_poll(**_with_poll_description(dict(
+                    chat_id=channel_id, question=poll.question,
+                    options=[o.text for o in poll.options], type="quiz",
+                    correct_option_id=poll.correct_option_ids[0],
+                    explanation=poll.explanation, is_anonymous=True,
+                ), _poll_description(poll)))
+            except Exception as e:
+                print(f"ADD_LECTURE channel backup post failed for lecture '{current}' ({year}): {e}")
+        QUIZ_INDEX[year][current].setdefault("poll_images", []).append({
+            "mid": msg.message_id, **stored_img,
+        })
+        await save_quiz_index(year)
+    if pending_case:
+        QUIZ_INDEX[year][current].setdefault("poll_case_studies", []).append({
+            "mid": msg.message_id, "content": pending_case["content"],
+        })
+        await save_quiz_index(year)
+
+    await _refresh_add_lecture_status(context, user_id, al_state)
+
+async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.poll:
+        return
+
+    user_id = update.effective_chat.id
+
+    # ── /add_lecture is waiting on quiz polls from this admin ────────
+    al_state = ADD_LECTURE_STATE.get(user_id)
+    if al_state:
+        await _capture_add_lecture_poll(update, context, user_id, al_state)
+        return
+
+    if user_id in SLEEPING:
+        return
+
+    poll = update.message.poll
+    # Strip any existing A) B) C) prefixes from options to avoid double-labeling
+    question      = poll.question
+    raw_options   = [strip_leading_letter_prefix(opt.text) for opt in poll.options]
+    # Telegram only reveals correct_option_ids if the quiz is closed, or was
+    # sent by our own bot / directly to it — an open quiz forwarded from
+    # someone else comes back empty. We must NOT guess in that case.
+    correct_index = poll.correct_option_ids[0] if poll.correct_option_ids else None
+    explanation   = poll.explanation or None
+
+    # An image sent (with no caption / unparseable caption) just before this
+    # forward is paired with it.
+    pending_img = PENDING_IMAGE.pop(user_id, None)
+
+    # ── Show the poll question + choices ─────────────────────────
+    lines = [f"❓ <b>{html.escape(question)}</b>"]
+    for opt in raw_options:
+        lines.append(html.escape(opt))
+    full_text = "\n".join(lines)
+
+    if pending_img:
+        with open(pending_img, "rb") as f:
+            cap = full_text if len(full_text) <= 1024 else None
+            sent = await context.bot.send_photo(
+                chat_id=user_id, photo=f, caption=cap,
+                parse_mode=ParseMode.HTML if cap else None,
+            )
+            if not cap:
+                await context.bot.send_message(
+                    chat_id=user_id, text=full_text,
+                    parse_mode=ParseMode.HTML,
+                )
+    else:
+        await context.bot.send_message(
+            chat_id=user_id, text=full_text,
+            parse_mode=ParseMode.HTML,
+        )
+
+# ═══════════════════════════════════════════════════════════════
+# IMAGE HANDLER
+# ═══════════════════════════════════════════════════════════════
+async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
+    user_id  = update.effective_chat.id
+    real_uid = update.effective_user.id if update.effective_user else user_id
+
+    # ── /report_issue waiting on this user's next message ──────────
+    # Same draft-staging path as the text branch in handle() — see
+    # AWAITING_REPORT_ISSUE's comment. Checked first (before SLEEPING and
+    # before the normal "image for a quiz question" flow below) so a
+    # screenshot sent right after /report_issue is never mistaken for a
+    # quiz-question image, and still works even while sleeping.
+    report_wait_started = AWAITING_REPORT_ISSUE.pop(real_uid, None)
+    if report_wait_started is not None and time.time() - report_wait_started <= REPORT_ISSUE_AWAIT_TIMEOUT:
+        if not REPORT_ISSUE_GROUP_ID:
+            await update.message.reply_text("⚠️ الميزة دي مش متاحة دلوقتي.")
+            return
+        report_photo = update.message.photo[-1] if update.message.photo else None
+        if not report_photo:
+            return
+        report_caption = (update.message.caption or "").strip()
+        await _stage_report_draft(update, context, real_uid, text=report_caption, photo_file_id=report_photo.file_id)
+        return
+
+    # ── /edit_quiz → 📎 Add case / image waiting on a photo (image half;
+    # the text half lives in handle()). Checked before the /add_lecture
+    # branch below — arming is refused while an add session is open, so the
+    # two can't both be waiting on this admin's next message.
+    pending_att = AWAITING_EQ_ATTACH.get(real_uid)
+    if pending_att and is_admin(update):
+        if not can_edit_year(update, pending_att["year"]):
+            AWAITING_EQ_ATTACH.pop(real_uid, None)
+            return
+        att_photo = update.message.photo[-1] if update.message.photo else None
+        if not att_photo:
+            return
+        if pending_att["kind"] != "image":
+            await update.message.reply_text("📝 مستني نص (Case study) مش صورة — ابعت النص، أو دوس Cancel.")
+            return
+        AWAITING_EQ_ATTACH.pop(real_uid, None)
+        err = await _apply_eq_attach(
+            context, pending_att, photo=att_photo,
+            spoiler=bool(getattr(update.message, "has_media_spoiler", False)),
+        )
+        await update.message.reply_text(
+            err or "✅ اتسجلت الصورة — هتظهر مع السؤال ده.",
+            reply_markup=None if err else _eq_att_done_markup(pending_att),
+        )
+        return
+
+    # ── /add_lecture DM authoring in progress for this admin: a plain
+    # (not forwarded) photo is a pending image for whichever poll gets
+    # forwarded next — see ADD_LECTURE_STATE's "pending_image" field and
+    # _capture_add_lecture_poll, which claims it. Checked before SLEEPING,
+    # same reasoning as the report-issue branch above: an admin's own
+    # authoring session shouldn't be affected by their SLEEPING flag.
+    al_state = ADD_LECTURE_STATE.get(real_uid)
+    if al_state and is_admin(update):
+        al_photo = update.message.photo[-1] if update.message.photo else None
+        if not al_photo:
+            return
+        replaced_note = (
+            "\n⚠️ ده استبدل الصورة اللي بعتهالك قبل كده — ده كانت لسه معلقة ومربوطتش بسؤال."
+            if al_state.get("pending_image") else ""
+        )
+        al_state["pending_image"] = {
+            "file_id":        al_photo.file_id,
+            "file_unique_id": al_photo.file_unique_id,
+            "spoiler":        bool(getattr(update.message, "has_media_spoiler", False)),
+        }
+        await update.message.reply_text(
+            f"🖼 اتسجلت الصورة — هتترتبط بأول سؤال (Quiz poll) تفورورده دلوقتي.{replaced_note}",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if user_id in SLEEPING:
+        return
+
+    photo = update.message.photo[-1] if update.message.photo else None
+    if not photo:
+        return
+
+    caption = (update.message.caption or "").strip()
+
+    img_dir = os.path.join(IMG_BASE_DIR, str(user_id))
+    os.makedirs(img_dir, exist_ok=True)
+    img_path = os.path.join(img_dir, f"img_{photo.file_unique_id}.jpg")
+    tg_file  = await context.bot.get_file(photo.file_id)
+    await tg_file.download_to_drive(img_path)
+
+    # ── Case 1: caption already IS a complete quiz question ─────────
+    # Parse and build the question immediately — no need to ask again.
+    parsed = parse_mcq_block(caption) if caption else None
+    if parsed:
+        question, raw_options, correct_index, explanation = parsed
+        question, raw_options = _apply_qz_watermark(question, raw_options, real_uid)
+        await _save_watermark_state()
+        await deliver_quiz(
+            context, user_id, question, raw_options, correct_index,
+            explanation=explanation, image_path=img_path,
+        )
+        events = await _record_activity(real_uid, questions_delta=1)
+        _update_telegram_name(real_uid, update.effective_user)
+        await react_random(update, context)
+        await _announce_events(context, user_id, events)
+        await backup_analytics_to_channel(context)
+        return
+
+    # ── Case 2: no caption — park the image and ask for the question
+    _clear_pending_image(user_id)
+    PENDING_IMAGE[user_id] = img_path
+    await update.message.reply_text(
+        "🖼 <b>استلمت الصورة!</b>\n"
+        "دلوقتي ابعت السؤال والاختيارات (بنفس صيغة الأسئلة المعتادة) "
+        "وهيتضاف الصورة تلقائي للسؤال ده.",
+        parse_mode=ParseMode.HTML,
+    )
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """PDFs sent in a private DM: captioned = treated as a manual question
+    (caption parsed as the MCQ text — no attachment, since Telegram polls
+    can only carry a photo, not a PDF). Uncaptioned PDFs are silently ignored."""
+    if not update.message or not update.message.document:
+        return
+    user_id  = update.effective_chat.id
+    real_uid = update.effective_user.id if update.effective_user else user_id
+    if user_id in SLEEPING:
+        return
+    doc = update.message.document
+    if doc.mime_type != "application/pdf":
+        return
+
+    caption = (update.message.caption or "").strip()
+    if caption:
+        parsed = parse_mcq_block(caption)
+        if not parsed:
+            await update.message.reply_text(
+                "⚠️ الكابشن مش صيغة سؤال كاملة (لازم سؤال + اختيارات + إجابة صح متعلّم عليها بـ z).\n\n"
+                "مثال:\n"
+                "<code>What is the powerhouse of the cell?\n"
+                "a) Nucleus\n"
+                "b) Mitochondria z\n"
+                "c) Ribosome</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        question, raw_options, correct_index, explanation = parsed
+        question, raw_options = _apply_qz_watermark(question, raw_options, real_uid)
+        await _save_watermark_state()
+        await deliver_quiz(context, user_id, question, raw_options, correct_index, explanation=explanation)
+        events = await _record_activity(real_uid, questions_delta=1)
+        _update_telegram_name(real_uid, update.effective_user)
+        await react_random(update, context)
+        await _announce_events(context, user_id, events)
+        await backup_analytics_to_channel(context)
+        return
+
+
+# ═══════════════════════════════════════════════════════════════
+# STORAGE GROUP — AUTO-INDEXING
+# ═══════════════════════════════════════════════════════════════
+# Reserved vault key for the onboarding "Where are we?! 🙃" message. Post it
+# in the storage group like any other item, with a caption starting with
+# this exact word. It starts with an underscore on purpose: the password
+# DM lookup (see handle in the STORAGE PASSWORD LOOKUP block) lowercases
+# what a user types and matches it against STORAGE_INDEX, and the text
+# handler treats this as a normal password too — so a real word here would
+# let anyone who typed it read the message early. Guarded there too.
+ONBOARDING_STORAGE_KEY = "_onboarding"   # no longer wired to onboarding delivery
+                                          # (see ONBOARDING_SPECIAL_TEXT / _send_onboarding_special
+                                          # below, now a fixed message) — kept reserved here only
+                                          # so handle_storage_text_message/_index_item don't need
+                                          # touching, in case the vault path is ever reused.
+
+# ── Fixed "welcome tour" message, shown right after the bully joke ─────
+# Used to be pulled live from whatever the admin had stored in the vault
+# under ONBOARDING_STORAGE_KEY (copy_messages from STORAGE_GROUP_ID) — now
+# just a fixed message, same idea as HOW_TO_USE_TEXT but only ever shown
+# once, mid-onboarding.
+ONBOARDING_SPECIAL_ART = (
+    "./\\___/\\ \n"
+    "(=^ ◡ ^=)ﾉ"
+)
+ONBOARDING_SPECIAL_TEXT = (
+    quizzy_block(ONBOARDING_SPECIAL_ART, "Now you are asking the RIGHT questions!")
+    + "\n\n"
+    "Welcome to The Quizician!\n"
+    "This is the place where all the magic happens 🪄✨\n\n\n"
+    "ودلوقتي خليني أرجع أتكلم عربي بقا علشان أعرفك أزاي تستخدم منصة... \n"
+    "<b>«The Quizician»</b>\n\n\n"
+    "<b>Quizzes ⁉️</b>\n"
+    "بتختار الموديول، بعدين المادة، وبعدين المحاضرة — وتبدأ تجاوب. كل سؤال بيتصحح على طول، "
+    "وبتاخد XP على كل إجابة صح، وفالآخر نتيجتك بتظهر وتقدر تعيد أسئلتك اللي غلط فيها، وبتتحفظ "
+    "فالMistakes bank (نظفه علطول علشان ميكونش شكلك وحش 🌚)\n\n"
+    "<b>💥 Daily Quiz</b>\n"
+    "15 سؤال عشوائي من كل المحاضرات المتاحه، بتتجدد كل يوم الساعة 2 الضهر، لكن ركز! عندك "
+    "محاولة واحدة بس في اليوم علشان تبقا المركز الأول!!\n"
+    "(أول تلات مراكز بياخدو ماديليات🥇، المركز بيعتمد على سرعتك + صحة إجاباتك... يعني بلاش "
+    "بصمجة يا دولي 😂)\n\n"
+    "<b>🧠 Mistakes Bank</b>\n"
+    "أي سؤال تغلط فيه بيتسجل هنا تلقائي، عشان ترجعله وتراجعه تاني وقت ما تحب. وتقدر تنظفه من "
+    "جوا الـ Mistakes Bank نفسه (أخيراً بقا في زرار يمسح آخطاء الماضي ❤️‍🩹)\n\n"
+    "<b>📊 My Stats 📈</b>\n"
+    "شوف الـ XP والـ Level بتاعك، عدد الأسئلة الصح والغلط، والـ achievements اللي فتحتها وحاجات "
+    "تانيه كتير (جدا) 🔥🔥\n\n"
+    "<b>🏆 Leaderboard</b>\n"
+    "ترتيبك بين زمايلك في نفس السنة/الفرقة، حسب عدد الإجابات الصح ونسبة الدقة، عايزينك تبقا فخر "
+    "بلدنا بقا 🤩\n\n"
+    "<b>⚙️ Settings</b>\n"
+    "أديها بصة قبل ما تبدأ أي حاجة 👀\n\n"
+    "❤️ لو في إي إضافة أو أي فيدباك تحب تقوله: \n"
+    "/feedback &lt;message&gt;\n\n"
+    "/report_issue —\n"
+    "لو فيه مشكلة أو سؤال غلط، ابعتلنا بلاغ وأدمن هيرد عليك فأقرب وقت (بنستخدمه لما يكون في "
+    "مشكلة مش لما سؤال أنت مش فاهمه علشان نعتق الأدمنز 🙏🌹)\n\n"
+    "<b>«دلوقتي بقا... عمرك سألت نفسك هو أزاي تيم كويز بيعملوا أسئلتهم؟!\n"
+    "حابب أقولك أنك دلوقتي واقف فالمصنع نفسه! (حرفيا)\n"
+    "وتقدر تجرب علشان تعرف سهولة الموضوع لو كتبت سؤال بشوية أختيارات البوت هيبعتلك الأسئلة "
+    "فشكل كويز جاهز»</b>\n"
+    "<code>What is the powerhouse of the cell?\n"
+    "a) choice 1\n"
+    "b) Mitochondria z  ← علّم الصح بـ z\n"
+    "c) choice 2\n"
+    "ex: تفسير (اختياري)</code>\n"
+    "بسكدا! طب ما الدنيا حلوه أهي!\n"
+    "لو حابب تشارك الدفعة بأفكارك, متترددش تدخل التيم وتورنا 🤩\n\n"
+    "تواصل مع أي حد من هيدز تيم كويز\n"
+    "وهم هيردو عليك فأقرب وقت ❤️‍🔥\n"
+
+    "<b>كفايه رغي بقا ويلا بينا؟!</b>"
+)
+
+async def _index_item(caption: str, message_ids: list):
+    password = caption.strip().split(maxsplit=1)[0].lower()
+    STORAGE_INDEX.setdefault(password, []).append(sorted(message_ids))
+    await save_storage_index()
+    return password
+
+async def _send_onboarding_special(query) -> None:
+    """Shows the fixed onboarding "welcome tour" message (ONBOARDING_SPECIAL_TEXT),
+    with the final 🗣️🗣️🔥 يلا بينا button — edited into the same message as the
+    "just kidding" step rather than sent as a separate new message."""
+    await query.edit_message_text(
+        text=ONBOARDING_SPECIAL_TEXT,
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🗣️🗣️🔥 يلا بينا", callback_data="onboard_go"),
+        ]]),
+    )
+
+async def _finalize_album(context: ContextTypes.DEFAULT_TYPE, media_group_id: str):
+    # Wait for the album's parts to stop arriving before filing it as one item.
+    await asyncio.sleep(1.5)
+    buf = ALBUM_BUFFER.pop(media_group_id, None)
+    if not buf:
+        return
+    caption = buf["caption"]
+    if not caption:
+        await context.bot.send_message(
+            STORAGE_GROUP_ID,
+            "⚠️ ألبوم اتبعت من غير كابشن (كلمة سر) — اتجاهله ومحدش هيقدر يفتحه.",
+        )
+        return
+    password = await _index_item(caption, buf["ids"])
+    await backup_storage_to_channel(context)
+    await context.bot.send_message(
+        STORAGE_GROUP_ID,
+        f"✅ اتخزن ألبوم من {len(buf['ids'])} ملف تحت الكلمة: <code>{password}</code>\n"
+        f"🐾 <i>{random.choice(QUIZZY_SUCCESS_LINES)}</i>",
+        parse_mode=ParseMode.HTML,
+    )
+
+async def handle_storage_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Vault posts are normally media + a password caption (handle_storage_message
+    below), but the onboarding "Where are we?! 🙃" message is often plain
+    text. So a text post in the vault is filed too — but ONLY when its first
+    word is exactly ONBOARDING_STORAGE_KEY. Any other text in the storage
+    group is ignored, same as before, so nothing else about the vault changes."""
+    msg = update.message
+    if not msg or not msg.text:
+        return
+    first_word = msg.text.strip().split(maxsplit=1)[0].lower() if msg.text.strip() else ""
+    if first_word != ONBOARDING_STORAGE_KEY:
+        return
+    await _index_item(msg.text, [msg.message_id])
+    await backup_storage_to_channel(context)
+    await msg.reply_text(
+        f"✅ اتخزن تحت الكلمة: <code>{ONBOARDING_STORAGE_KEY}</code>\n"
+        f"🐾 <i>{random.choice(QUIZZY_SUCCESS_LINES)}</i>",
+        parse_mode=ParseMode.HTML,
+    )
+
+async def handle_storage_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Indexes media posted in STORAGE_GROUP_ID. First caption word = password."""
+    msg = update.message
+    if not msg:
+        return
+    caption = (msg.caption or "").strip()
+
+    if msg.media_group_id:
+        buf = ALBUM_BUFFER.setdefault(msg.media_group_id, {"ids": [], "caption": None})
+        buf["ids"].append(msg.message_id)
+        if caption:
+            buf["caption"] = caption  # usually only one part of the album carries it
+        existing_task = buf.get("task")
+        if existing_task:
+            existing_task.cancel()
+        buf["task"] = asyncio.create_task(_finalize_album(context, msg.media_group_id))
+        return
+
+    if not caption:
+        await msg.reply_text("⚠️ الملف ده اتبعت من غير كابشن — محتاج كلمة سر في الكابشن عشان يتخزن.")
+        return
+
+    password = await _index_item(caption, [msg.message_id])
+    await backup_storage_to_channel(context)
+    await msg.reply_text(
+        f"✅ اتخزن تحت الكلمة: <code>{password}</code>\n"
+        f"🐾 <i>{random.choice(QUIZZY_SUCCESS_LINES)}</i>",
+        parse_mode=ParseMode.HTML,
+    )
+
+async def _run_backup_now(context: ContextTypes.DEFAULT_TYPE) -> str:
+    """Force-creates/refreshes both pinned backups right now, instead of
+    waiting for the next real change. Shared by /backup_now and the Dev
+    Panel's 💾 Backup Now button — returns the status text to show,
+    rather than sending it itself, since the two callers reply
+    differently (update.message.reply_text vs a fresh send_message after
+    editing a button message)."""
+    await backup_storage_to_channel(context)
+    for y in configured_years():
+        await backup_quiz_to_channel(context, y)
+    lines = [
+        "✅ اتعمل باك أب دلوقتي.",
+        f"📌 Storage group: {'تم' if STORAGE_BACKUP_STATE.get('backup_msg_id') else 'مش متظبط STORAGE_GROUP_ID'}",
+    ]
+    for y in YEAR_ORDER:
+        if not year_channel_id(y):
+            lines.append(f"📌 {year_label(y)}: مش متظبط لسه (مفيش channel_id)")
+            continue
+        ok = bool(QUIZ_BACKUP_STATE[y].get("backup_msg_id"))
+        lines.append(f"📌 {year_label(y)}: {'تم' if ok else 'فشل'}")
+    return "\n".join(lines)
+
+async def backup_now_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: force-create/refresh both pinned backups right now, instead of
+    waiting for the next real change."""
+    if not is_admin(update):
+        await update.message.reply_text(MSG_ADMIN_ONLY)
+        return
+    await update.message.reply_text(await _run_backup_now(context))
+
+# ═══════════════════════════════════════════════════════════════
+# QUIZ CHANNEL — AUTO-INDEXING
+# ═══════════════════════════════════════════════════════════════
+async def handle_quiz_channel_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Indexes lectures + quiz polls posted in any year's quiz channel —
+    which year is resolved from the incoming chat id (see year_for_chat)."""
+    msg = update.channel_post or update.message
+    if not msg:
+        return
+    year = year_for_chat(msg.chat.id)
+    if year is None:
+        return  # not one of the configured quiz channels
+    channel_id = year_channel_id(year)
+
+    # ── A photo — either a written-question ("w:") post, or a plain
+    # illustration meant for the NEXT poll question ────────────────
+    if msg.photo:
+        current = QUIZ_STATE[year].get("current_lecture")
+        if not current or current not in QUIZ_INDEX[year]:
+            await context.bot.send_message(
+                channel_id,
+                "⚠️ محتاج تبعت اسم المحاضرة الأول (أي رسالة نصية) قبل ما تبعت صور."
+            )
+            return
+        photo   = msg.photo[-1]   # highest resolution
+        caption = (msg.caption or "").strip()
+        written = parse_spoiler_written_caption(msg) if caption else None
+        if written is None and caption:
+            written = parse_written_channel_block(caption)
+        image_info = {
+            "file_id":        photo.file_id,
+            "file_unique_id": photo.file_unique_id,   # the immutable part — see QUIZ_PENDING_POLL_IMAGE
+            "spoiler":        bool(getattr(msg, "has_media_spoiler", False)),
+        }
+        if written:
+            title, content = written
+            QUIZ_INDEX[year][current].setdefault("written", []).append({
+                "id": msg.message_id, "title": title, "content": content, "image": image_info,
+            })
+            await save_quiz_index(year)
+            return
+        # Not a written question — hold it for whichever poll comes next.
+        # A second image before that poll simply overwrites this one
+        # (last image before the question wins), same as re-sending a
+        # lecture name overwrites QUIZ_STATE's current_lecture.
+        QUIZ_PENDING_POLL_IMAGE[year][current] = image_info
+        return
+
+    # ── A quiz poll — file it under the currently-open lecture ──
+    if msg.poll:
+        current = QUIZ_STATE[year].get("current_lecture")
+        if not current or current not in QUIZ_INDEX[year]:
+            await context.bot.send_message(
+                channel_id,
+                "⚠️ محتاج تبعت اسم المحاضرة الأول (أي رسالة نصية) قبل ما تبعت أسئلة."
+            )
+            return
+        insert_after = QUIZ_INSERT_AFTER[year].get(current, "__none__")
+        if insert_after == "__none__":
+            # Normal authoring — append at the end, as before.
+            QUIZ_INDEX[year][current]["ids"].append(msg.message_id)
+        else:
+            # Reopened via /edit_quiz's "➕ Insert new poll after" — splice
+            # this new question in right after insert_after (or at the
+            # very start, if it's None), then advance the marker to this
+            # mid so a second poll sent right after lands after this one,
+            # not after the original target again.
+            ids = QUIZ_INDEX[year][current]["ids"]
+            pos = (ids.index(insert_after) + 1) if insert_after is not None and insert_after in ids else 0
+            ids.insert(pos, msg.message_id)
+            QUIZ_INSERT_AFTER[year][current] = msg.message_id
+        # An image posted right before THIS poll (and after any earlier
+        # poll) is now claimed by it — see QUIZ_PENDING_POLL_IMAGE's
+        # comment and _deliver_next_lecture_question, which attaches it
+        # as the poll's native media at delivery time.
+        pending_img = QUIZ_PENDING_POLL_IMAGE[year].pop(current, None)
+        if pending_img:
+            QUIZ_INDEX[year][current].setdefault("poll_images", []).append({
+                "mid": msg.message_id, **pending_img,
+            })
+        await save_quiz_index(year)
+        # Track this poll so we know once it's stopped (only then is the
+        # correct answer known — needed before it can be delivered as a
+        # lecture question). question/options are captured right away since
+        # those aren't access-restricted like correct_option_id is; that
+        # lets lecture delivery build its own poll (see
+        # _deliver_next_lecture_question) without depending on a copy of
+        # the original, which would stay anonymous forever.
+        QUIZ_POLL_STATUS[year][msg.poll.id] = {
+            "lecture":           current,
+            "message_id":        msg.message_id,
+            "closed":            msg.poll.is_closed,
+            "correct_option_id": msg.poll.correct_option_ids[0] if msg.poll.correct_option_ids else None,
+            "question":          msg.poll.question,
+            "options":           [o.text for o in msg.poll.options],
+            "explanation":       msg.poll.explanation,
+            "description":       _poll_description(msg.poll),
+        }
+        await save_quiz_poll_status(year)
+        # NOTE: the channel backup document + the "still open" reaction are
+        # both deliberately deferred to -END (below) instead of happening
+        # here per-question — doing them per-question was sending/pinning
+        # a fresh backup document for every single poll.
+        return
+
+    # ── Plain text: either "-END" or a new/resumed lecture name ─
+    if not msg.text:
+        return
+    text = msg.text.strip()
+
+    if text.upper() in ("-END", "-FIN"):
+        is_fin = text.upper() == "-FIN"
+        current = QUIZ_STATE[year].get("current_lecture")
+        if not current or current not in QUIZ_INDEX[year]:
+            await context.bot.send_message(channel_id, "⚠️ مفيش محاضرة مفتوحة دلوقتي.")
+            return
+
+        open_message_ids = [
+            p["message_id"] for p in QUIZ_POLL_STATUS[year].values()
+            if p["lecture"] == current and not p["closed"]
+        ]
+
+        # -FIN: best-effort auto-stop of any question still open. NOTE:
+        # Telegram's stopPoll only works on a poll the *bot itself* sent —
+        # these quiz polls are posted directly by admins in the channel, so
+        # the bot has no API-level way to close them on its own; this loop
+        # will normally close nothing and every question will still need a
+        # manual Stop Poll, exactly like -END. It's left in as a harmless
+        # no-op in case that ever changes (e.g. polls start being relayed
+        # through the bot), rather than silently pretending to finalize
+        # something it technically can't.
+        auto_stopped = 0
+        if is_fin:
+            for mid in list(open_message_ids):
+                try:
+                    stopped_poll = await context.bot.stop_poll(chat_id=channel_id, message_id=mid)
+                except Exception:
+                    continue
+                for p in QUIZ_POLL_STATUS[year].values():
+                    if p["message_id"] == mid:
+                        p["closed"]            = True
+                        p["correct_option_id"] = stopped_poll.correct_option_id
+                        break
+                open_message_ids.remove(mid)
+                auto_stopped += 1
+            if auto_stopped:
+                await save_quiz_poll_status(year)
+
+        QUIZ_INDEX[year][current]["closed"] = True
+        await save_quiz_index(year)
+        QUIZ_STATE[year]["current_lecture"] = None
+        await save_quiz_state(year)
+        QUIZ_INSERT_AFTER[year].pop(current, None)   # done editing (if this was an /edit_quiz re-open)
+        QUIZ_PENDING_POLL_IMAGE[year].pop(current, None)   # any unclaimed image dies with the lecture
+
+        # Batched now, once, instead of one reaction call per question:
+        # mark every still-open (forgot to Stop Poll) question in this
+        # lecture with 😢.
+        for mid in open_message_ids:
+            try:
+                await context.bot.set_message_reaction(
+                    chat_id=channel_id, message_id=mid,
+                    reaction=[ReactionTypeEmoji("😢")], is_big=False,
+                )
+            except Exception:
+                pass
+
+        # Single backup for the whole lecture, once it's actually closed.
+        await backup_quiz_to_channel(context, year)
+
+        count = len(QUIZ_INDEX[year][current]["ids"])
+        open_count = len(open_message_ids)
+        note = (
+            f"\n⚠️ {open_count} سؤال لسه مفتوح — لازم توقف التصويت عليه (Stop Poll) "
+            f"قبل ما يبقى ممكن يتبعت للطلاب."
+            if open_count else "\n✅ كل الأسئلة جاهزة للإرسال."
+        )
+        if is_fin and auto_stopped:
+            note += f"\n🤖 اتقفل {auto_stopped} سؤال تلقائي."
+        verb = "اتخلصت" if is_fin else "اتقفلت"
+        await context.bot.send_message(
+            channel_id,
+            f"✅ {verb} محاضرة <b>{current}</b> — {count} سؤال.{note}",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # ── Written question ("w: ...") — unscored reference content, not a
+    # poll. Checked before lecture-title parsing so it's never mistaken
+    # for (and rejected as) a malformed lecture name. ──────────────────
+    written = parse_spoiler_written_message(msg)
+    if written is None:
+        written = parse_written_channel_block(text)
+    if written:
+        current = QUIZ_STATE[year].get("current_lecture")
+        if not current or current not in QUIZ_INDEX[year]:
+            await context.bot.send_message(
+                channel_id,
+                "⚠️ محتاج تبعت اسم المحاضرة الأول (أي رسالة نصية) قبل ما تبعت أسئلة مكتوبة."
+            )
+            return
+        title, content = written
+        # If an image was posted just before this "w:" text (same pattern
+        # as an image posted before a poll question — see the msg.photo
+        # branch above and _deliver_next_lecture_question), claim it for
+        # this written entry instead of leaving it stranded in
+        # QUIZ_PENDING_POLL_IMAGE, where it would either get wrongly
+        # attached to whatever poll comes next or die unclaimed at -END.
+        pending_img = QUIZ_PENDING_POLL_IMAGE[year].pop(current, None)
+        QUIZ_INDEX[year][current].setdefault("written", []).append({
+            "id": msg.message_id, "title": title, "content": content, "image": pending_img,
+        })
+        await save_quiz_index(year)
+        return
+
+    # New lecture name (or resuming one that already exists).
+    # Format: "<Module> - <Subject> Lecture <number>: <name>"
+    module, subject, lecture_number, name_or_error = parse_lecture_title(year, text)
+    if module is None:
+        await context.bot.send_message(channel_id, name_or_error, parse_mode=ParseMode.HTML)
+        return
+    name = name_or_error
+
+    entry = QUIZ_INDEX[year].setdefault(text, {
+        "ids": [], "closed": False,
+        "module": module, "subject": subject, "lecture_number": lecture_number, "name": name,
+    })
+    entry["closed"]         = False
+    entry["module"]         = module
+    entry["subject"]        = subject
+    entry["lecture_number"] = lecture_number
+    entry["name"]           = name
+    await save_quiz_index(year)
+    QUIZ_STATE[year]["current_lecture"] = text
+    await save_quiz_state(year)
+    await backup_quiz_to_channel(context, year)
+    await context.bot.send_message(
+        channel_id,
+        f"🆕 <b>[{year_label(year)}] {module} - {subject} Lecture {lecture_number}: {name}</b>\n"
+        f"ابعت الأسئلة (كويزات) دلوقتي، وابعت <code>-END</code> أو <code>-FIN</code> لما تخلص.\n"
+        f"⚠️ لازم توقف كل سؤال (Stop Poll) الأول عشان يبقى قابل للإرسال.",
+        parse_mode=ParseMode.HTML,
+    )
+
+def _locked_year_modules_view(user_id: int | None, years: list) -> tuple[str, InlineKeyboardMarkup] | None:
+    """If this user has a year/class set whose channel is still configured
+    and has at least one ready module, returns the (text, keyboard) for
+    jumping straight to their module list — skipping the "which year?"
+    step entirely, since onboarding now makes year/class mandatory (see
+    _onboarding_gate) and there's normally no other year for them to
+    pick from anyway. Shared by quiz_lectures_cmd (/quiz) and the
+    quiz_years callback ("📚 More Quizzes" / "🔙 رجوع للسنين") so both
+    entry points skip consistently.
+
+    Returns None — meaning "fall back to the full year picker" — only
+    for the now-rare edge cases where locking straight to a year isn't
+    actually possible: no year_class on record (shouldn't happen post-
+    onboarding, but covers pre-onboarding-gate legacy sessions), that
+    year's channel no longer configured, or it has no ready modules yet."""
+    if not user_id:
+        return None
+    year_class = get_year_class(user_id)
+    if year_class not in years or not year_channel_id(year_class):
+        return None
+    modules = ready_modules(year_class)
+    if not modules:
+        return None
+    buttons = [
+        [InlineKeyboardButton(module_label(m), callback_data=f"module:{year_class}:{i}")]
+        for i, m in enumerate(modules)
+    ]
+    # Search Content 🔎 — scoped to this locked year; module (or "all
+    # modules") is picked on the next screen. See search_year:/search_mod:
+    # in button_handler and AWAITING_SEARCH_QUERY.
+    buttons.append([InlineKeyboardButton("Search Content 🔎", callback_data=f"search_year:{year_class}")])
+    # Not "🔙 رجوع للسنين" here — with a locked year/class there's no
+    # other year behind it to go back to, so that button would just
+    # reopen this exact same screen. Back to Home is the only meaningful
+    # "out" from here now.
+    buttons.append([InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")])
+    text = f"📚 <b>{year_label(year_class)}</b> — اختار الموديول:" + year_credit_line(year_class)
+    return text, InlineKeyboardMarkup(buttons)
+
+async def quiz_lectures_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User-facing: /quiz. Jumps straight to the module list for the
+    caller's own year/class (set via the onboarding/Settings year_class
+    prompt — see get_year_class, year_class_keyboard, _locked_year_modules_view),
+    skipping the "which year?" step entirely. Falls back to the full
+    year-picker (old behaviour) if that's not possible right now — see
+    _locked_year_modules_view for exactly when."""
+    user_id = update.effective_user.id if update.effective_user else None
+    years = configured_years()
+    if not years:
+        await update.message.reply_text("📭 مفيش سنين متاحة دلوقتي.")
+        return
+
+    view = _locked_year_modules_view(user_id, years)
+    if view:
+        text, markup = view
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        return
+
+    buttons = [[InlineKeyboardButton(year_label(y), callback_data=f"yr:{y}")] for y in years]
+    buttons.append([InlineKeyboardButton("Search Content 🔎", callback_data="search_pick_year")])
+    await update.message.reply_text(
+        "📚 <b>اختار السنة:</b>", parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+def _next_daily_quiz_line() -> str:
+    """One line: how long until the next 💥Daily Quiz💥 push, plus its
+    Cairo clock time. Shared by /time and the post-quiz results summary."""
+    next_push = next_daily_quiz_time()
+    now       = datetime.now(DAILY_QUIZ_TZ)
+    delta     = next_push - now
+    hours, remainder = divmod(int(delta.total_seconds()), 3600)
+    minutes = remainder // 60
+    when = "النهاردة" if next_push.date() == now.date() else "بكرة"
+    return f"⏰ الـ Daily Quiz الجاية: {when} الساعة {next_push.strftime('%I:%M %p')} (بعد {hours} ساعة و{minutes} دقيقة)"
+
+async def time_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/time — current Cairo time, and when the next 💥Daily Quiz💥 push is."""
+    now = datetime.now(DAILY_QUIZ_TZ)
+    await update.message.reply_text(
+        f"🕒 دلوقتي: <b>{now.strftime('%I:%M %p')}</b> (توقيت القاهرة)\n\n"
+        f"{_next_daily_quiz_line()}",
+        parse_mode=ParseMode.HTML,
+    )
+
+def _daily_module_view() -> tuple[str | None, InlineKeyboardMarkup | None]:
+    """Builds the /daily_module picker screen. Shared by daily_module_cmd
+    and the Dev Panel's 📆 Daily Module button. Returns (None, None) if
+    there are no configured years to pick from — callers show their own
+    'nothing configured' message in that case, since one replies fresh
+    and the other edits a button message."""
+    years = configured_years()
+    if not years:
+        return None, None
+    scope = get_daily_quiz_scope()
+    current = f"\n\nدلوقتي محدد: {year_label(scope['year'])} — {scope['module']}" if scope else "\n\nدلوقتي: كل المنهج (مفيش تحديد)"
+    buttons = [[InlineKeyboardButton(year_label(y), callback_data=f"dqy:{y}")] for y in years]
+    if scope:
+        buttons.append([InlineKeyboardButton("🔓 شيل التحديد (رجّع كل المنهج)", callback_data="dq_scope_off")])
+    text = f"📚 <b>Daily Quiz — اختار الموديول اللي هيتحدد عليه:</b>{current}"
+    return text, InlineKeyboardMarkup(buttons)
+
+async def daily_module_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: pick a year, then a module, to temporarily override that
+    year's DAILY_QUIZ_ACTIVE_MODULE default (e.g. to switch early, before
+    the code constant itself gets updated). Own callback_data namespace
+    (dqy:/dqm:/dq_scope_off) — deliberately separate from the yr:/module:
+    user-facing browsing flow, since this is a one-time admin scope pick,
+    not lecture navigation."""
+    if not is_admin(update):
+        await update.message.reply_text(MSG_ADMIN_ONLY)
+        return
+    text, markup = _daily_module_view()
+    if text is None:
+        await update.message.reply_text("📭 مفيش سنين متاحة دلوقتي.")
+        return
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+def _quiz_year_arg(context) -> tuple[str | None, str | None]:
+    """Shared arg-parsing for /quiz_list and /quiz_delete: expects the
+    year key as the first arg. Returns (year, error_message)."""
+    years = configured_years()
+    valid = ", ".join(years) if years else "(مفيش سنين متظبطة)"
+    if not context.args or context.args[0] not in YEARS:
+        return None, f"استخدام: /quiz_list <سنة>\nالسنين المتاحة: {valid}"
+    year = context.args[0]
+    if not year_channel_id(year):
+        return None, f"⚠️ {year_label(year)} لسه مفيهاش channel_id متظبط."
+    return year, None
+
+async def quiz_list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: /quiz_list <year> — numbered list of ALL lectures (open +
+    closed) in that year, for /quiz_delete."""
+    if not is_admin(update):
+        await update.message.reply_text(MSG_ADMIN_ONLY)
+        return
+    year, err = _quiz_year_arg(context)
+    if err:
+        await update.message.reply_text(err)
+        return
+    if not can_edit_year(update, year):
+        await update.message.reply_text(_wrong_year_msg(update))
+        return
+    index = QUIZ_INDEX[year]
+    if not index:
+        await update.message.reply_text(f"📭 مفيش محاضرات مسجلة لسه في {year_label(year)}.")
+        return
+    lines = [f"📋 <b>كل محاضرات {year_label(year)}:</b>"]
+    for i, (key, v) in enumerate(index.items(), 1):
+        status = "✅ مقفولة" if v["closed"] else "🟡 لسه مفتوحة"
+        lecnum = f" {v['lecture_number']}" if v.get("lecture_number") else ""
+        lines.append(f"{i}. {v['module']} - {v['subject']} Lecture{lecnum}: {v['name']} — {len(v['ids'])} سؤال — {status}")
+    lines.append(f"\nاستخدم /quiz_delete {year} &lt;رقم&gt; للحذف")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+async def quiz_delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: /quiz_delete <year> <n> — asks for confirmation, then
+    removes a lecture from that year's index (does not delete the actual
+    channel messages; only stops it showing up in /quiz). The actual
+    removal happens in button_handler's quizdel_yes branch once the admin
+    taps to confirm; see PENDING_QUIZ_DELETE."""
+    if not is_admin(update):
+        await update.message.reply_text(MSG_ADMIN_ONLY)
+        return
+    years = configured_years()
+    valid = ", ".join(years) if years else "(مفيش سنين متظبطة)"
+    if len(context.args) < 2 or context.args[0] not in YEARS or not context.args[1].isdigit():
+        await update.message.reply_text(
+            f"استخدام: /quiz_delete <سنة> <رقم>\nالسنين المتاحة: {valid}\nشوف الأرقام في /quiz_list <سنة>"
+        )
+        return
+    year = context.args[0]
+    if not year_channel_id(year):
+        await update.message.reply_text(f"⚠️ {year_label(year)} لسه مفيهاش channel_id متظبط.")
+        return
+    if not can_edit_year(update, year):
+        await update.message.reply_text(_wrong_year_msg(update))
+        return
+    n = int(context.args[1])
+    index = QUIZ_INDEX[year]
+    keys = list(index.keys())
+    if n < 1 or n > len(keys):
+        await update.message.reply_text(f"❌ رقم غلط — فيه {len(keys)} محاضرة بس في {year_label(year)}")
+        return
+    key     = keys[n - 1]
+    lecture = index[key]
+
+    admin_id = update.effective_user.id
+    PENDING_QUIZ_DELETE[admin_id] = (year, key)
+    await update.message.reply_text(
+        f"⚠️ <b>متأكد إنك عايز تمسح المحاضرة دي؟</b>\n\n"
+        f"{year_label(year)} — {lecture['module']} - {lecture['subject']}: {lecture['name']}\n"
+        f"(الرسايل نفسها هتفضل في القناة — العملية دي بس بتشيلها من /quiz)",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑 أيوه، امسح", callback_data="quizdel_yes")],
+            [InlineKeyboardButton("🔙 لأ، سيبها", callback_data="quizdel_no")],
+        ]),
+    )
+
+async def edit_quiz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: /edit_quiz (alias: /quiz_edit) — browse year -> module -> subject -> lecture
+    (same drill-down as /quiz), then pick a question from that lecture to
+    delete it or insert a new one right after it. Reuses the same
+    yr:/module:/subject: browsing callback_data as /quiz so the flow
+    doesn't have to duplicate module/subject listing — only the last step
+    (picking a lecture) branches into the editquiz: namespace instead of
+    lecture:/lecturego:."""
+    if not is_admin(update):
+        await update.message.reply_text(MSG_ADMIN_ONLY)
+        return
+    years = configured_years()
+    bound = admin_bound_year(update.effective_user.id)
+    if bound:
+        years = [y for y in years if y == bound]
+    if not years:
+        await update.message.reply_text("📭 مفيش سنين متاحة دلوقتي.")
+        return
+    buttons = [[InlineKeyboardButton(year_label(y), callback_data=f"eqyr:{y}")] for y in years]
+    await update.message.reply_text(
+        "✏️ <b>Edit Quiz — اختار السنة:</b>", parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+async def add_lecture_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: /add_lecture — DM-based authoring, no channel involved.
+    Year -> module -> subject (alyr:/almod:/alsubj: below) -> typed
+    "number: name" -> then forward quiz polls (sender name hidden) one by
+    one, -END to close. See ADD_LECTURE_STATE's comment for why this
+    works without ever waiting on a Stop Poll."""
+    if not is_admin(update):
+        await update.message.reply_text(MSG_ADMIN_ONLY)
+        return
+    years = configured_years()
+    bound = admin_bound_year(update.effective_user.id)
+    if bound:
+        years = [y for y in years if y == bound]
+    if not years:
+        await update.message.reply_text("📭 مفيش سنين متاحة دلوقتي.")
+        return
+    buttons = [[InlineKeyboardButton(year_label(y), callback_data=f"alyr:{y}")] for y in years]
+    await update.message.reply_text(
+        "📚 <b>Add Lecture — اختار السنة:</b>", parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+# ═══════════════════════════════════════════════════════════════
+# TEXT MESSAGE HANDLER
+# ═══════════════════════════════════════════════════════════════
+async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+
+    user_id  = update.effective_chat.id
+    real_uid = update.effective_user.id if update.effective_user else user_id
+    if user_id in SLEEPING:
+        return
+
+    text = update.message.text.strip()
+
+    # ── /add_lecture DM authoring in progress for this admin ─────────
+    # Owns every text message from them until -END/-FIN, exactly the way
+    # the channel-authoring flow owns every channel_post — otherwise a
+    # stray message here could get misread as a search query, nickname,
+    # etc. Quiz polls themselves arrive as update.message.poll, not text,
+    # and are caught in handle_poll (see _capture_add_lecture_poll).
+    al_state = ADD_LECTURE_STATE.get(real_uid)
+    if al_state:
+        if not is_admin(update):
+            return
+        if text.upper() in ("-END", "-FIN"):
+            status_id = al_state.get("status_message_id")
+            summary, err = await _close_add_lecture(context, real_uid, al_state)
+            if status_id:
+                try:
+                    await context.bot.delete_message(chat_id=real_uid, message_id=status_id)
+                except Exception:
+                    pass
+            await update.message.reply_text(err or summary, parse_mode=ParseMode.HTML)
+            return
+
+        auto_written = parse_spoiler_written_message(update.message)
+        if auto_written:
+            title, content = auto_written
+            await _capture_add_lecture_written(
+                context, real_uid, al_state, title, content, update.message.message_id
+            )
+            return
+
+        # ── Case study: a long plain-text message, bound to whichever
+        # poll gets forwarded next (same "last one before the poll wins"
+        # convention as pending_image below, and as QUIZ_PENDING_POLL_IMAGE
+        # in the channel-authoring flow). The length threshold keeps a
+        # short stray message (a typo, "ok", etc.) falling through to the
+        # rejection reply below instead of silently being filed away as a
+        # case study nobody meant to attach.
+        if len(text) >= ADD_LECTURE_CASE_STUDY_MIN_LEN:
+            replaced_note = (
+                "\n⚠️ ده استبدل الـ Case study اللي بعتهولك قبل كده — ده كان لسه معلق ومربوطش بسؤال."
+                if al_state.get("pending_case_study") else ""
+            )
+            al_state["pending_case_study"] = {"content": text}
+            await update.message.reply_text(
+                f"📝 اتسجل الـ Case study — هيترتبط بأول سؤال (Quiz poll) تفورورده دلوقتي.{replaced_note}",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        await update.message.reply_text(
+            "📚 لسه في محاضرة مفتوحة للإضافة — فوروارد سؤال (Quiz)، أو ابعت سؤال مكتوب وإجابته مخفية بـ Spoiler، "
+            "أو ابعت صورة/Case study هيترتبط بالسؤال الجاي، أو استخدم زراير End/Cancel Lecture تحت آخر رسالة.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # ── AWAITING ADD_LECTURE NAME (/add_lecture, after module+subject) ──
+    pending_al_name = AWAITING_ADD_LECTURE_NAME.pop(real_uid, None)
+    if pending_al_name:
+        if not is_admin(update):
+            return
+        m = re.match(r"^\s*(\d+)\s*:\s*(.+)$", text)
+        if not m:
+            await update.message.reply_text(
+                "⚠️ الصيغة غلط. لازم تكون:\n<code>رقم: الاسم</code>\nمثال: <code>3: Insulin Signaling</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            AWAITING_ADD_LECTURE_NAME[real_uid] = pending_al_name
+            return
+        number, name = m.group(1), m.group(2).strip()
+        year, module, subject = pending_al_name["year"], pending_al_name["module"], pending_al_name["subject"]
+
+        current_lock = QUIZ_STATE[year].get("current_lecture")
+        if current_lock and current_lock in QUIZ_INDEX[year] and not QUIZ_INDEX[year][current_lock]["closed"]:
+            await update.message.reply_text(
+                f"⚠️ في محاضرة مفتوحة دلوقتي (<b>{current_lock}</b>) — لازم تتقفل بـ -END الأول.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        lecture_key = f"{module} - {subject} Lecture {number}: {name}"
+        existed_before   = lecture_key in QUIZ_INDEX[year]
+        was_closed_before = QUIZ_INDEX[year][lecture_key]["closed"] if existed_before else False
+        resumed = existed_before and bool(QUIZ_INDEX[year][lecture_key]["ids"])
+        entry = QUIZ_INDEX[year].setdefault(lecture_key, {
+            "ids": [], "closed": False,
+            "module": module, "subject": subject, "lecture_number": number, "name": name,
+        })
+        entry["closed"]         = False
+        entry["module"]         = module
+        entry["subject"]        = subject
+        entry["lecture_number"] = number
+        entry["name"]           = name
+        await save_quiz_index(year)
+        QUIZ_STATE[year]["current_lecture"] = lecture_key
+        await save_quiz_state(year)
+        ADD_LECTURE_STATE[real_uid] = {
+            "year": year, "lecture_key": lecture_key,
+            "existed_before": existed_before, "was_closed_before": was_closed_before,
+            "session_ids": [],            # poll mids added THIS session — what Cancel Lecture undoes
+            "session_written_ids": [],    # written-entry message ids added THIS session
+            "status_message_id": None,    # the one live running-count message
+            "pending_image": None,        # photo sent (not forwarded) since the last poll — see
+                                           # handle_image's ADD_LECTURE_STATE branch. Claimed (and
+                                           # cleared) by the next forwarded poll; last image before a
+                                           # poll wins, same convention as QUIZ_PENDING_POLL_IMAGE.
+            "pending_case_study": None,   # long text sent since the last poll, to bind to the next
+                                           # forwarded poll — see handle()'s case-study branch below.
+                                           # Same "last one before a poll wins" convention.
+        }
+
+        resume_note = (
+            f"\n♻️ فيه بالفعل {len(entry['ids'])} سؤال محفوظين هنا — هيتضافوا عليهم."
+            if resumed else ""
+        )
+        await update.message.reply_text(
+            f"🆕 <b>[{year_label(year)}] {module} - {subject} Lecture {number}: {name}</b>{resume_note}\n\n"
+            "دلوقتي فوروارد الأسئلة (Quiz polls) واحد واحد، وشيل اسم المرسل من كل واحدة "
+            "(Hide Sender's Name) — من غيرها الإجابة الصح مش هتتعرف.\n"
+            "لو عايز تضيف صورة أو Case study (نص) لسؤال معين، ابعتها الأول وبعدين فوروارد السؤال — "
+            "هترتبط بيه تلقائي.\n"
+            "بعد أول سؤال هتلاقي رسالة بعداد الأسئلة وزراير End/Cancel Lecture تحتها.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # ── "-Reply <id> <message>" (report-issue reply, plain text) ─────
+    # Works from REPORT_ISSUE_GROUP_ID regardless of who Telegram reports
+    # as the sender — deliberately NOT identity-based (no AWAITING_* /
+    # real_uid matching) because the button-driven two-step flow below
+    # this one silently breaks when the group has "remain anonymous"
+    # enabled for admins: a typed message then arrives with
+    # effective_user = GroupAnonymousBot, not the admin's real id, so any
+    # check keyed on real_uid never matches. Parsing a self-contained
+    # command out of the message text sidesteps that identity question
+    # entirely — the id is right there in the text, no state to match up
+    # against who's supposedly typing. Not admin-gated beyond "must be
+    # sent in this group" for the same reason: if you're posting in a
+    # private group only admins are in, that's the access control.
+    if REPORT_ISSUE_GROUP_ID and user_id == REPORT_ISSUE_GROUP_ID and text.startswith("-Reply"):
+        parts = text.split(maxsplit=2)
+        if len(parts) < 3 or not parts[1].isdigit():
+            await update.message.reply_text(
+                "⚠️ الصيغة: <code>-Reply &lt;id&gt; &lt;رسالتك&gt;</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        group_message_id = int(parts[1])
+        reply_text        = parts[2]
+        thread = REPORT_THREADS.get(group_message_id)
+        if not thread:
+            await update.message.reply_text(f"⚠️ مفيش report بالـ ID ده: {group_message_id}")
+            return
+        if thread.get("closed"):
+            await update.message.reply_text("⚠️ الـ report ده مقفول بالفعل.")
+            return
+        _append_report_message(thread, "admin", reply_text)
+        user_dm_ok = await _refresh_report_thread(context, group_message_id, thread)
+        if not user_dm_ok:
+            await update.message.reply_text("⚠️ الرد اتسجل بس معرفتش أبعته للمستخدم (يمكن قافل البوت).")
+        return
+
+    # ── AWAITING USER FOLLOWUP (reporter's own "↩️ Reply") ───────
+    # Keyed by real_uid (the reporter, in their own DM — no anonymous-
+    # admin identity issue here, this only ever runs in a private chat).
+    pending_followup = AWAITING_USER_FOLLOWUP.pop(real_uid, None)
+    if pending_followup:
+        group_message_id = pending_followup["group_message_id"]
+        thread = REPORT_THREADS.get(group_message_id)
+        if not thread:
+            await update.message.reply_text("⚠️ الـ report ده مش لاقيه دلوقتي (يمكن البوت اتعمله restart).")
+            return
+        if thread.get("closed"):
+            await update.message.reply_text("⚠️ الـ report ده اتقفل، مينفعش ترد عليه تاني.")
+            return
+        _append_report_message(thread, "user", text)
+        await update.message.reply_text("✅ اتبعت للأدمن.")
+        await _refresh_report_thread(context, group_message_id, thread)
+        return
+
+    # ── AWAITING BROADCAST MESSAGE (/broadcast composer) ──────────
+    # Set only via the admin-gated "✏️ Set Message" button — the is_admin
+    # check here is just defense in depth, not the actual access control.
+    if AWAITING_BROADCAST_MESSAGE.pop(real_uid, None):
+        if not is_admin(update):
+            return
+        draft = BROADCAST_DRAFTS.setdefault(real_uid, {"audience": "all", "text": None})
+        # Use the untouched message text (not the stripped `text`) so the
+        # entity offsets line up, then convert its formatting to HTML.
+        draft["text"] = _broadcast_text_from_message(update.message.text, update.message.entities)
+        draft["media"] = None   # a typed message replaces any attachment set earlier
+        body, markup = _broadcast_composer_view(real_uid)
+        await update.message.reply_text(body, parse_mode=ParseMode.HTML, reply_markup=markup)
+        return
+
+    # ── AWAITING DEV PANEL — 🔢 Set year (typed nickname/ID) ───────
+    # Set only via the creator-gated devpanel_setyear callback — the
+    # is_creator check here is defense in depth, not the real gate.
+    if AWAITING_DEVPANEL_SETYEAR.pop(real_uid, None):
+        if not is_creator(update):
+            return
+        await _prompt_set_year(update.message, text)
+        return
+
+    # ── AWAITING DEV PANEL — 👥 Users (typed nickname/ID) ───────────
+    if AWAITING_DEVPANEL_MYSTATS.pop(real_uid, None):
+        if not is_creator(update):
+            return
+        target_id = _resolve_user_ref(text)
+        if target_id is None:
+            await update.message.reply_text(f"⚠️ مش لاقي حد بالاسم/الـ ID ده: {html.escape(text)}")
+            return
+        await _send_mystats(context, target_id, update.message)
+        return
+
+    # ── AWAITING SEARCH QUERY (🔎 Search Content) ─────────────────
+    # Set by the search_mod: callback once year (+ module, or "all") is
+    # picked — see button_handler. Keyed the same way (real_uid via
+    # query.from_user.id there, which is the same id as effective_user
+    # here).
+    pending_search = AWAITING_SEARCH_QUERY.pop(real_uid, None)
+    if pending_search:
+        await _send_search_results(context, user_id, pending_search["year"], pending_search["module"], text)
+        return
+
+    # ── AWAITING EQEDIT (/edit_quiz — typed replacement text) ────────
+    # Armed by eqedq:/eqedo:/eqedex: in button_handler. Admin-gated here
+    # too as defense in depth, same as every other admin AWAITING_* flow
+    # above — the real gate is the "eq" prefix check in button_handler.
+    pending_eqedit = AWAITING_EQEDIT.pop(real_uid, None)
+    if pending_eqedit:
+        if not is_admin(update):
+            return
+        await _apply_eqedit(update, context, pending_eqedit, text)
+        return
+
+    # ── AWAITING EQ ATTACH (/edit_quiz → 📎 Add case / image, text half) ──
+    pending_att = AWAITING_EQ_ATTACH.get(real_uid)
+    if pending_att:
+        if not is_admin(update) or not can_edit_year(update, pending_att["year"]):
+            AWAITING_EQ_ATTACH.pop(real_uid, None)
+            return
+        if pending_att["kind"] != "case":
+            await update.message.reply_text("🖼 مستني صورة مش نص — ابعت الصورة، أو دوس Cancel.")
+            return
+        content = text.strip()
+        if not content:
+            return
+        if len(content) > 4000:
+            await update.message.reply_text("⚠️ النص طويل أوي (أقصى حاجة 4000 حرف) — قصّره وابعته تاني.")
+            return
+        AWAITING_EQ_ATTACH.pop(real_uid, None)
+        err = await _apply_eq_attach(context, pending_att, text=content)
+        await update.message.reply_text(
+            err or "✅ اتسجل الـ Case study — هيظهر قبل السؤال ده.",
+            reply_markup=None if err else _eq_att_done_markup(pending_att),
+        )
+        return
+
+    # ── AWAITING EQ SEARCH (/edit_quiz → 🔎 Search Questions) ────────
+    # Armed by eqsrch: in button_handler; admin + year re-checked here as
+    # defense in depth, same as the AWAITING_EQEDIT block above.
+    pending_eqsearch = AWAITING_EQ_SEARCH.pop(real_uid, None)
+    if pending_eqsearch:
+        if not can_edit_year(update, pending_eqsearch["year"]):
+            return
+        await _eq_run_search(context, user_id, real_uid, pending_eqsearch["year"], pending_eqsearch["mod_idx"], text)
+        return
+
+    # ── AWAITING NICKNAME (Settings, or first-ever /start) ───────
+    # Keyed by real_uid (the person's Telegram user id, same key SETTINGS
+    # uses), not the chat id, so this works the same in DMs and groups.
+    awaiting = AWAITING_NICKNAME.get(real_uid)
+    if awaiting:
+        onboarding = (awaiting == "onboarding")
+        del AWAITING_NICKNAME[real_uid]
+        nickname = text[:32].strip()
+        if not nickname:
+            if onboarding:
+                # Still no nickname on file — re-ask instead of falling
+                # through to the settings menu, since there isn't a main
+                # menu to fall back to yet.
+                AWAITING_NICKNAME[real_uid] = "onboarding"
+                await _flow_onboarding_message(
+                    update, context, real_uid,
+                    "⚠️ الاسم فاضي — اكتب اسم تحب أتنادي بيه عليك.",
+                )
+            else:
+                await update.message.reply_text(
+                    "⚠️ الاسم فاضي — جرب تاني.",
+                    reply_markup=settings_menu_keyboard(real_uid),
+                )
+            return
+        if _contains_vulgar_word(nickname):
+            if onboarding:
+                # Same re-ask pattern as the empty-name case above — no
+                # main menu to fall back to yet during onboarding.
+                AWAITING_NICKNAME[real_uid] = "onboarding"
+                await _flow_onboarding_message(
+                    update, context, real_uid,
+                    quizzy_block(QUIZZY_ANGRY_ART, "do you know that i had to make AN ENTIRE FILTER FOR PEOPLE LIKE YOU?!"),
+                    parse_mode=ParseMode.HTML,
+                )
+            else:
+                await update.message.reply_text(
+                    quizzy_block(QUIZZY_ANGRY_ART, "do you know that i had to make AN ENTIRE FILTER FOR PEOPLE LIKE YOU?!"),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=settings_menu_keyboard(real_uid),
+                )
+            return
+        entry = _get_settings_entry(real_uid)
+        entry["nickname"] = nickname
+        await save_settings()
+        await backup_settings_to_channel(context)
+        _get_entry(real_uid)["nickname"] = nickname
+        await save_analytics()
+        await backup_analytics_to_channel(context)
+        if onboarding:
+            # After this step, further onboarding edits happen through the
+            # callback-query buttons themselves (query.edit_message_text),
+            # not this dict, so it's fine to leave the stale entry — the
+            # next first-ever-/start for this user overwrites it anyway.
+            await _flow_onboarding_message(
+                update, context, real_uid,
+                f"{quizzy_block(QUIZZY_HAPPY_ART, f'What a lovely name Dr.{nickname} 🥰')}\n\n"
+                "What Year/Class are you currently in?\n\n",
+                parse_mode=ParseMode.HTML,
+                reply_markup=year_class_keyboard("onboard_yc"),
+            )
+        else:
+            await update.message.reply_text(
+                f"✅ اتسجل! هنناديك <b>{html.escape(nickname)}</b> دلوقتي.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=settings_menu_keyboard(real_uid),
+            )
+        return
+
+    # ── AWAITING REPORT ISSUE TEXT (/report_issue) ───────────────
+    # Keyed by real_uid, same as nickname above. Stages a draft (preview
+    # + Send/Cancel buttons) instead of posting straight to admins — see
+    # _stage_report_draft. Expired waits (see REPORT_ISSUE_AWAIT_TIMEOUT)
+    # fall through and this message is handled normally below instead.
+    report_wait_started = AWAITING_REPORT_ISSUE.pop(real_uid, None)
+    if report_wait_started is not None and time.time() - report_wait_started <= REPORT_ISSUE_AWAIT_TIMEOUT:
+        if not REPORT_ISSUE_GROUP_ID:
+            await update.message.reply_text("⚠️ الميزة دي مش متاحة دلوقتي.")
+            return
+        await _stage_report_draft(update, context, real_uid, text=text, photo_file_id=None)
+        return
+
+
+    # ── AWAITING ADMIN REPLY TEXT (report_reply button) ──────────
+    # Keyed by real_uid normally — but if this group has "remain
+    # anonymous" enabled for admins, a message the admin sends here
+    # arrives with effective_user = GroupAnonymousBot, not the admin's
+    # real Telegram id, even though the earlier button tap (a callback
+    # query, unaffected by anonymous-admin mode) correctly recorded
+    # AWAITING_REPORT_REPLY under the admin's real id. That mismatch was
+    # silently swallowing every reply: the pop-by-real_uid below found
+    # nothing and fell through with no message and no error.
+    #
+    # Fix: only the admin is ever expected to type in this specific
+    # group, so if the message is IN this group at all, resolve the
+    # pending reply by chat rather than strictly requiring real_uid to
+    # match — find whichever AWAITING_REPORT_REPLY entry (there should
+    # only ever be zero or one at a time in practice) exists, regardless
+    # of whose id it's filed under.
+    pending_reply = AWAITING_REPORT_REPLY.pop(real_uid, None)
+    if pending_reply is None and REPORT_ISSUE_GROUP_ID and user_id == REPORT_ISSUE_GROUP_ID and AWAITING_REPORT_REPLY:
+        fallback_uid = next(iter(AWAITING_REPORT_REPLY))
+        pending_reply = AWAITING_REPORT_REPLY.pop(fallback_uid)
+    if pending_reply:
+        group_message_id = pending_reply["group_message_id"]
+        thread = REPORT_THREADS.get(group_message_id)
+        if not thread:
+            await update.message.reply_text("⚠️ الـ report ده مش لاقيه دلوقتي (يمكن البوت اتعمله restart).")
+            return
+        _append_report_message(thread, "admin", text)
+        user_dm_ok = await _refresh_report_thread(context, group_message_id, thread)
+        if not user_dm_ok:
+            await update.message.reply_text("⚠️ الرد اتسجل بس معرفتش أبعته للمستخدم (يمكن قافل البوت).")
+        return
+
+    # ── STORAGE PASSWORD LOOKUP ──────────────────────────────────
+    if update.effective_chat.type == "private":
+        items = STORAGE_INDEX.get(text.lower()) if text.lower() != ONBOARDING_STORAGE_KEY else None
+        if items:
+            for message_ids in items:
+                try:
+                    await context.bot.copy_messages(
+                        chat_id=user_id,
+                        from_chat_id=STORAGE_GROUP_ID,
+                        message_ids=message_ids,
+                    )
+                except Exception as e:
+                    print(f"Storage delivery failed for password lookup: {e}")
+                    await update.message.reply_text(
+                        quizzy_block(QUIZZY_SAD_ART, random.choice(QUIZZY_ERROR_LINES)),
+                        parse_mode=ParseMode.HTML,
+                    )
+            return
+
+    try:
+        blocks = re.split(r"\n\s*\n", text)
+
+        if len(blocks) > MAX_QUESTIONS_PER_MSG:
+            await update.message.reply_text(
+                f"❌ الحد الأقصى {MAX_QUESTIONS_PER_MSG} سؤال في المرة الواحدة"
+            )
+            return
+
+        for block in blocks:
+            block = block.strip()
+            if not block:
+                continue
+
+            # ── WRITTEN ─────────────────────────────────────────
+            written = parse_written_strict(block)
+            if written:
+                title, content = written
+                await update.message.reply_text(
+                    f"*{title}*\n||{content}||",
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                )
+                continue
+
+            # ── MCQ ─────────────────────────────────────────────
+            lines = normalize_mcq_block(block)
+
+            if _looks_like_mcq_attempt(lines) and get_nickname(real_uid) is None:
+                # Don't let someone who never finished onboarding create
+                # quiz content anonymously — send them through /start
+                # (which asks for a name) first, same as every other
+                # identified feature in the bot already requires.
+                await update.message.reply_text(
+                    "👋 لازم تعمل /start الأول وتحط اسمك قبل ما تقدر تعمل أسئلة."
+                )
+                return
+
+            if len(lines) < 3:
+                # Only warn if this looks like a genuine (but broken)
+                # attempt at a question — i.e. it has at least one
+                # option-style line (a)/b)/1. ...). Plain chat text never
+                # matches that, so "hi"/"شكرا"/etc. pass through silently
+                # instead of getting flagged as a format error, while
+                # someone who typed a)/b)/c) but got the shape wrong
+                # still gets pointed at the right format.
+                if _looks_like_mcq_attempt(lines):
+                    await update.message.reply_text(
+                        "⚠️ <b>الصياغة غلط!</b>\n\n"
+                        "الشكل الصح هو:\n"
+                        "<code>What is the powerhouse of the cell?\n"
+                        "a) Nucleus\n"
+                        "b) Mitochondria z  ← علّم الصح بـ z\n"
+                        "c) Ribosome\n"
+                        "ex: Mitochondria produces the cell's ATP (اختياري)</code>",
+                        parse_mode=ParseMode.HTML,
+                    )
+                continue
+
+            question, raw_options, correct_index, explanation = parse_mcq_lines(lines)
+
+            if correct_index is None or correct_index >= len(raw_options):
+                await update.message.reply_text(
+                    "⚠️ <b>ما فيش إجابة صح!</b>\n\n"
+                    "علّم الإجابة الصحيحة بـ <code>z</code> في نهايتها، زي كده:\n"
+                    "<code>b) Mitochondria z</code>",
+                    parse_mode=ParseMode.HTML,
+                )
+                continue
+
+            # An image sent (with no caption / unparseable caption) just
+            # before this message is paired with this question.
+            pending_img = PENDING_IMAGE.pop(user_id, None)
+
+            question, raw_options = _apply_qz_watermark(question, raw_options, real_uid)
+            await _save_watermark_state()
+
+            await deliver_quiz(
+                context, user_id, question, raw_options, correct_index,
+                explanation=explanation, image_path=pending_img,
+            )
+            events = await _record_activity(real_uid, questions_delta=1)
+            _update_telegram_name(real_uid, update.effective_user)
+            await react_random(update, context)
+            await _announce_events(context, user_id, events)
+            await backup_analytics_to_channel(context)
+
+    except Exception as e:
+        print("ERROR:", e)
+
+# ═══════════════════════════════════════════════════════════════
+# QUIZZY POPUP EASTER EGGS
+#
+# A handful of toasts (query.answer(text), show_alert left False — a small
+# banner that fades by itself, no OK button) on top of specific button
+# taps — Quizzy (the bot's cat persona) getting a word in on top of
+# whatever that button normally does. None of these ever block or change
+# the underlying action. They're all decided in one place, _tap_toast,
+# and shown by the single answer() at the top of button_handler — a tap
+# can only be answered once, so a toast can't be raised from inside a
+# branch after that.
+#
+# Two of the five scenarios this was scoped for don't fit this
+# mechanism at all, because a toast only exists as a response to a
+# button tap (a callback query) — there's no equivalent for a poll answer:
+#   - "User gets 10/10" happens when the LAST question of a Daily
+#     Quiz is answered — that's a poll vote (handle_poll_answer),
+#     not a button tap, so there's no callback query to answer with
+#     a popup. The perfect-score line is appended to the completion
+#     summary message text instead — same joke, different delivery,
+#     see _finish-daily-quiz block in handle_poll_answer.
+#   - "User opens quizzes around 3–5 AM" is applied at every place a
+#     user actually starts a quiz session via a button tap (Daily
+#     Quiz, a lecture, a Mistakes Bank retake) rather than at every
+#     screen that merely mentions quizzes, since "opens quizzes" reads
+#     as starting one, not browsing a menu.
+# ═══════════════════════════════════════════════════════════════
+QUIZZY_LATE_NIGHT_START_HOUR = 3   # inclusive
+QUIZZY_LATE_NIGHT_END_HOUR   = 5   # exclusive — 3:00–4:59 local (DAILY_QUIZ_TZ)
+QUIZZY_LATE_NIGHT_MSG        = "🐱 Bro just go to sleep."
+QUIZZY_ALREADY_DONE_MSG      = "🐱 didn't I already give you one..."
+QUIZZY_PERFECT_SCORE_LINE    = "🐱 I would say I'm proud of you, but I'm literally a cat."
+QUIZZY_MISTAKES_EMPTY_MSG    = "🐱 Does this make you bankrupt?"
+QUIZZY_MISTAKES_HIGH_MSG     = "🐱 they say mistakes make you stronger, how much can you bench-press?"
+# Toasts for the non-Quizzy taps that used to be OK-button alerts (see _tap_toast)
+TOAST_SR_NEEDS_AUTO_NEXT   = "⚠️ Spaced Repetition لازم يكون معاه Auto-Next شغال"
+TOAST_AUTO_NEXT_OFF_SR     = "⚠️ قفلت Auto-Next، فـ Spaced Repetition مش هيشتغل لحد ما ترجعه"
+TOAST_BANK_ALREADY_EMPTY   = "🎉 بنك الأخطاء بتاعك فاضي أصلاً!"
+TOAST_BOOKMARKS_ALREADY_EMPTY = "مفيش أسئلة محفوظة أصلاً! ❤️"
+TOAST_COMING_SOON        = "ما تصبر على رزقك يا ضاكتور الله"
+TOAST_REPORT_CLOSED        = "⚠️ الـ report ده اتقفل، مينفعش ترد عليه تاني."
+TOAST_REPORT_NOT_YOURS     = "⚠️ مش قادر أعمل كده."
+QUIZZY_MISTAKES_HIGH_THRESHOLD = 10   # mistake count at/above which the bench-press jab fires
+
+def _quizzy_is_late_night() -> bool:
+    """Same clock/timezone as the insomniac Extra achievement
+    (DAILY_QUIZ_TZ), but its own separate 3–5 AM window rather than
+    reusing that achievement's 2–5 AM — a popup and an Extra are
+    different things and don't need to agree on the exact cutoff."""
+    hour = datetime.now(DAILY_QUIZ_TZ).hour
+    return QUIZZY_LATE_NIGHT_START_HOUR <= hour < QUIZZY_LATE_NIGHT_END_HOUR
+
+# ── Onboarding toasts ──────────────────────────────────────────────
+# Quizzy's onboarding quips are shown as a toast (query.answer(text) with
+# show_alert left False): a banner that appears at the top of the chat and
+# disappears by itself, instead of a message that stays in the chat. A
+# toast only exists as the answer to a button tap, so this covers the two
+# quips that ARE taps — the one after picking a Year/Class, and the
+# welcome line when tapping 🗣️🗣️🔥 يلا بينا. The typed-/start greetings
+# have no callback query to answer, so they remain ordinary messages.
+# Telegram truncates a toast at 200 characters; every line here is far under.
+ONBOARDING_YEAR_QUIPS = {
+    "y1": "Year 1? You are a new-comer! Oh You will love it here.",
+    "y2": "Year 2? Oh you are in for a trip! But don't worry it will be fun. 😉",
+    "y3": "Year 3? Wouldn't that be... Oh! You are becoming a Semi-Senior soon!!",
+}
+
+def _tap_toast(callback_data: str | None, user_id: int) -> str | None:
+    """Quizzy's toast for this button tap, or None for no toast (the normal
+    case — None makes query.answer() behave exactly as a bare answer() did).
+
+    Every Quizzy popup lives here, decided BEFORE the handler runs, because
+    Telegram takes one answer per tap and button_handler answers first
+    thing. Doing the lookup here (rather than answering again from inside
+    the branch) is what makes them show at all.
+
+    Never raises: a failure looking up the bank/date must not take down
+    the tap it's decorating, so any error just means no toast."""
+    data = callback_data or ""
+    try:
+        # ── onboarding ──
+        if data.startswith("onboard_yc:"):
+            quip = ONBOARDING_YEAR_QUIPS.get(data.split(":", 1)[1])
+            return f"🐱 {quip}" if quip else None
+        # (onboard_go — "يلا بينا" — has no toast: it now just sends the
+        # same welcome menu /start does, Quizzy's line included.)
+
+        # ── Daily Quiz: "already done today" outranks the late-night nudge —
+        # the one place that race surfaces is a stale Start button tapped
+        # after the quiz was completed some other way, and it's the more
+        # specific joke for that exact case.
+        if data == "daily_quiz_begin":
+            if get_daily_quiz_last_date(user_id) == _today():
+                return QUIZZY_ALREADY_DONE_MSG
+            return QUIZZY_LATE_NIGHT_MSG if _quizzy_is_late_night() else None
+
+        # ── Mistakes Bank menu: empty / very full ──
+        if data == "mistakes_bank_menu":
+            count = len(_scoped_mistakes_bank(user_id))
+            if count == 0:
+                return QUIZZY_MISTAKES_EMPTY_MSG
+            if count >= QUIZZY_MISTAKES_HIGH_THRESHOLD:
+                return QUIZZY_MISTAKES_HIGH_MSG
+            return None
+
+        # ── starting a lecture quiz / a Mistakes Bank or Bookmarks retake at 3–5 AM ──
+        if data.startswith("lecturego:") or data in ("mistakes_retake", "bookmarks_retake"):
+            return QUIZZY_LATE_NIGHT_MSG if _quizzy_is_late_night() else None
+
+        # ── Settings: the Spaced Repetition / Auto-Next mismatch warnings.
+        # The handler flips the toggle AFTER this runs, so this predicts
+        # the outcome from the CURRENT state: turning SR on while auto-next
+        # is off, or turning auto-next off while SR is on. (Safe to read
+        # ahead of the handler: button_handler is serialized per user, so
+        # nothing can change the state in between.)
+        if data == "toggle_spaced_repetition":
+            turning_on = not get_spaced_repetition_enabled(user_id)
+            return TOAST_SR_NEEDS_AUTO_NEXT if (turning_on and not get_auto_next_enabled(user_id)) else None
+        if data == "toggle_auto_next":
+            turning_off = get_auto_next_enabled(user_id)
+            return TOAST_AUTO_NEXT_OFF_SR if (turning_off and get_spaced_repetition_enabled(user_id)) else None
+
+        # ── Mistakes Bank menu: Clear Mistakes Bank ──
+        if data == "clear_mistakes_bank_ask":
+            # same scoped count the handler uses for its own empty check
+            return TOAST_BANK_ALREADY_EMPTY if not _scoped_mistakes_bank(user_id) else None
+        if data == "clear_mistakes_bank_yes":
+            # The handler deletes exactly _scoped_mistakes_bank(user_id)
+            # (this user's entries in the /daily_module scope, or all of
+            # theirs with no scope) — the same set the confirm screen
+            # counted — so count that same set.
+            cleared = len(_scoped_mistakes_bank(user_id))
+            return f"✅ اتمسح {cleared} سؤال من بنك الأخطاء بتاعك."
+
+        # ── Main menu: 🔥COMING SOON🔥 (toast only, nothing else happens) ──
+        if data == "coming_soon":
+            return TOAST_COMING_SOON
+
+        # ── Bookmarks: Clear Bookmarks ──
+        if data == "clear_bookmarks_ask":
+            return TOAST_BOOKMARKS_ALREADY_EMPTY if not _bookmark_entries(user_id) else None
+        if data == "clear_bookmarks_yes":
+            return f"✅ اتمسح {len(_bookmark_entries(user_id))} سؤال من الـ Bookmarks بتاعتك."
+
+        # ── Report follow-up: the reporter's own "↩️ Reply" button ──
+        if data.startswith("report_user_reply:"):
+            thread = REPORT_THREADS.get(int(data.split(":", 1)[1]))
+            if not thread or thread.get("closed"):
+                return TOAST_REPORT_CLOSED
+            if thread["user_id"] != user_id:
+                return TOAST_REPORT_NOT_YOURS
+            return None
+    except Exception as e:
+        print(f"TOAST: couldn't decide a toast for {data!r}: {e}")
+    return None
+
+# ═══════════════════════════════════════════════════════════════
+# INLINE BUTTON HANDLER
+# ═══════════════════════════════════════════════════════════════
+def _eq_resolve_lecture(year, mod_idx, subj_idx, lec_idx):
+    """Shared lookup+validation for the lecture level of /edit_quiz
+    (eqlecture:/eqmsstart: and friends) — mirrors the inline checks each
+    eq*: branch used to repeat by hand. Returns
+    (error_text_or_None, entry, lecture_key, ids)."""
+    if year not in YEARS or not year_channel_id(year):
+        return "⚠️ السنة دي مش متاحة دلوقتي.", None, None, None
+    modules = ready_modules(year)
+    if mod_idx >= len(modules):
+        return "⚠️ الموديول ده مش موجود دلوقتي.", None, None, None
+    module = modules[mod_idx]
+    subjects = ready_subjects(year, module)
+    if subj_idx >= len(subjects):
+        return "⚠️ المادة دي مش موجودة دلوقتي.", None, None, None
+    subject = subjects[subj_idx]
+    names = ready_lecture_keys(year, module, subject)
+    if lec_idx >= len(names):
+        return "⚠️ المحاضرة دي مش موجودة دلوقتي.", None, None, None
+    lecture_key = names[lec_idx]
+    entry = QUIZ_INDEX[year][lecture_key]
+    return None, entry, lecture_key, entry["ids"]
+
+def _eq_resolve(year, mod_idx, subj_idx, lec_idx, mid):
+    """Shared lookup+validation for the question level of /edit_quiz
+    (eqedit:/eqedq:/eqedo:/eqedex:/eqedc:/eqedcpick: below), built on
+    _eq_resolve_lecture. Returns
+    (error_text_or_None, entry, lecture_key, ids, pid, status) where pid
+    is the poll_id key into QUIZ_POLL_STATUS[year] and status is that
+    entry itself (question/options/correct_option_id/explanation/...)."""
+    err, entry, lecture_key, ids = _eq_resolve_lecture(year, mod_idx, subj_idx, lec_idx)
+    if err:
+        return err, None, None, None, None, None
+    if mid not in ids:
+        return "⚠️ السؤال ده مش موجود دلوقتي — يمكن اتعدل من حتة تانية.", None, None, None, None, None
+    pid = next((p for p, v in QUIZ_POLL_STATUS[year].items() if v["message_id"] == mid), None)
+    status = QUIZ_POLL_STATUS[year].get(pid) if pid else None
+    if not status or not status.get("question") or not status.get("options"):
+        return "⚠️ مفيش بيانات محفوظة للسؤال ده يتعدل (سؤال قديم قبل ما التسجيل يتفعل).", None, None, None, None, None
+    return None, entry, lecture_key, ids, pid, status
+
+EQ_SEARCH_LIMIT = 100        # max matches listed per /edit_quiz search
+EQ_SEARCH_PAGE_SIZE = 10     # matches per page of the results list
+
+def _eq_search_questions(year: str, mod_idx: int | None, query_text: str) -> list:
+    """Finds poll questions in `year` (optionally only module #mod_idx of
+    ready_modules(year)) whose question text OR any option contains
+    query_text (same Arabic-aware normalization as user-side Search
+    Content). Each match carries the mod/subj/lec indices the existing
+    eqq:/eqedit: callbacks need. Only lectures /edit_quiz itself lists
+    (ready_lecture_keys: closed + non-empty) are searched, so every hit is
+    reachable through the normal flow too. Capped at EQ_SEARCH_LIMIT."""
+    needle = _normalize_for_filter(query_text)
+    if not needle:
+        return []
+    modules = ready_modules(year)
+    status_by_mid = _poll_status_index(year)
+    matches = []
+    for m_idx, module in enumerate(modules):
+        if mod_idx is not None and m_idx != mod_idx:
+            continue
+        for s_idx, subject in enumerate(ready_subjects(year, module)):
+            for l_idx, lecture_key in enumerate(ready_lecture_keys(year, module, subject)):
+                entry = QUIZ_INDEX[year][lecture_key]
+                for mid in entry["ids"]:
+                    status = status_by_mid.get(mid)
+                    question = status.get("question") if status else None
+                    if not question:
+                        continue
+                    haystack = " ".join([str(question)] + [str(o) for o in (status.get("options") or [])])
+                    if needle not in _normalize_for_filter(haystack):
+                        continue
+                    matches.append({
+                        "mid": mid, "question": str(question),
+                        "lecture_name": entry.get("name", "؟"), "subject": subject,
+                        "mod_idx": m_idx, "subj_idx": s_idx, "lec_idx": l_idx,
+                    })
+                    if len(matches) >= EQ_SEARCH_LIMIT:
+                        return matches
+    return matches
+
+def _eq_search_back_markup(year: str, mod_idx: int | None) -> InlineKeyboardMarkup:
+    back = f"eqyr:{year}" if mod_idx is None else f"eqmodule:{year}:{mod_idx}"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔎 Search Again", callback_data=f"eqsrch:{year}:{'all' if mod_idx is None else mod_idx}")],
+        [InlineKeyboardButton("🔙 رجوع", callback_data=back)],
+    ])
+
+def _eq_search_scope(year: str, mod_idx: int | None) -> str:
+    if mod_idx is None:
+        return f"{year_label(year)} — All Modules"
+    modules = ready_modules(year)
+    return f"{year_label(year)} — {module_label(modules[mod_idx]) if mod_idx < len(modules) else '؟'}"
+
+def _eq_search_list_view(state: dict, page: int) -> tuple[str, InlineKeyboardMarkup]:
+    """One page of the /edit_quiz search results: numbered snippets +
+    number buttons (eqsrchpick:), ⬅️/➡️ paging, Search Again / Back."""
+    matches = state["matches"]
+    pages = max(1, (len(matches) + EQ_SEARCH_PAGE_SIZE - 1) // EQ_SEARCH_PAGE_SIZE)
+    page = max(0, min(page, pages - 1))
+    state["page"] = page
+    start = page * EQ_SEARCH_PAGE_SIZE
+    chunk = matches[start:start + EQ_SEARCH_PAGE_SIZE]
+
+    capped = f" (أول {EQ_SEARCH_LIMIT} بس — دقق البحث أكتر)" if len(matches) >= EQ_SEARCH_LIMIT else ""
+    page_note = f" — صفحة {page + 1}/{pages}" if pages > 1 else ""
+    lines = [
+        f"✏️ 📚 {_eq_search_scope(state['year'], state['mod_idx'])}",
+        f"🔎 \"{html.escape(state['query'][:80])}\"",
+        "",
+        f"✅ لاقيت {len(matches)} سؤال{capped}{page_note}",
+        "اختار رقم السؤال عشان تفتحه (تحذفه أو تعدله) 👇",
+        "",
+    ]
+    for i, m in enumerate(chunk, start + 1):
+        snippet = " ".join(m["question"].split())
+        if len(snippet) > 90:
+            snippet = snippet[:90].rstrip() + "…"
+        lines.append(f"<b>{i}.</b> {html.escape(snippet)}")
+        lines.append(f"     ↳ {subject_label(m['subject'])} — {html.escape(m['lecture_name'])}")
+
+    token = state["token"]
+    nums = [
+        InlineKeyboardButton(str(i), callback_data=f"eqsrchpick:{token}:{m['mid']}")
+        for i, m in enumerate(chunk, start + 1)
+    ]
+    rows = [nums[j:j + 5] for j in range(0, len(nums), 5)]
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("⬅️ السابق", callback_data=f"eqsrchpage:{token}:{page - 1}"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton("التالي ➡️", callback_data=f"eqsrchpage:{token}:{page + 1}"))
+        rows.append(nav)
+    rows.extend(_eq_search_back_markup(state["year"], state["mod_idx"]).inline_keyboard)
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+async def _eq_run_search(context: ContextTypes.DEFAULT_TYPE, chat_id: int, admin_id: int,
+                         year: str, mod_idx: int | None, query_text: str) -> None:
+    matches = _eq_search_questions(year, mod_idx, query_text)
+    if not matches:
+        EQ_SEARCH_RESULTS.pop(admin_id, None)
+        await context.bot.send_message(
+            chat_id,
+            f"✏️ 📚 {_eq_search_scope(year, mod_idx)}\n🔎 \"{html.escape(query_text[:80])}\"\n\n📭 مفيش أسئلة اتطابقت مع البحث ده.",
+            parse_mode=ParseMode.HTML, reply_markup=_eq_search_back_markup(year, mod_idx),
+        )
+        return
+    state = {"token": secrets.token_hex(3), "year": year, "mod_idx": mod_idx,
+             "query": query_text, "matches": matches, "page": 0}
+    EQ_SEARCH_RESULTS[admin_id] = state
+    text, markup = _eq_search_list_view(state, 0)
+    await context.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+def _eq_att_lecture_of(year: str, mid: int):
+    """(lecture_key, entry) of the lecture currently holding poll `mid`, or (None, None)."""
+    for k, v in QUIZ_INDEX.get(year, {}).items():
+        if mid in v.get("ids", []):
+            return k, v
+    return None, None
+
+def _eq_att_menu(year: str, mod_idx: int, subj_idx: int, lec_idx: int, mid: int):
+    """Text + keyboard of the 📎 case/image submenu for one existing question.
+    Returns (error_text_or_None, text, markup)."""
+    err, entry, lecture_key, ids = _eq_resolve_lecture(year, mod_idx, subj_idx, lec_idx)
+    if err:
+        return err, None, None
+    if mid not in ids:
+        return "⚠️ السؤال ده مش موجود دلوقتي — يمكن اتعدل من حتة تانية.", None, None
+    status = _poll_status_index(year).get(mid) or {}
+    question = " ".join(str(status.get("question") or "؟؟؟").split())
+    if len(question) > 150:
+        question = question[:150].rstrip() + "…"
+    case = next((c for c in (entry.get("poll_case_studies") or []) if c["mid"] == mid), None)
+    image = next((i for i in (entry.get("poll_images") or []) if i["mid"] == mid), None)
+    idx = f"{year}:{mod_idx}:{subj_idx}:{lec_idx}:{mid}"
+    case_state = f"✅ موجود ({len(case['content'])} حرف)" if case else "—"
+    text = (
+        f"📎 <b>Case study / صورة</b> — {html.escape(entry['name'])}\n\n"
+        f"❓ {html.escape(question)}\n\n"
+        f"📝 Case study: {case_state}\n"
+        f"🖼 صورة: {'✅ موجودة' if image else '—'}\n\n"
+        "اللي هتضيفه بيظهر <b>قبل السؤال ده</b> لما الطالب يبدأ المحاضرة."
+    )
+    rows = [
+        [InlineKeyboardButton(f"📝 {'Replace' if case else 'Add'} case study", callback_data=f"eqattc:{idx}")],
+        [InlineKeyboardButton(f"🖼 {'Replace' if image else 'Add'} image", callback_data=f"eqatti:{idx}")],
+    ]
+    if case:
+        rows.append([InlineKeyboardButton("🗑 Remove case study", callback_data=f"eqattxc:{idx}")])
+    if image:
+        rows.append([InlineKeyboardButton("🗑 Remove image", callback_data=f"eqattxi:{idx}")])
+    rows.append([InlineKeyboardButton("🔙 رجوع للسؤال", callback_data=f"eqq:{idx}")])
+    return None, text, InlineKeyboardMarkup(rows)
+
+async def _apply_eq_attach(context: ContextTypes.DEFAULT_TYPE, pending: dict, *, text: str | None = None,
+                           photo=None, spoiler: bool = False) -> str | None:
+    """Saves a case study (text) or image (photo = a Telegram PhotoSize) onto
+    the existing question pending["mid"], replacing any earlier one of the
+    same kind. Images are reposted into the year's channel first so we keep
+    that permanent copy's file_id (same durability trick as
+    _capture_add_lecture_poll; falls back to the admin's own upload if the
+    channel post fails). Returns an error string, or None on success."""
+    year, mid = pending["year"], pending["mid"]
+    lecture_key, entry = _eq_att_lecture_of(year, mid)
+    if entry is None:
+        return "⚠️ السؤال ده مش موجود دلوقتي — يمكن اتشال من حتة تانية."
+    if text is not None:
+        entry["poll_case_studies"] = [c for c in (entry.get("poll_case_studies") or []) if c["mid"] != mid] + [
+            {"mid": mid, "content": text}
+        ]
+    else:
+        stored = {"file_id": photo.file_id, "file_unique_id": photo.file_unique_id, "spoiler": spoiler}
+        channel_id = year_channel_id(year)
+        if channel_id:
+            try:
+                sent = await context.bot.send_photo(chat_id=channel_id, photo=photo.file_id, has_spoiler=spoiler)
+                ch = sent.photo[-1]
+                stored = {"file_id": ch.file_id, "file_unique_id": ch.file_unique_id, "spoiler": spoiler}
+            except Exception as e:
+                print(f"EQ ATTACH channel backup post failed for {lecture_key} ({year}): {e}")
+        entry["poll_images"] = [i for i in (entry.get("poll_images") or []) if i["mid"] != mid] + [
+            {"mid": mid, **stored}
+        ]
+    await save_quiz_index(year)
+    await backup_quiz_to_channel(context, year)
+    return None
+
+def _eq_att_done_markup(pending: dict) -> InlineKeyboardMarkup:
+    idx = f"{pending['year']}:{pending['mod_idx']}:{pending['subj_idx']}:{pending['lec_idx']}:{pending['mid']}"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📎 Case / image", callback_data=f"eqatt:{idx}")],
+        [InlineKeyboardButton("🔙 رجوع للسؤال", callback_data=f"eqq:{idx}")],
+    ])
+
+async def _render_eq_edit_menu(query, year, mod_idx, subj_idx, lec_idx, mid, entry, status):
+    """Draws the eqedit: submenu (question/choices/correct-choice/
+    explanation) for one poll. Shared by eqedit: itself and by every
+    flow that lands back on it (eqeditcancel:/eqedcpick:/_apply_eqedit)."""
+    options_preview = "\n".join(
+        f"{string.ascii_uppercase[i]}) {'✅ ' if i == status.get('correct_option_id') else ''}{opt}"
+        for i, opt in enumerate(status["options"])
+    )
+    buttons = [
+        [InlineKeyboardButton("✏️ Edit question", callback_data=f"eqedq:{year}:{mod_idx}:{subj_idx}:{lec_idx}:{mid}")],
+        [InlineKeyboardButton("🔤 Edit choices", callback_data=f"eqedo:{year}:{mod_idx}:{subj_idx}:{lec_idx}:{mid}")],
+        [InlineKeyboardButton("✅ Choose different correct choice", callback_data=f"eqedc:{year}:{mod_idx}:{subj_idx}:{lec_idx}:{mid}")],
+        [InlineKeyboardButton("💬 Edit explanation", callback_data=f"eqedex:{year}:{mod_idx}:{subj_idx}:{lec_idx}:{mid}")],
+        [InlineKeyboardButton("🔙 رجوع", callback_data=f"eqq:{year}:{mod_idx}:{subj_idx}:{lec_idx}:{mid}")],
+    ]
+    await query.edit_message_text(
+        f"✏️ <b>{entry['name']}</b>\n\n"
+        f"❓ {html.escape(status['question'])}\n\n{html.escape(options_preview)}\n\n"
+        f"💬 {html.escape(status.get('explanation') or '(مفيش explanation)')}\n\n"
+        "اختار حاجة تعدلها:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+EQ_LIST_PAGE_SIZE = 40   # threshold (question count) above which the
+                          # /edit_quiz "اختار رقم السؤال" screen splits into
+                          # two messages instead of one — sized so this only
+                          # kicks in for a genuinely long lecture: 40
+                          # questions x ~75 chars worst case (60-char preview
+                          # + numbering + blank line) is well under
+                          # Telegram's 4096-char message limit, so a
+                          # normal-sized lecture always fits in a single
+                          # message — see the "if total <= EQ_LIST_PAGE_SIZE"
+                          # guard below.
+
+def _eq_lecture_list_view(year, mod_idx, subj_idx, lec_idx, lecture_key, entry):
+    """Builds the /edit_quiz "اختار رقم السؤال اللي عايز تعدله" screen for a
+    lecture — first 60 chars of each question (blank line between), plus a
+    numbered grid of buttons. Returns a list of one or two (text, markup)
+    parts: a short lecture fits in a single message (markup included); a
+    long one is split into two messages instead — the first carries just
+    the first half of the question list as plain text (markup=None), the
+    second carries the second half of the list PLUS the full button grid
+    for every question (both halves) and the action buttons. Callers must
+    send/edit part 1 first, then send part 2 as a follow-up message when
+    it's present. callback_data on each numbered button carries the
+    question's own immutable channel message_id (mid), NOT its position in
+    `ids`, since positions shift whenever an earlier question in this same
+    lecture gets deleted (see eqq:/eqdel:/eqins: further down, which all
+    look the question up by mid rather than trusting an index)."""
+    ids = entry["ids"]
+    total = len(ids)
+
+    poll_status_by_mid = {v["message_id"]: v for v in QUIZ_POLL_STATUS[year].values() if v["lecture"] == lecture_key}
+    all_lines = []
+    number_buttons, row = [], []
+    for i, mid in enumerate(ids, 1):
+        status = poll_status_by_mid.get(mid)
+        preview = html.escape(status["question"][:60]) if status and status.get("question") else "؟؟؟"
+        all_lines.append(f"{i}. {preview}")
+        row.append(InlineKeyboardButton(str(i), callback_data=f"eqq:{year}:{mod_idx}:{subj_idx}:{lec_idx}:{mid}"))
+        if len(row) == 6:
+            number_buttons.append(row)
+            row = []
+    if row:
+        number_buttons.append(row)
+
+    # Written (unscored) entries — kept in entry["written"], separate from
+    # the polls in ids — listed after the polls as W1, W2, ... Tapping one
+    # opens its own preview with a delete button (eqw:/eqwdel: below).
+    w_row = []
+    for j, w in enumerate(entry.get("written") or [], 1):
+        wid = w.get("id")
+        label = html.escape(str(w.get("title") or w.get("content") or "؟؟؟")[:60])
+        all_lines.append(f"📝 W{j}. {label}")
+        if wid is None:
+            continue
+        w_row.append(InlineKeyboardButton(f"📝W{j}", callback_data=f"eqw:{year}:{mod_idx}:{subj_idx}:{lec_idx}:{wid}"))
+        if len(w_row) == 4:
+            number_buttons.append(w_row)
+            w_row = []
+    if w_row:
+        number_buttons.append(w_row)
+    total = len(all_lines)   # polls + written, for the split-in-two threshold below
+
+    number_buttons.append([InlineKeyboardButton(
+        "➕ Tail poll", callback_data=f"eqtail:{year}:{mod_idx}:{subj_idx}:{lec_idx}"
+    )])
+    if ids:
+        number_buttons.append([InlineKeyboardButton(
+            "🗑 اختار أكتر من سؤال للحذف", callback_data=f"eqmsstart:{year}:{mod_idx}:{subj_idx}:{lec_idx}"
+        )])
+    number_buttons.append([InlineKeyboardButton("🔙 رجوع للمحاضرات", callback_data=f"eqsubject:{year}:{mod_idx}:{subj_idx}")])
+    full_markup = InlineKeyboardMarkup(number_buttons)
+
+    header = f"✏️ <b>{entry['name']}</b> — اختار رقم السؤال اللي عايز تعدله:\n\n"
+    if total <= EQ_LIST_PAGE_SIZE:
+        return [(header + "\n\n".join(all_lines), full_markup)]
+
+    split_at = -(-total // 2)   # ceil(total/2) — divide the list evenly between the two messages
+    part1_text = header + "\n\n".join(all_lines[:split_at])
+    part2_text = (
+        f"✏️ <b>{entry['name']}</b> (تابع):\n\n"
+        + "\n\n".join(all_lines[split_at:])
+    )
+    return [(part1_text, None), (part2_text, full_markup)]
+
+def _eqms_keyboard(year, lecture_key, entry, selected: set, page: int = 1):
+    """Renders the eqmsstart:/eqmstoggle: multiselect-delete view: the
+    same numbered question list eqlecture: shows, but as togglable
+    checkbox buttons, plus a confirm/cancel row. Paginated the same way
+    (EQ_LIST_PAGE_SIZE/page) and for the same reason — a long lecture's
+    full list can trip Telegram's message-length limit. The "احذف
+    المختار" count always reflects every selected question across every
+    page, not just the one currently shown, since `selected` is the
+    session-wide set."""
+    ids = entry["ids"]
+    total = len(ids)
+    max_page = max(1, (total + EQ_LIST_PAGE_SIZE - 1) // EQ_LIST_PAGE_SIZE)
+    page = max(1, min(page, max_page))
+    start = (page - 1) * EQ_LIST_PAGE_SIZE
+    page_items = list(enumerate(ids, 1))[start:start + EQ_LIST_PAGE_SIZE]
+
+    poll_status_by_mid = {v["message_id"]: v for v in QUIZ_POLL_STATUS[year].values() if v["lecture"] == lecture_key}
+    lines, number_buttons, row = [], [], []
+    for i, mid in page_items:
+        status  = poll_status_by_mid.get(mid)
+        preview = html.escape(status["question"][:60]) if status and status.get("question") else "؟؟؟"
+        mark    = "✅" if mid in selected else "⬜"
+        lines.append(f"{mark} {i}. {preview}")
+        row.append(InlineKeyboardButton(f"{mark}{i}", callback_data=f"eqmstoggle:{mid}"))
+        if len(row) == 6:
+            number_buttons.append(row)
+            row = []
+    if row:
+        number_buttons.append(row)
+
+    nav = []
+    if page > 1:
+        nav.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"eqmspage:{page-1}"))
+    if page < max_page:
+        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"eqmspage:{page+1}"))
+    if nav:
+        number_buttons.append(nav)
+
+    number_buttons.append([
+        InlineKeyboardButton(f"🗑 احذف المختار ({len(selected)})", callback_data="eqmsconfirm"),
+        InlineKeyboardButton("❌ إلغاء", callback_data="eqmscancel"),
+    ])
+    page_note = f" (صفحة {page}/{max_page})" if max_page > 1 else ""
+    text = (
+        f"🗑 <b>{entry['name']}</b> — اختار الأسئلة اللي عايز تحذفها (دوس تحددها، وتاني دوسة تشيلها){page_note}:\n\n"
+        + "\n\n".join(lines)
+    )
+    return text, InlineKeyboardMarkup(number_buttons)
+
+async def _eqms_render(query, user_id: int, page: int) -> None:
+    """Shared re-render step for eqmsstart:/eqmspage:/eqmstoggle: — pulls
+    the live lecture for this user's EQMS_SELECTED session, builds the
+    keyboard for `page`, and edits the message.
+
+    Telegram rejects an edit whose text+markup are byte-identical to what's
+    already showing ("message is not modified") — this happens for real
+    here, e.g. select a question then immediately deselect it, landing
+    back on exactly the state eqmsstart: first rendered. Callers all call
+    query.answer() themselves before this runs (clearing the tap's loading
+    spinner immediately, regardless of what happens next), so this can
+    just swallow that one specific error instead of leaving the edit
+    half-done or the spinner stuck."""
+    state = EQMS_SELECTED.get(user_id)
+    if not state:
+        await query.edit_message_text("⚠️ انتهت جلسة الاختيار دي — ابدأ تاني من قايمة الأسئلة.")
+        return
+    err, entry, lecture_key, ids = _eq_resolve_lecture(state["year"], state["mod_idx"], state["subj_idx"], state["lec_idx"])
+    if err:
+        EQMS_SELECTED.pop(user_id, None)
+        await query.edit_message_text(err)
+        return
+    if not ids:
+        EQMS_SELECTED.pop(user_id, None)
+        await query.edit_message_text("📭 مفيش أسئلة نحذف منها.")
+        return
+    state["page"] = page
+    text, markup = _eqms_keyboard(state["year"], lecture_key, entry, state["mids"], page=page)
+    try:
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+    except BadRequest as e:
+        if "message is not modified" not in str(e).lower():
+            raise
+
+async def _apply_eqedit(update: Update, context: ContextTypes.DEFAULT_TYPE, pending: dict, text: str):
+    """Applies a typed eqedq:/eqedo:/eqedex: reply to the saved poll
+    snapshot in QUIZ_POLL_STATUS — same "channel copy stays archival,
+    only the index/status is authoritative" convention eqdel: already
+    uses — then redraws the eqedit: menu so the admin sees the result
+    right away."""
+    real_uid = update.effective_user.id
+    year, mid = pending["year"], pending["mid"]
+    mod_idx, subj_idx, lec_idx = pending["mod_idx"], pending["subj_idx"], pending["lec_idx"]
+    err, entry, lecture_key, ids, pid, status = _eq_resolve(year, mod_idx, subj_idx, lec_idx, mid)
+    if err:
+        await update.message.reply_text(err)
+        return
+
+    kind = pending["kind"]
+    warning = ""
+    if kind == "question":
+        question = text.strip()
+        if not question:
+            await update.message.reply_text("⚠️ السؤال فاضي — جرب تاني.")
+            AWAITING_EQEDIT[real_uid] = pending
+            return
+        QUIZ_POLL_STATUS[year][pid]["question"] = question
+
+    elif kind == "options":
+        new_options = [clean_option(l) for l in text.split("\n") if l.strip()]
+        if len(new_options) < 2:
+            await update.message.reply_text("⚠️ لازم اختيارين على الأقل — جرب تاني.")
+            AWAITING_EQEDIT[real_uid] = pending
+            return
+        QUIZ_POLL_STATUS[year][pid]["options"] = new_options
+        old_correct = status.get("correct_option_id")
+        if old_correct is None or old_correct >= len(new_options):
+            QUIZ_POLL_STATUS[year][pid]["correct_option_id"] = None
+            warning = "\n\n⚠️ الإجابة الصح اتشالت لإن الاختيارات اتغيرت — اختار وحدة جديدة."
+
+    elif kind == "explanation":
+        explanation = text.strip()
+        QUIZ_POLL_STATUS[year][pid]["explanation"] = None if explanation == "-" else explanation[:TELEGRAM_EX_LIMIT]
+
+    await save_quiz_poll_status(year)
+    await backup_quiz_to_channel(context, year)
+
+    status = QUIZ_POLL_STATUS[year][pid]
+    buttons = [[InlineKeyboardButton(
+        "↩️ رجوع لتعديل السؤال ده", callback_data=f"eqedit:{year}:{mod_idx}:{subj_idx}:{lec_idx}:{mid}"
+    )]]
+    await update.message.reply_text(
+        f"✅ اتحفظ.{warning}", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+BOOKMARKS_PAGE_SIZE = 5
+
+def _mistakes_bank_menu_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Text + keyboard of the 🧠 Mistakes Bank menu. Shared by the menu
+    button and the post-clear refresh, so both always look the same."""
+    scope = get_daily_quiz_scope()
+    count = len(_scoped_mistakes_bank(user_id))
+    scope_line = f"📚 {year_label(scope['year'])} — {module_label(scope['module'])}\n\n" if scope else ""
+    text = f"🧠 <b>بنك الأخطاء</b>\n\n{scope_line}عدد الأسئلة المسجلة: <b>{count}</b>"
+    buttons = []
+    if count:
+        buttons.append([InlineKeyboardButton("🔁 Retake Questions", callback_data="mistakes_retake")])
+        buttons.append([InlineKeyboardButton("🗑 Clear Mistakes Bank", callback_data="clear_mistakes_bank_ask")])
+    buttons.append([InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")])
+    return text, InlineKeyboardMarkup(buttons)
+
+def _bookmarks_text(user_id: int, page: int = 1) -> tuple[str, InlineKeyboardMarkup]:
+    items = list(reversed(_bookmark_list(user_id)))  # newest first
+    total = len(items)
+    max_page = max(1, (total + BOOKMARKS_PAGE_SIZE - 1) // BOOKMARKS_PAGE_SIZE)
+    page = max(1, min(page, max_page))
+    start = (page - 1) * BOOKMARKS_PAGE_SIZE
+    shown = items[start:start + BOOKMARKS_PAGE_SIZE]
+
+    if not shown:
+        text = (
+            f"{quizzy_block(QUIZZY_HAPPY_ART, 'مفيش أسئلة محفوظة لسه! ❤️')}\n\n"
+            "اعمل ❤️ على أي سؤال عشان يتضاف هنا للمراجعة."
+        )
+    else:
+        lines = [
+            f"{quizzy_block(QUIZZY_HAPPY_ART, 'دي الأسئلة اللي حفظتها يا دكتور ❤️')}\n",
+            f"<b>❤️ Bookmarks</b> — {total} سؤال",
+            "",
+        ]
+        for i, item in enumerate(shown, start + 1):
+            question = html.escape(str(item.get("question", "—")))
+            lines.append(f"<b>{i}.</b> {question}")
+            opts = item.get("options", []) or []
+            for j, opt in enumerate(opts):
+                if j >= 8:
+                    lines.append("…")
+                    break
+                lines.append(f"   {string.ascii_uppercase[j]}) {html.escape(str(opt))}")
+            location_bits = [item.get("module"), item.get("subject"), item.get("lecture")]
+            location = " — ".join(str(x) for x in location_bits if x)
+            if location:
+                lines.append(f"   <i>{html.escape(location)}</i>")
+            lines.append("")
+        text = "\n".join(lines).rstrip()
+
+    buttons = []
+    nav = []
+    if page > 1:
+        nav.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"bookmarks_page:{page-1}"))
+    if page < max_page:
+        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"bookmarks_page:{page+1}"))
+    if nav:
+        buttons.append(nav)
+    if total:
+        buttons.append([InlineKeyboardButton("🔁 Retake Questions", callback_data="bookmarks_retake")])
+        buttons.append([InlineKeyboardButton("🗑 Clear Bookmarks", callback_data="clear_bookmarks_ask")])
+    buttons.append([InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")])
+    return text, InlineKeyboardMarkup(buttons)
+
+async def _send_bookmarks(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_target, *, edit: bool = False, page: int = 1):
+    text, markup = _bookmarks_text(user_id, page)
+    send = reply_target.edit_text if edit else reply_target.reply_text
+    await send(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+# ── Lecture quick-access links — /start deep link straight to a
+# lecture's preview screen (▶️ Start / ❌ Cancel), skipping the normal
+# Year -> Module -> Subject -> Lecture browse. Telegram deep-link
+# payloads only allow [A-Za-z0-9_-].
+#
+# PERMANENT links: every lecture entry carries its own random "uid"
+# (QUIZ_INDEX[year][lecture_key]["uid"], 8 hex chars, assigned once and
+# never changed — it lives inside the entry, so it's saved/backed up/
+# restored with the rest of the quiz index and survives renumbering,
+# deleting other lectures, etc.). Payload format: "L_<year>_<uid>".
+#
+# LEGACY links (the first version of this feature) used positions
+# instead: "lec_<year>_<mod_idx>_<subj_idx>_<lec_idx>". Those keep
+# working: at startup _freeze_legacy_lecture_links records, once per
+# year, which lecture each position pointed to at that moment
+# (QUIZ_STATE[year]["legacy_links"], backed up with the quiz state) and
+# from then on legacy payloads resolve through that frozen table
+# instead of live positions — so they stop drifting too.
+def _lecture_uid(year: str, lecture_key: str) -> tuple[str, bool]:
+    """Returns (uid, newly_assigned) for one lecture, assigning a fresh
+    unique uid the first time. The caller must save (and back up) the
+    quiz index if newly_assigned is True."""
+    entry = QUIZ_INDEX[year][lecture_key]
+    uid = entry.get("uid")
+    if isinstance(uid, str) and uid:
+        return uid, False
+    taken = {e.get("uid") for e in QUIZ_INDEX[year].values()}
+    while True:
+        uid = secrets.token_hex(4)
+        if uid not in taken:
+            break
+    entry["uid"] = uid
+    return uid, True
+
+def _build_lecture_quicklink_payload(year: str, uid: str) -> str:
+    return f"L_{year}_{uid}"
+
+def _parse_lecture_quicklink_payload(payload: str):
+    """Returns ("uid", year, uid) for a permanent link, ("idx", year,
+    (mod_idx, subj_idx, lec_idx)) for a legacy positional link, or None
+    if `payload` isn't a well-formed lecture quick-link at all (some
+    other /start param, or garbled/hand-edited)."""
+    parts = (payload or "").split("_")
+    if len(parts) == 3 and parts[0] == "L" and parts[2].isalnum():
+        return "uid", parts[1], parts[2]
+    if len(parts) == 5 and parts[0] == "lec" and all(x.isdigit() for x in parts[2:]):
+        return "idx", parts[1], (int(parts[2]), int(parts[3]), int(parts[4]))
+    return None
+
+def _locate_lecture_by_uid(year: str, uid: str):
+    """(mod_idx, subj_idx, lec_idx) of the lecture with this uid RIGHT
+    NOW (the lecture:/lecturego: buttons still use positions, but those
+    are freshly computed per screen), or None if it no longer exists /
+    isn't ready."""
+    for key, entry in QUIZ_INDEX.get(year, {}).items():
+        if entry.get("uid") != uid:
+            continue
+        module, subject = entry.get("module"), entry.get("subject")
+        modules = ready_modules(year)
+        if module not in modules:
+            return None
+        subjects = ready_subjects(year, module)
+        if subject not in subjects:
+            return None
+        keys = ready_lecture_keys(year, module, subject)
+        if key not in keys:
+            return None
+        return modules.index(module), subjects.index(subject), keys.index(key)
+    return None
+
+def _lecture_quicklink_preview(payload: str, user_id: int):
+    """None if `payload` isn't a lecture quick-link; otherwise the
+    (text, markup) to show — the lecture's preview screen, or a "no
+    longer exists" message if it was deleted."""
+    parsed = _parse_lecture_quicklink_payload(payload)
+    if parsed is None:
+        return None
+    kind, year, ref = parsed
+    if kind == "uid":
+        loc = _locate_lecture_by_uid(year, ref)
+    else:
+        frozen = QUIZ_STATE.get(year, {}).get("legacy_links")
+        if isinstance(frozen, dict):
+            uid = frozen.get("_".join(str(i) for i in ref))
+            loc = _locate_lecture_by_uid(year, uid) if uid else None
+        else:
+            loc = ref   # not frozen yet (startup freeze skipped) — live positions, as before
+    if loc is None:
+        return "⚠️ المحاضرة دي مش موجودة دلوقتي.", None
+    return _lecture_preview_view(year, *loc, user_id)
+
+async def _freeze_legacy_lecture_links(app) -> None:
+    """Startup, after the quiz restores: (1) give every ready lecture a
+    uid, (2) once per year, freeze the position -> uid table that
+    legacy "lec_<year>_<m>_<s>_<l>" links resolve through. Saves and
+    backs up whatever changed. Skips a year whose restore failed (its
+    index may be stale/empty)."""
+    ctx = SimpleNamespace(bot=app.bot)
+    for year in configured_years():
+        if not RESTORE_OK.get(f"quiz_{year}", True):
+            continue
+        state = QUIZ_STATE[year]
+        legacy = {} if not isinstance(state.get("legacy_links"), dict) else None
+        changed = False
+        for mod_idx, module in enumerate(ready_modules(year)):
+            for subj_idx, subject in enumerate(ready_subjects(year, module)):
+                for lec_idx, key in enumerate(ready_lecture_keys(year, module, subject)):
+                    uid, new = _lecture_uid(year, key)
+                    changed = changed or new
+                    if legacy is not None:
+                        legacy[f"{mod_idx}_{subj_idx}_{lec_idx}"] = uid
+        if legacy is not None:
+            state["legacy_links"] = legacy
+            changed = True
+        if changed:
+            await save_quiz_index(year)
+            await save_quiz_state(year)
+            await backup_quiz_to_channel(ctx, year)
+
+def _lecture_preview_view(
+    year: str, mod_idx: int, subj_idx: int, lec_idx: int, user_id: int,
+) -> tuple[str, InlineKeyboardMarkup | None]:
+    """Builds the lecture preview screen (leaderboard + your best result,
+    ▶️ Start / ❌ Cancel buttons) for one year/mod_idx/subj_idx/lec_idx —
+    or an error string (with no markup) if any index no longer resolves
+    (content renamed/removed since the button or quick-link was made).
+    Shared by the "lecture:" browse callback and the quick-access /start
+    deep link, so both show byte-identical UI."""
+    if year not in YEARS or not year_channel_id(year):
+        return "⚠️ السنة دي مش متاحة دلوقتي.", None
+
+    modules = ready_modules(year)
+    if mod_idx >= len(modules):
+        return "⚠️ الموديول ده مش موجود دلوقتي.", None
+    module = modules[mod_idx]
+    subjects = ready_subjects(year, module)
+    if subj_idx >= len(subjects):
+        return "⚠️ المادة دي مش موجودة دلوقتي.", None
+    subject = subjects[subj_idx]
+    names = ready_lecture_keys(year, module, subject)
+    if lec_idx >= len(names):
+        return "⚠️ المحاضرة دي مش موجودة دلوقتي.", None
+    lecture_key = names[lec_idx]
+    entry = QUIZ_INDEX[year][lecture_key]
+    lr_key = _lr_key(year, lecture_key)
+
+    board = _lecture_leaderboard(lr_key)
+    lines = [
+        quizzy_block(QUIZZY_READY_ART, "CHALLENGE YOURSELF!"),
+        "",
+        f"🎓 <b>{year_label(year)} — {module} - {subject}: {entry['name']}</b>\n",
+    ]
+    if board:
+        medals = ["🥇", "🥈", "🥉"]
+        lines.append("🏆 <b>أفضل النتائج:</b>")
+        for i, row in enumerate(board):
+            medal = medals[i] if i < len(medals) else f"{i + 1}."
+            lines.append(
+                f"{medal} {html.escape(row['nickname'])} — "
+                f"{row['best_correct']}/{row['best_total']} ({row['best_pct']}%)"
+            )
+    else:
+        lines.append("🏆 محدش خد المحاضرة دي لسه — يلا كن أول واحد!")
+
+    my_result = _get_lecture_results(lr_key).get(str(user_id))
+    if my_result:
+        lines.append(
+            f"\n📌 أحسن نتيجة ليك: {my_result['best_correct']}/{my_result['best_total']} "
+            f"({my_result['best_pct']}%) — حاولت {my_result['attempts']} مرة"
+        )
+
+    buttons = [
+        [InlineKeyboardButton("▶️ ابدأ المحاضرة", callback_data=f"lecturego:{year}:{mod_idx}:{subj_idx}:{lec_idx}")],
+        [InlineKeyboardButton("❌ إلغاء", callback_data=f"subject:{year}:{mod_idx}:{subj_idx}")],
+        [InlineKeyboardButton("🔗 لينك سريع للمحاضرة", callback_data=f"lecturelink:{year}:{mod_idx}:{subj_idx}:{lec_idx}")],
+    ]
+    return "\n".join(lines), InlineKeyboardMarkup(buttons)
+
+
+@_serialize_per_user
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query   = update.callback_query
+    user_id = query.from_user.id
+    # Telegram takes ONE answerCallbackQuery per tap, and this is it — so a
+    # Quizzy toast (a small banner at the top of the screen that fades on
+    # its own, i.e. answer(text) WITHOUT show_alert) has to be decided
+    # right here rather than answered later inside the branch. See
+    # _tap_toast for which taps get one.
+    # Toasts are now sent as a silent message that auto-deletes after
+    # TOAST_DELETE_SECONDS (8s) instead of the fading answer() banner — the
+    # tap itself is still answered bare so the button's spinner clears.
+    toast_text = _tap_toast(query.data, user_id)
+    await query.answer()
+    if toast_text:
+        toast_chat = query.message.chat_id if query.message else user_id
+        await _send_toast_message(context, toast_chat, toast_text)
+
+    # 🔥COMING SOON🔥 — the toast above is the whole feature; leave the menu as is.
+    if query.data == "coming_soon":
+        return
+
+    # ── QUESTION TIMEOUT — resume/abandon a paused session ────────────
+    # Only shown after two consecutive timed-out questions in a row (see
+    # _handle_question_timeout / QUESTION TIMEOUT section above).
+    if query.data.startswith("qresume:"):
+        kind    = query.data.split(":", 1)[1]
+        store   = _SESSION_STORE_BY_KIND.get(kind)
+        session = store.get(user_id) if store is not None else None
+        if not session or not session.get("paused"):
+            await query.edit_message_text("⚠️ مفيش جلسة متوقفة نكملها دلوقتي.")
+            return
+        session["paused"] = False
+        session["timeout_streak"] = 0
+        await query.edit_message_text("▶️ تمام، ياللا نكمل!")
+        # The question that triggered the pause was never answered —
+        # skip it as wrong now, same as the first timeout in a row does,
+        # then carry on delivering the rest of the queue as normal.
+        await _advance_session_for_kind(context, kind, user_id, session, is_correct=False)
+        return
+
+    if query.data.startswith("qabandon:"):
+        kind  = query.data.split(":", 1)[1]
+        store = _SESSION_STORE_BY_KIND.get(kind)
+        if store is not None:
+            store.pop(user_id, None)
+        label = _QUIZ_KIND_LABEL.get(kind, "الجلسة")
+        await query.edit_message_text(
+            f"🥀 تم إلغاء الـ {label}. تقدر تبدأ واحدة جديدة في أي وقت.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")]]),
+        )
+        return
+
+    # ── BROADCAST composer (admin only) — see the BROADCAST COMMAND ──
+    # section for _broadcast_composer_view / _send_broadcast.
+    if query.data.startswith("bc") and query.data.split(":", 1)[0] in (
+        "bcaud", "bcmsg", "bcmsgcancel", "bcpreview", "bcsend", "bccancel"
+    ):
+        if not is_admin(update):
+            await query.answer("🚫 للأدمن فقط", show_alert=True)
+            return
+
+        if query.data.startswith("bcaud:"):
+            key = query.data.split(":", 1)[1]
+            if key in BROADCAST_AUDIENCE_ORDER:
+                BROADCAST_DRAFTS.setdefault(user_id, {"audience": "all", "text": None})["audience"] = key
+            body, markup = _broadcast_composer_view(user_id)
+            await query.edit_message_text(body, parse_mode=ParseMode.HTML, reply_markup=markup)
+            return
+
+        if query.data == "bcmsg":
+            AWAITING_BROADCAST_MESSAGE[user_id] = True
+            await query.edit_message_text(
+                "✏️ ابعت نص الرسالة اللي عايز تبثها دلوقتي — أو أي مرفق (صورة/فيديو/ملف/صوت/ستيكر...) وهيتبعت زي ما هو.\n"
+                "التنسيق (Bold / Italic / Spoiler / Link...) اللي تعمله في الرسالة هيتبعت زي ما هو. "
+                "ولو النص من غير تنسيق تقدر تكتب HTML بسيط: <code>&lt;b&gt;</code>, <code>&lt;i&gt;</code>, <code>&lt;tg-spoiler&gt;</code>...",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="bcmsgcancel")]]),
+            )
+            return
+
+        if query.data == "bcmsgcancel":
+            AWAITING_BROADCAST_MESSAGE.pop(user_id, None)
+            body, markup = _broadcast_composer_view(user_id)
+            await query.edit_message_text(body, parse_mode=ParseMode.HTML, reply_markup=markup)
+            return
+
+        if query.data == "bcpreview":
+            draft = BROADCAST_DRAFTS.get(user_id)
+            text  = draft.get("text") if draft else None
+            media = draft.get("media") if draft else None
+            if not (text or media):
+                await query.answer("⚠️ لسه مفيش رسالة.", show_alert=True)
+                return
+            try:
+                await _deliver_broadcast_item(context.bot, user_id, text, media)
+            except Exception as e:
+                await query.answer(f"⚠️ مشكلة في الرسالة (يمكن الـ HTML مش مظبوط): {e}", show_alert=True)
+            return
+
+        if query.data == "bccancel":
+            BROADCAST_DRAFTS.pop(user_id, None)
+            AWAITING_BROADCAST_MESSAGE.pop(user_id, None)
+            await query.edit_message_text("❌ Broadcast اتلغى.")
+            return
+
+        if query.data == "bcsend":
+            draft = BROADCAST_DRAFTS.get(user_id)
+            text  = draft.get("text") if draft else None
+            media = draft.get("media") if draft else None
+            if not (text or media):
+                await query.answer("⚠️ لسه مفيش رسالة.", show_alert=True)
+                return
+            audience   = draft["audience"]
+            recipients = _broadcast_audience_user_ids(audience)
+            if not recipients:
+                await query.answer("⚠️ مفيش مستخدمين في الجمهور ده دلوقتي.", show_alert=True)
+                return
+            BROADCAST_DRAFTS.pop(user_id, None)
+            AWAITING_BROADCAST_MESSAGE.pop(user_id, None)
+            await query.edit_message_text("📡 بيتجهز للإرسال…")
+            await _send_broadcast(context, query.message, audience, text, recipients, media)
+            return
+
+
+    # ── /dev_panel — Creator-only control panel ───────────────────────
+    if query.data == "devpanel_back":
+        if not is_creator(update):
+            await query.answer(MSG_ADMIN_ONLY, show_alert=True)
+            return
+        AWAITING_DEVPANEL_SETYEAR.pop(user_id, None)
+        AWAITING_DEVPANEL_MYSTATS.pop(user_id, None)
+        text, markup = _dev_panel_view()
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        return
+
+    if query.data == "devpanel_setyear":
+        if not is_creator(update):
+            await query.answer(MSG_ADMIN_ONLY, show_alert=True)
+            return
+        AWAITING_DEVPANEL_SETYEAR[user_id] = True
+        await query.edit_message_text(
+            "🔢 ابعت الـ Nickname أو الـ ID بتاع الشخص اللي عايز تعدل سنته:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="devpanel_back")]]),
+        )
+        return
+
+    if query.data == "devpanel_mystats":
+        if not is_creator(update):
+            await query.answer(MSG_ADMIN_ONLY, show_alert=True)
+            return
+        AWAITING_DEVPANEL_MYSTATS[user_id] = True
+        await query.edit_message_text(
+            "👥 ابعت الـ Nickname أو الـ ID بتاع الشخص اللي عايز تشوف إحصائياته:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="devpanel_back")]]),
+        )
+        return
+
+    if query.data == "devpanel_backups":
+        if not is_creator(update):
+            await query.answer(MSG_ADMIN_ONLY, show_alert=True)
+            return
+        text, markup = _dev_panel_backups_view()
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        return
+
+    if query.data == "devpanel_backup_now":
+        if not is_creator(update):
+            await query.answer(MSG_ADMIN_ONLY, show_alert=True)
+            return
+        await query.edit_message_text("💾 بيعمل باك أب دلوقتي…")
+        await context.bot.send_message(chat_id=user_id, text=await _run_backup_now(context))
+        return
+
+    if query.data == "devpanel_restore":
+        if not is_creator(update):
+            await query.answer(MSG_ADMIN_ONLY, show_alert=True)
+            return
+        await query.edit_message_text(
+            "🔄 اختار الـ system اللي عايز تعمله restore من آخر نسخة مثبتة (pinned) في القناة بتاعته:",
+            reply_markup=_restore_picker_keyboard(),
+        )
+        return
+
+    if query.data == "devpanel_daily_module":
+        if not is_creator(update):
+            await query.answer(MSG_ADMIN_ONLY, show_alert=True)
+            return
+        text, markup = _daily_module_view()
+        if text is None:
+            await query.edit_message_text("📭 مفيش سنين متاحة دلوقتي.")
+            return
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        return
+
+    # ── /dev_panel: 🔢 Set year — year/class picker tap on a target user
+    # (as opposed to onboard_yc:/dqyc:, which act on the tapping user
+    # themselves). Parsed separately since the target's user_id rides
+    # along in callback_data: "devpanel_setyear_pick:<target_id>:<yc>".
+    if query.data.startswith("devpanel_setyear_pick:"):
+        if not is_creator(update):
+            await query.answer(MSG_ADMIN_ONLY, show_alert=True)
+            return
+        _, target_str, yc = query.data.split(":")
+        if yc not in YEAR_CLASS_NUMBER:
+            await query.edit_message_text("⚠️ الاختيار ده مش متاح.")
+            return
+        target_id = int(target_str)
+        entry = _get_settings_entry(target_id)
+        entry["year_class"] = yc
+        await save_settings()
+        await backup_settings_to_channel(context)
+        label = get_nickname(target_id) or str(target_id)
+        await query.edit_message_text(
+            f"✅ اتعدلت سنة <b>{html.escape(label)}</b> لـ {year_class_label(yc)}.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # ── /restore: run one system's restore-from-pin on demand ────────
+    if query.data.startswith("restore_go:"):
+        if not is_admin(update):
+            await query.answer("🚫 للأدمن فقط", show_alert=True)
+            return
+        key = query.data.split(":", 1)[1]
+        target = _RESTORE_TARGETS.get(key)
+        if not target:
+            await query.edit_message_text("⚠️ مش لاقي الـ system ده.")
+            return
+        label, restore_fn = target
+        await query.edit_message_text(f"🔄 بيعمل restore لـ {label}…")
+        status = await restore_fn(context.application)
+        if status == "ok":
+            await context.bot.send_message(chat_id=user_id, text=f"✅ {label} — تم الـ restore من آخر نسخة مثبتة.")
+        elif status == "no_backup":
+            reset_kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton(f"🆕 ابدأ {label} من جديد (Reset)", callback_data=f"restore_reset:{key}"),
+            ]])
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    f"ℹ️ {label} — مفيش نسخة احتياطية متثبتة (pinned) في القناة بتاعته دلوقتي، "
+                    "فمحصلش أي restore والداتا المحلية زي ما هي.\n\n"
+                    "لو عايز تبدأ الملف ده من جديد (reset لملف فاضي) بدل ما تدور على نسخة قديمة، دوس تحت:"
+                ),
+                reply_markup=reset_kb,
+            )
+        elif status == "not_configured":
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"⚠️ {label} — القناة/الجروب بتاعه مش متظبط في الإعدادات، فمحصلش أي حاجة.",
+            )
+        elif status == "invalid":
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    f"❌ {label} — لقيت نسخة مثبتة بس شكلها/structure غلط أو تالف، "
+                    "فرفضت أعمل restore منها عشان محدش يتبعثر محلياً. اتبعتلك رسالة تانية بالتفاصيل."
+                ),
+            )
+        else:  # "error"
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"❌ {label} — الـ restore فشل. اتبعتلك رسالة تانية بالتفاصيل (نفس رسالة فشل الـ restore وقت التشغيل).",
+            )
+        return
+
+    # ── /restore: "no backup pinned" -> offer to reset (blank file) ──
+    if query.data.startswith("restore_reset:"):
+        if not is_admin(update):
+            await query.answer("🚫 للأدمن فقط", show_alert=True)
+            return
+        key = query.data.split(":", 1)[1]
+        target = _RESTORE_TARGETS.get(key)
+        if not target or key not in _RESET_ACTIONS:
+            await query.edit_message_text("⚠️ مش لاقي الـ system ده.")
+            return
+        label, _ = target
+        await query.edit_message_text(
+            f"⚠️ متأكد إنك عايز تبدأ {label} من ملف جديد فاضي؟ الداتا المحلية الحالية لِـ {label} "
+            "(لو فيه حاجة) هتتمسح ويتبعت ملف فاضي كـ backup جديد.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ أيوه، اعمل Reset", callback_data=f"restore_reset_confirm:{key}"),
+                InlineKeyboardButton("❌ لأ، إلغاء", callback_data=f"restore_reset_cancel:{key}"),
+            ]]),
+        )
+        return
+
+    if query.data.startswith("restore_reset_confirm:"):
+        if not is_admin(update):
+            await query.answer("🚫 للأدمن فقط", show_alert=True)
+            return
+        key = query.data.split(":", 1)[1]
+        target = _RESTORE_TARGETS.get(key)
+        reset_fn = _RESET_ACTIONS.get(key)
+        if not target or not reset_fn:
+            await query.edit_message_text("⚠️ مش لاقي الـ system ده.")
+            return
+        label, _ = target
+        await query.edit_message_text(f"🆕 بيعمل reset لـ {label}…")
+        try:
+            await reset_fn(context)
+            await context.bot.send_message(chat_id=user_id, text=f"✅ {label} — اتعمله reset، وبقى فيه ملف فاضي جديد متثبت في القناة بتاعته.")
+        except Exception as e:
+            print(f"{label.upper()} RESET ERROR:", e)
+            await context.bot.send_message(chat_id=user_id, text=f"❌ {label} — الـ reset فشل: {e}")
+        return
+
+    if query.data.startswith("restore_reset_cancel:"):
+        if not is_admin(update):
+            await query.answer("🚫 للأدمن فقط", show_alert=True)
+            return
+        key = query.data.split(":", 1)[1]
+        label = _RESTORE_TARGETS.get(key, (key, None))[0]
+        await query.edit_message_text(f"🗑 اتلغى — {label} زي ما هي، مفيش حاجة اتغيرت.")
+        return
+
+    # ── /restore: "🛑 Everything 🛑" — restore every system in one go ──
+    # Confirm-gated since it touches every system at once, unlike a
+    # single restore_go: tap. Runs each system's restore_fn sequentially
+    # (same functions restore_go: uses, one per _RESTORE_TARGETS entry)
+    # and reports a per-system status line at the end; any system that
+    # came back "no_backup" gets its own 🆕 Reset button attached to the
+    # summary, same as the single-system flow offers.
+    if query.data == "restore_all":
+        if not is_admin(update):
+            await query.answer("🚫 للأدمن فقط", show_alert=True)
+            return
+        systems_line = "، ".join(label for label, _ in _RESTORE_TARGETS.values())
+        await query.edit_message_text(
+            f"🛑 متأكد إنك عايز تعمل restore لكل الـ systems مرة واحدة؟\n\n"
+            f"({systems_line})\n\n"
+            "كل واحد هياخد آخر نسخة مثبتة (pinned) في قناته، ولو مفيش نسخة مثبتة لواحد منهم "
+            "هيتقال لك كده من غير ما يتلمس.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ أيوه، اعمل Restore للكل", callback_data="restore_all_confirm"),
+                InlineKeyboardButton("❌ لأ، إلغاء", callback_data="restore_all_cancel"),
+            ]]),
+        )
+        return
+
+    if query.data == "restore_all_cancel":
+        if not is_admin(update):
+            await query.answer("🚫 للأدمن فقط", show_alert=True)
+            return
+        await query.edit_message_text("🗑 اتلغى — مفيش حاجة اتعملها restore.")
+        return
+
+    if query.data == "restore_all_confirm":
+        if not is_admin(update):
+            await query.answer("🚫 للأدمن فقط", show_alert=True)
+            return
+        await query.edit_message_text("🛑 بيعمل restore لكل الـ systems… ده ممكن ياخد شوية وقت.")
+        lines = ["🛑 <b>نتيجة الـ Restore الشامل:</b>\n"]
+        no_backup_keys = []
+        for key, (label, restore_fn) in _RESTORE_TARGETS.items():
+            try:
+                status = await restore_fn(context.application)
+            except Exception as e:
+                print(f"{label.upper()} RESTORE-ALL ERROR:", e)
+                status = "error"
+            if status == "ok":
+                lines.append(f"✅ {label} — تم الـ restore.")
+            elif status == "no_backup":
+                lines.append(f"ℹ️ {label} — مفيش نسخة مثبتة، اتسابت زي ما هي.")
+                no_backup_keys.append(key)
+            elif status == "not_configured":
+                lines.append(f"⚠️ {label} — القناة/الجروب بتاعه مش متظبط.")
+            elif status == "invalid":
+                lines.append(f"❌ {label} — النسخة المثبتة شكلها/structure غلط أو تالف، اتسابت زي ما هي.")
+            else:  # "error"
+                lines.append(f"❌ {label} — فشل الـ restore.")
+        markup = None
+        if no_backup_keys:
+            markup = InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"🆕 Reset {_RESTORE_TARGETS[k][0]}", callback_data=f"restore_reset:{k}")]
+                for k in no_backup_keys
+            ])
+        await context.bot.send_message(
+            chat_id=user_id, text="\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=markup,
+        )
+        return
+
+    # ── /restore: "🆕 🛑 RESET EVERYTHING 🛑" — wipe every system to a
+    # blank file in one go (same as tapping 🆕 Reset on each system's
+    # "no backup pinned" offer, just for all of them at once and without
+    # needing restore_go: to hit no_backup first). Confirm-gated and
+    # explicitly warned as irreversible, since unlike restore_all this
+    # discards local data outright rather than pulling from a pin.
+    if query.data == "reset_all":
+        if not is_admin(update):
+            await query.answer("🚫 للأدمن فقط", show_alert=True)
+            return
+        systems_line = "، ".join(label for label, _ in _RESTORE_TARGETS.values())
+        await query.edit_message_text(
+            f"🛑🆕 <b>متأكد إنك عايز تعمل RESET لكل الـ systems مرة واحدة؟</b>\n\n"
+            f"({systems_line})\n\n"
+            "⚠️ ده هيمسح الداتا المحلية بتاعت كل نظام من دول ويبدأه من ملف فاضي جديد "
+            "(زي ما بيحصل لو دُست 🆕 Reset على نظام لوحده)، والعملية دي <b>مش هترجع تاني</b>.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🗑 أيوه، اعمل Reset للكل", callback_data="reset_all_confirm"),
+                InlineKeyboardButton("❌ لأ، إلغاء", callback_data="reset_all_cancel"),
+            ]]),
+        )
+        return
+
+    if query.data == "reset_all_cancel":
+        if not is_admin(update):
+            await query.answer("🚫 للأدمن فقط", show_alert=True)
+            return
+        await query.edit_message_text("🗑 اتلغى — مفيش حاجة اتعملها reset.")
+        return
+
+    if query.data == "reset_all_confirm":
+        if not is_admin(update):
+            await query.answer("🚫 للأدمن فقط", show_alert=True)
+            return
+        await query.edit_message_text("🆕 بيعمل reset لكل الـ systems… ده ممكن ياخد شوية وقت.")
+        lines = ["🆕 <b>نتيجة الـ Reset الشامل:</b>\n"]
+        for key, (label, _) in _RESTORE_TARGETS.items():
+            reset_fn = _RESET_ACTIONS.get(key)
+            if not reset_fn:
+                continue
+            try:
+                await reset_fn(context)
+                lines.append(f"✅ {label} — اتعمله reset (ملف فاضي جديد متثبت في القناة بتاعته).")
+            except Exception as e:
+                print(f"{label.upper()} RESET-ALL ERROR:", e)
+                lines.append(f"❌ {label} — فشل الـ reset: {e}")
+        await context.bot.send_message(chat_id=user_id, text="\n".join(lines), parse_mode=ParseMode.HTML)
+        return
+
+    # ── /preview — onboarding walkthrough (admin-only, non-destructive;
+    # see preview_cmd for why the Year/Class buttons here are inert).
+    # From here on (bully joke -> "just kidding" -> how/where -> the fixed
+    # welcome-tour message -> onboard_go) the preview hands off to the REAL
+    # onboard_bully:/onboard_how/onboard_where/onboard_go handlers further
+    # below, unmodified — none of those steps write any state (the joke's
+    # answer isn't stored), so they're already safe to trigger outside of
+    # real onboarding. ──────────────────────────────────────────────────
+    if query.data == "preview_step2":
+        if not is_admin(update):
+            await query.answer(MSG_ADMIN_ONLY, show_alert=True)
+            return
+        preview_kb = InlineKeyboardMarkup(
+            [[InlineKeyboardButton(year_class_label(yc), callback_data="preview_noop")] for yc in YEAR_ORDER]
+            + [[InlineKeyboardButton("▶️ Next (bully joke)", callback_data="preview_yc_done")]]
+        )
+        await query.edit_message_text(
+            f"{quizzy_block(QUIZZY_HAPPY_ART, 'What a lovely name Dr.<nickname> 🥰')}\n\n"
+            "What Year/Class are you currently in?\n\n"
+            "<i>🔍 Preview — the buttons above are just a mock-up here, they don't set anything.</i>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=preview_kb,
+        )
+        return
+
+    if query.data == "preview_noop":
+        await query.answer("🔍 Preview — دي مجرد عينة، مش بتغير أي حاجة فعلياً.", show_alert=True)
+        return
+
+    if query.data == "preview_yc_done":
+        if not is_admin(update):
+            await query.answer(MSG_ADMIN_ONLY, show_alert=True)
+            return
+        # Same single edited message as the real onboard_yc: onboarding
+        # branch (happy quizzy face + bully question together, not two
+        # sends) — tapping either button leads to the (also state-free)
+        # "just kidding" step via the real onboard_bully: handler below.
+        await query.edit_message_text(
+            f"{quizzy_block(QUIZZY_HAPPY_ART, 'Do you want me to bully you when you get questions wrong?')}\n\n"
+            "<i>🔍 Preview — دي عينة بس، مفيش سنة/كلاس اتسجلت فعلياً.</i>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("What???", callback_data="onboard_bully:what"),
+                InlineKeyboardButton("No 😭",   callback_data="onboard_bully:no"),
+            ]]),
+        )
+        return
+
+
+    # ── REPORT ISSUE: draft confirmation (user's own Send/Cancel) ────
+    if query.data == "report_draft_send":
+        draft = REPORT_DRAFTS.pop(user_id, None)
+        if draft is None:
+            await query.edit_message_text("⚠️ مفيش بلاغ متسجل دلوقتي — جرب /report_issue تاني.")
+            return
+        if time.time() - draft["created_at"] > REPORT_DRAFT_CONFIRM_TIMEOUT:
+            await query.edit_message_text("⌛ البلاغ ده قديم شوية — جرب /report_issue تاني.")
+            return
+        ok = await _submit_report(context, user_id, query.from_user, draft["text"], draft["photo_file_id"])
+        if ok:
+            await query.edit_message_text("✅ اتبعتت. هيتم الرد عليك من هنا لما الأدمن يشوفها.")
+        else:
+            await query.edit_message_text("⚠️ مشكلة في إرسال الرسالة — جرب تاني لو سمحت.")
+        return
+
+    if query.data == "report_draft_cancel":
+        REPORT_DRAFTS.pop(user_id, None)
+        await query.edit_message_text("🗑 اتلغى. تقدر تبدأ بلاغ جديد بـ /report_issue في أي وقت.")
+        return
+
+    # ── REPORT ISSUE: reply / close (admin-only, from REPORT_ISSUE_GROUP_ID) ──
+    if query.data == "report_noop":
+        return   # "🔒 Closed" button on an already-closed report — nothing to do
+
+    # ── REPORT ISSUE: reporter's own "↩️ Reply" on the admin's DM'd reply ──
+    # No admin gate here — this button is on the REPORTER's own DM, meant
+    # for them specifically. group_message_id ties it back to the right
+    # thread regardless of how many reports this person has ever filed.
+    if query.data.startswith("report_user_reply:"):
+        group_message_id = int(query.data.split(":", 1)[1])
+        thread = REPORT_THREADS.get(group_message_id)
+        if not thread or thread.get("closed"):
+            return   # "report closed" toast was shown by _tap_toast
+        if thread["user_id"] != user_id:
+            # Shouldn't happen (this button only ever goes out to the
+            # thread's own reporter), but don't let a forwarded/replayed
+            # callback_data let someone follow up on someone else's thread.
+            # (its "can't do that" toast was shown by _tap_toast)
+            return
+        AWAITING_USER_FOLLOWUP[user_id] = {"group_message_id": group_message_id}
+        await context.bot.send_message(
+            chat_id=user_id,
+            text="✏️ اكتب ردك، وهيتبعت للأدمن على طول.",
+        )
+        return
+
+    if query.data.startswith("report_reply:"):
+        if not is_admin(update):
+            await query.answer("🚫 للأدمن فقط", show_alert=True)
+            return
+        group_message_id = int(query.data.split(":", 1)[1])
+        thread = REPORT_THREADS.get(group_message_id)
+        if not thread or thread.get("closed"):
+            await query.answer("⚠️ الـ report ده مقفول أو مش لاقيه.", show_alert=True)
+            return
+        AWAITING_REPORT_REPLY[user_id] = {"group_message_id": group_message_id}
+        try:
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text="✏️ اكتب ردك على المستخدم ده في رسالة، وهيتبعتله على طول.",
+                reply_to_message_id=query.message.message_id,
+            )
+        except Exception as e:
+            print("REPORT REPLY PROMPT FAILED:", e)
+            AWAITING_REPORT_REPLY.pop(user_id, None)   # prompt never went out — don't leave a dangling awaiting-state
+            await query.answer("⚠️ مشكلة في إرسال طلب الرد — جرب تاني.", show_alert=True)
+        return
+
+    if query.data.startswith("report_close:"):
+        if not is_admin(update):
+            await query.answer("🚫 للأدمن فقط", show_alert=True)
+            return
+        group_message_id = int(query.data.split(":", 1)[1])
+        thread = REPORT_THREADS.get(group_message_id)
+        if not thread:
+            await query.answer("⚠️ الـ report ده مش لاقيه دلوقتي.", show_alert=True)
+            return
+        thread["closed"] = True
+        AWAITING_REPORT_REPLY.pop(user_id, None)   # cancel any reply this admin was mid-typing for it
+        AWAITING_USER_FOLLOWUP.pop(thread["user_id"], None)   # ...and any follow-up the reporter was mid-typing
+        await save_report_threads()
+        await query.edit_message_text(
+            _report_thread_text(thread, group_message_id), parse_mode=ParseMode.HTML,
+            reply_markup=_report_reply_keyboard(group_message_id, closed=True),
+        )
+        await backup_report_threads_to_channel(context)
+        return
+
+    # ── 🔎 SEARCH CONTENT ────────────────────────────────────────────
+    # search_pick_year  -> full year picker (only reachable when this user
+    #                      has no locked year/class — see _locked_year_modules_view)
+    # search_year:<year> -> module picker (+ "All Modules") for that year
+    # search_mod:<year>:<module|__ALL__> -> arms AWAITING_SEARCH_QUERY and
+    #                      prompts for the search text; also what
+    #                      "🔎 Search Again" reuses after a completed search.
+    if query.data == "search_pick_year":
+        years = configured_years()
+        if not years:
+            await query.edit_message_text("📭 مفيش سنين متاحة دلوقتي.")
+            return
+        buttons = [[InlineKeyboardButton(year_label(y), callback_data=f"search_year:{y}")] for y in years]
+        buttons.append([InlineKeyboardButton("🔙 رجوع", callback_data="quiz_years")])
+        await query.edit_message_text(
+            "🔎 <b>Search Content</b> — اختار السنة:", parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    if query.data.startswith("search_year:"):
+        year = query.data.split(":", 1)[1]
+        if year not in YEARS or not year_channel_id(year):
+            await query.edit_message_text("⚠️ السنة دي مش متاحة دلوقتي.")
+            return
+        modules = ready_modules(year)
+        if not modules:
+            await query.edit_message_text(f"📭 مفيش موديولات متظبطة لـ {year_label(year)} لسه.")
+            return
+        buttons = [[InlineKeyboardButton("🔎 All Modules", callback_data=f"search_mod:{year}:{SEARCH_MOD_ALL}")]]
+        buttons += [[InlineKeyboardButton(module_label(m), callback_data=f"search_mod:{year}:{m}")] for m in modules]
+        buttons.append([InlineKeyboardButton("🔙 رجوع", callback_data="quiz_years")])
+        await query.edit_message_text(
+            f"🔎 <b>Search Content</b> — {year_label(year)}: اختار الموديول (أو كله):",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    # srchpage:<token>:<page> -> flips the results list to another page.
+    # srchpick:<token>:<idx>  -> resends that one match as a live quiz poll
+    #                            (the list stays so more can be picked).
+    # <token> ties the button to one specific search; a newer search, or a
+    # bot restart (SEARCH_RESULTS is in-memory), makes older lists "expired".
+    if query.data.startswith(("srchpage:", "srchpick:")):
+        prefix, token, num_str = query.data.split(":", 2)
+        chat_id = query.message.chat_id
+        state = SEARCH_RESULTS.get(chat_id)
+        if not state or state["token"] != token:
+            await _send_toast_message(context, chat_id, "⚠️ نتيجة البحث دي انتهت — ابحث تاني.")
+            return
+        num = int(num_str)
+        if prefix == "srchpage":
+            text, markup = _search_list_view(state, num)
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+            return
+        if not 0 <= num < len(state["matches"]):
+            return
+        m = state["matches"][num]
+        where = f"{subject_label(m['subject'])} — {html.escape(m['lecture_name'])}"
+        await context.bot.send_message(chat_id, f"{num + 1}. {where}", parse_mode=ParseMode.HTML)
+        await deliver_quiz(
+            context, chat_id, m["question"], m["options"], m["correct_option_id"],
+            explanation=m.get("explanation"), description=m.get("description"),
+        )
+        if num not in state["sent"]:
+            state["sent"].add(num)
+            _, markup = _search_list_view(state, state["page"])
+            try:
+                await query.edit_message_reply_markup(reply_markup=markup)   # ✅ on the picked number
+            except BadRequest:
+                pass
+        return
+
+    if query.data.startswith("search_mod:"):
+        _, year, mod_token = query.data.split(":", 2)
+        if year not in YEARS or not year_channel_id(year):
+            await query.edit_message_text("⚠️ السنة دي مش متاحة دلوقتي.")
+            return
+        module = None if mod_token == SEARCH_MOD_ALL else mod_token
+        if module and module not in ready_modules(year):
+            await query.edit_message_text("⚠️ الموديول ده مش موجود دلوقتي.")
+            return
+        AWAITING_SEARCH_QUERY[user_id] = {"year": year, "module": module}
+        await query.edit_message_text(
+            f"🔎 <b>Search Content</b>\n📚 {_search_scope_label(year, module)}\n\n"
+            "Type a word or a part of a question and Quizzy will search for it!",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="quiz_years")]]),
+        )
+        return
+
+    # ── QUIZ YEARS: top-level list ──────────────────────────────────
+    if query.data == "quiz_years":
+        years = configured_years()
+        if not years:
+            await query.edit_message_text("📭 مفيش سنين متاحة دلوقتي.")
+            return
+        view = _locked_year_modules_view(user_id, years)
+        if view:
+            text, markup = view
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+            return
+        buttons = [[InlineKeyboardButton(year_label(y), callback_data=f"yr:{y}")] for y in years]
+        buttons.append([InlineKeyboardButton("Search Content 🔎", callback_data="search_pick_year")])
+        await query.edit_message_text(
+            "📚 <b>اختار السنة:</b>", parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    # ── YEAR: list modules within one year ──────────────────────────
+    if query.data.startswith("yr:") and query.data.count(":") == 1:
+        year = query.data.split(":")[1]
+        if year not in YEARS or not year_channel_id(year):
+            await query.edit_message_text("⚠️ السنة دي مش متاحة دلوقتي.")
+            return
+        modules = ready_modules(year)
+        if not modules:
+            await query.edit_message_text(f"📭 مفيش موديولات متظبطة لـ {year_label(year)} لسه.")
+            return
+        buttons = [[InlineKeyboardButton(module_label(m), callback_data=f"module:{year}:{i}")] for i, m in enumerate(modules)]
+        buttons.append([InlineKeyboardButton("🔙 رجوع للسنين", callback_data="quiz_years")])
+        await query.edit_message_text(
+            f"📚 <b>{year_label(year)}</b> — اختار الموديول:" + year_credit_line(year),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    # ── QUIZ MODULE: list subjects within one module ───────────────
+    if query.data.startswith("module:") and query.data.count(":") == 2:
+        _, year, mod_idx_str = query.data.split(":")
+        mod_idx = int(mod_idx_str)
+        if year not in YEARS or not year_channel_id(year):
+            await query.edit_message_text("⚠️ السنة دي مش متاحة دلوقتي.")
+            return
+        modules = ready_modules(year)
+        if mod_idx >= len(modules):
+            await query.edit_message_text("⚠️ الموديول ده مش موجود دلوقتي.")
+            return
+        module = modules[mod_idx]
+        subjects = ready_subjects(year, module)
+        buttons = [
+            [InlineKeyboardButton(subject_label(s), callback_data=f"subject:{year}:{mod_idx}:{i}")]
+            for i, s in enumerate(subjects)
+        ]
+        buttons.append([InlineKeyboardButton("🔙 رجوع للموديولات", callback_data=f"yr:{year}")])
+        await query.edit_message_text(
+            f"🎓 <b>{year_label(year)} — {module}</b> — اختار المادة:", parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    # ── QUIZ SUBJECT: list lectures within one module + subject ────
+    if query.data.startswith("subject:"):
+        _, year, mod_idx_str, subj_idx_str = query.data.split(":")
+        mod_idx, subj_idx = int(mod_idx_str), int(subj_idx_str)
+        if year not in YEARS or not year_channel_id(year):
+            await query.edit_message_text("⚠️ السنة دي مش متاحة دلوقتي.")
+            return
+        modules = ready_modules(year)
+        if mod_idx >= len(modules):
+            await query.edit_message_text("⚠️ الموديول ده مش موجود دلوقتي.")
+            return
+        module = modules[mod_idx]
+        subjects = ready_subjects(year, module)
+        if subj_idx >= len(subjects):
+            await query.edit_message_text("⚠️ المادة دي مش موجودة دلوقتي.")
+            return
+        subject = subjects[subj_idx]
+        names = ready_lecture_keys(year, module, subject)
+        # ✅ marks a lecture this user has finished — a recorded result
+        # exists only once a real (non-retake) run reaches the end, see
+        # _finish_lecture_session. .get, not _get_lecture_results, so
+        # merely browsing never creates empty result buckets.
+        def _done_mark(name: str) -> str:
+            return "✅ " if str(user_id) in LECTURE_RESULTS.get(_lr_key(year, name), {}) else ""
+        buttons = [
+            [InlineKeyboardButton(
+                f"{_done_mark(name)}Lecture {QUIZ_INDEX[year][name]['lecture_number'] or (i + 1)}: {QUIZ_INDEX[year][name]['name']}",
+                callback_data=f"lecture:{year}:{mod_idx}:{subj_idx}:{i}",
+            )]
+            for i, name in enumerate(names)
+        ]
+        buttons.append([InlineKeyboardButton("🔙 رجوع للمواد", callback_data=f"module:{year}:{mod_idx}")])
+        header = f"🎓 <b>{year_label(year)} — {module} - {subject}</b>"
+        if not names:
+            header += "\n\n📭 لسه مفيش محاضرات هنا."
+        await query.edit_message_text(
+            header, parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    # ── LECTURE: show a preview (leaderboard + your stats) before starting ──
+    if query.data.startswith("lecture:"):
+        _, year, mod_idx_str, subj_idx_str, lec_idx_str = query.data.split(":")
+        mod_idx, subj_idx, lec_idx = int(mod_idx_str), int(subj_idx_str), int(lec_idx_str)
+        text, markup = _lecture_preview_view(year, mod_idx, subj_idx, lec_idx, user_id)
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        return
+
+    # ── LECTURELINK: hand back a shareable https://t.me/<bot>?start=...
+    # deep link for this exact lecture preview screen — see
+    # _build_lecture_quicklink_payload and start()'s handling of it.
+    # Sent as a normal message (not a popup) so it's easy to copy/forward.
+    if query.data.startswith("lecturelink:"):
+        _, year, mod_idx_str, subj_idx_str, lec_idx_str = query.data.split(":")
+        await query.answer()
+        try:
+            module = ready_modules(year)[int(mod_idx_str)]
+            subject = ready_subjects(year, module)[int(subj_idx_str)]
+            lecture_key = ready_lecture_keys(year, module, subject)[int(lec_idx_str)]
+        except (KeyError, IndexError, ValueError):
+            await context.bot.send_message(chat_id=user_id, text="⚠️ المحاضرة دي مش موجودة دلوقتي.")
+            return
+        uid, is_new = _lecture_uid(year, lecture_key)
+        if is_new:
+            await save_quiz_index(year)
+            await backup_quiz_to_channel(context, year)   # so a restore can't hand out a different uid later
+        me = await context.bot.get_me()
+        link = f"https://t.me/{me.username}?start={_build_lecture_quicklink_payload(year, uid)}"
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=(
+                "🔗 <b>لينك سريع للمحاضرة دي:</b>\n"
+                f"{link}\n\n"
+                "أي حد يدوس عليه هيوديه على طول للمحاضرة، وهيلاقي زرار ▶️ ابدأ و❌ إلغاء. "
+                "اللينك ده دايم — مش هيتغير لو اتمسحت أو اتضافت محاضرات تانية."
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # ── LECTUREGO: start one-at-a-time delivery of a closed lecture's ready quizzes ──
+    if query.data.startswith("lecturego:"):
+        _, year, mod_idx_str, subj_idx_str, lec_idx_str = query.data.split(":")
+        mod_idx, subj_idx, lec_idx = int(mod_idx_str), int(subj_idx_str), int(lec_idx_str)
+        if year not in YEARS or not year_channel_id(year):
+            await query.edit_message_text("⚠️ السنة دي مش متاحة دلوقتي.")
+            return
+
+        modules = ready_modules(year)
+        if mod_idx >= len(modules):
+            await query.edit_message_text("⚠️ الموديول ده مش موجود دلوقتي.")
+            return
+        module = modules[mod_idx]
+        subjects = ready_subjects(year, module)
+        if subj_idx >= len(subjects):
+            await query.edit_message_text("⚠️ المادة دي مش موجودة دلوقتي.")
+            return
+        subject = subjects[subj_idx]
+        names = ready_lecture_keys(year, module, subject)
+        if lec_idx >= len(names):
+            await query.edit_message_text("⚠️ المحاضرة دي مش موجودة دلوقتي.")
+            return
+        lecture_key = names[lec_idx]
+        entry = QUIZ_INDEX[year][lecture_key]
+        ids   = entry["ids"]
+
+        # Only polls Telegram has confirmed as stopped are actually
+        # deliverable — a quiz poll's correct answer isn't known until
+        # it's closed, and we need that to rebuild it as our own poll.
+        closed_message_ids = {v["message_id"] for v in QUIZ_POLL_STATUS[year].values() if v["closed"]}
+        ready_ids     = [mid for mid in ids if mid in closed_message_ids]
+        not_ready_cnt = len(ids) - len(ready_ids)
+
+        if not ready_ids:
+            await query.edit_message_text(
+                "⚠️ محدش قفل أي سؤال في المحاضرة دي لسه — هتتبعت لما الأدمن يوقف التصويت."
+                if not_ready_cnt else
+                "⚠️ المحاضرة دي مفيهاش أسئلة.",
+            )
+            return
+
+        randomize = get_randomize_enabled(user_id)
+        if randomize:
+            ready_ids = list(ready_ids)
+            random.shuffle(ready_ids)
+
+        # Written (unscored) entries for this lecture — never counted in
+        # "total"/"answered"/"correct" (see _deliver_written_item), just
+        # extra content mixed into delivery. Governed by its OWN setting
+        # (Mix Written), independent of Randomize (which only controls the
+        # order of the real poll questions): Mix Written ON scatters written
+        # entries at random positions among the polls WITHOUT reshuffling
+        # the polls' own order a second time (that order was already
+        # decided by Randomize just above); OFF (the default) always trails
+        # them at the end, in authoring order, even while Randomize is on —
+        # see parse_written_channel_block / handle_quiz_channel_message.
+        written_items = []
+        for w in (entry.get("written") or []):
+            wd = dict(w)
+            wd.update({
+                "year": year,
+                "module": module,
+                "subject": subject,
+                "lecture": entry.get("name", lecture_key),
+            })
+            written_items.append({"type": "written", "data": wd})
+        queue = list(ready_ids)
+        if get_mix_written_enabled(user_id):
+            for w in written_items:
+                queue.insert(random.randint(0, len(queue)), w)
+        else:
+            queue += written_items
+
+        auto_next = get_auto_next_enabled(user_id)
+        lr_key = _lr_key(year, lecture_key)
+        already_attempted = str(user_id) in _get_lecture_results(lr_key)
+
+        # Built once here, scoped to just this lecture's polls, so
+        # _advance_lecture_session can do an O(1) lookup by message_id per
+        # wrong answer instead of an O(n) scan over every poll ever tracked
+        # for the year.
+        poll_status_by_mid = {
+            v["message_id"]: v
+            for v in QUIZ_POLL_STATUS[year].values()
+            if v["lecture"] == lecture_key
+        }
+
+        session = {
+            "year": year, "module": module, "subject": subject, "lecture_key": lecture_key,
+            "queue": queue, "current_poll_id": None, "current_correct_id": None,
+            "total": len(ready_ids), "answered": 0, "correct": 0,
+            "mode": "auto" if auto_next else "batch",
+            "pending_polls": {},
+            "award_xp": not already_attempted,   # no XP farming on repeat attempts
+            "poll_status_by_mid": poll_status_by_mid,
+            "started_at": time.time(),   # see EXTRA_ACHIEVEMENTS' quick_thinker, checked in _finish_lecture_session
+            "kind": "lecture",
+        }
+        LECTURE_SESSIONS[user_id] = session
+
+        await query.edit_message_text(
+            f"🎓 <b>{year_label(year)} — {module} - {subject}: {entry['name']}</b> — {len(ready_ids)} سؤال، "
+            + ("هيتبعتولك واحد واحد 👇" if auto_next else "هيتبعتولك كلهم دلوقتي 👇")
+            + ("\n\n(محاولة تانية — من غير XP)" if already_attempted else ""),
+            parse_mode=ParseMode.HTML,
+        )
+
+        if auto_next:
+            sent = await _deliver_next_lecture_question(context, user_id, session)
+        else:
+            session["total"] = 0  # corrected below to how many actually go out
+            sent_count = await _deliver_all_lecture_questions(context, user_id, session)
+            session["total"] = sent_count
+            sent = sent_count > 0
+        if not sent:
+            LECTURE_SESSIONS.pop(user_id, None)
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="⚠️ المحاضرة دي اتحذفت من القناة، فاتشالت من القايمة.",
+            )
+            await backup_quiz_to_channel(context, year)
+            return
+
+        if not_ready_cnt:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    f"⚠️ {not_ready_cnt} Quiz not ready yet"
+                    "use /report_issue للتواصل مع أدمن"
+                ),
+            )
+        return
+
+    # ═══════════════════════════════════════════════════════════
+    # /edit_quiz — year -> module -> subject -> lecture -> question ->
+    # delete / insert-after. Own eqyr:/eqmodule:/eqsubject:/eqlecture:/
+    # eqq:/eqdel:/eqins: namespace, deliberately parallel to the
+    # yr:/module:/subject:/lecture: browsing flow above rather than
+    # reusing it, since every step here needs an admin gate and the final
+    # step (lecture) branches completely differently (question list
+    # instead of a start/leaderboard preview).
+    # ═══════════════════════════════════════════════════════════
+
+    # Every /edit_quiz callback lives in the "eq" namespace — eqyr:/
+    # eqmodule:/eqsubject:/eqlecture:/eqq:/eqdel:/eqins:/eqedit:/eqedq:/
+    # eqedo:/eqedex:/eqedc:/eqedcpick:/eqeditcancel:/eqmsstart:/
+    # eqmstoggle:/eqmsconfirm/eqmscancel — so one prefix check covers the
+    # whole flow instead of listing each one by hand and risking a new
+    # sub-flow slipping through ungated.
+    if query.data.startswith("eq"):
+        if not is_admin(update):
+            await query.answer("🚫 للأدمن فقط", show_alert=True)
+            return
+        # Defense in depth on top of the eqyr:/alyr: gate below: every
+        # eq*: callback past the year picker still carries that same year
+        # as its own first argument (the only exceptions — eqmstoggle:/
+        # eqmsconfirm/eqmscancel — never reach here with a year in
+        # parts[1], since they're either mid-only or bare, so this check
+        # simply no-ops for them and they lean on EQMS_SELECTED, itself
+        # only ever populated by an already year-gated eqmsstart:).
+        parts = query.data.split(":")
+        if len(parts) >= 2 and parts[1] in YEARS and not can_edit_year(update, parts[1]):
+            await query.edit_message_text(_wrong_year_msg(update))
+            return
+
+    # Every /add_lecture picker callback lives in the "al" namespace —
+    # alyr_root/alyr:/almod:/alsubj: — same one-prefix-covers-it-all gate
+    # as "eq" above.
+    if query.data.startswith("al"):
+        if not is_admin(update):
+            await query.answer("🚫 للأدمن فقط", show_alert=True)
+            return
+        parts = query.data.split(":")
+        if len(parts) >= 2 and parts[1] in YEARS and not can_edit_year(update, parts[1]):
+            await query.edit_message_text(_wrong_year_msg(update))
+            return
+
+    if query.data == "alyr_root":
+        years = configured_years()
+        bound = admin_bound_year(user_id)
+        if bound:
+            years = [y for y in years if y == bound]
+        buttons = [[InlineKeyboardButton(year_label(y), callback_data=f"alyr:{y}")] for y in years]
+        await query.edit_message_text(
+            "📚 <b>Add Lecture — اختار السنة:</b>", parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    if query.data.startswith("alyr:"):
+        # (year ownership already checked generically above, at the "al"
+        # prefix gate)
+        _, year = query.data.split(":")
+        modules = ready_modules(year)
+        if not modules:
+            await query.edit_message_text("📭 مفيش موديولات متعرفة للسنة دي.")
+            return
+        buttons = [[InlineKeyboardButton(m, callback_data=f"almod:{year}:{i}")] for i, m in enumerate(modules)]
+        buttons.append([InlineKeyboardButton("🔙 رجوع للسنين", callback_data="alyr_root")])
+        await query.edit_message_text(
+            f"📚 {year_label(year)} — اختار الموديول:", reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+
+    if query.data.startswith("almod:"):
+        _, year, mod_idx_str = query.data.split(":")
+        mod_idx = int(mod_idx_str)
+        modules = ready_modules(year)
+        if mod_idx >= len(modules):
+            await query.edit_message_text("⚠️ الموديول ده مش موجود دلوقتي.")
+            return
+        module = modules[mod_idx]
+        subjects = ready_subjects(year, module)
+        if not subjects:
+            await query.edit_message_text("📭 مفيش مواد متعرفة للموديول ده.")
+            return
+        buttons = [
+            [InlineKeyboardButton(s, callback_data=f"alsubj:{year}:{mod_idx}:{i}")]
+            for i, s in enumerate(subjects)
+        ]
+        buttons.append([InlineKeyboardButton("🔙 رجوع للموديولات", callback_data=f"alyr:{year}")])
+        await query.edit_message_text(
+            f"📚 {module} — اختار المادة:", reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+
+    if query.data.startswith("alsubj:"):
+        _, year, mod_idx_str, subj_idx_str = query.data.split(":")
+        mod_idx, subj_idx = int(mod_idx_str), int(subj_idx_str)
+        modules = ready_modules(year)
+        if mod_idx >= len(modules):
+            await query.edit_message_text("⚠️ الموديول ده مش موجود دلوقتي.")
+            return
+        module = modules[mod_idx]
+        subjects = ready_subjects(year, module)
+        if subj_idx >= len(subjects):
+            await query.edit_message_text("⚠️ المادة دي مش موجودة دلوقتي.")
+            return
+        subject = subjects[subj_idx]
+
+        # One authoring session per year at a time — shares the exact same
+        # single-flight lock the channel-authoring flow uses
+        # (QUIZ_STATE[year]["current_lecture"]), so a DM session and a
+        # channel session can never clash over the same year.
+        existing_current = QUIZ_STATE[year].get("current_lecture")
+        if existing_current and existing_current in QUIZ_INDEX[year] and not QUIZ_INDEX[year][existing_current]["closed"]:
+            await query.edit_message_text(
+                f"⚠️ في محاضرة مفتوحة دلوقتي (<b>{existing_current}</b>) — لازم تتقفل بـ -END الأول.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        AWAITING_ADD_LECTURE_NAME[user_id] = {"year": year, "module": module, "subject": subject}
+        await query.edit_message_text(
+            f"📚 {module} - {subject}\n\n"
+            "ابعت رقم المحاضرة واسمها بالصيغة:\n<code>رقم: الاسم</code>\n"
+            "مثال: <code>3: Insulin Signaling</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # ── ALEND: "End Lecture" button on the running-count status message ──
+    if query.data == "alend":
+        al_state = ADD_LECTURE_STATE.get(user_id)
+        if not al_state:
+            await query.edit_message_text("⚠️ مفيش محاضرة مفتوحة دلوقتي.")
+            return
+        summary, err = await _close_add_lecture(context, user_id, al_state)
+        await query.edit_message_text(err or summary, parse_mode=ParseMode.HTML)
+        return
+
+    # ── ALCANCEL: "Cancel Lecture" — drops only what this session added ──
+    if query.data == "alcancel":
+        al_state = ADD_LECTURE_STATE.pop(user_id, None)
+        if not al_state:
+            await query.edit_message_text("⚠️ مفيش محاضرة مفتوحة دلوقتي.")
+            return
+        dropped = await _cancel_add_lecture(al_state)
+        await query.edit_message_text(
+            f"❌ اتلغت المحاضرة. اتشال {dropped} سؤال كان اتسجل في الجلسة دي."
+            if dropped else "❌ اتلغت المحاضرة.",
+        )
+        return
+
+    if query.data == "eqyr_root":
+        years = configured_years()
+        bound = admin_bound_year(user_id)
+        if bound:
+            years = [y for y in years if y == bound]
+        if not years:
+            await query.edit_message_text("📭 مفيش سنين متاحة دلوقتي.")
+            return
+        buttons = [[InlineKeyboardButton(year_label(y), callback_data=f"eqyr:{y}")] for y in years]
+        await query.edit_message_text(
+            "✏️ <b>Edit Quiz — اختار السنة:</b>", parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    if query.data.startswith("eqyr:") and query.data.count(":") == 1:
+        year = query.data.split(":")[1]
+        if year not in YEARS or not year_channel_id(year):
+            await query.edit_message_text("⚠️ السنة دي مش متاحة دلوقتي.")
+            return
+        # (year ownership already checked generically above, at the "eq"
+        # prefix gate)
+        modules = ready_modules(year)
+        if not modules:
+            await query.edit_message_text(f"📭 مفيش موديولات متظبطة لـ {year_label(year)} لسه.")
+            return
+        buttons = [[InlineKeyboardButton("🔎 Search Questions", callback_data=f"eqsrch:{year}:all")]]
+        buttons += [[InlineKeyboardButton(module_label(m), callback_data=f"eqmodule:{year}:{i}")] for i, m in enumerate(modules)]
+        buttons.append([InlineKeyboardButton("🔙 رجوع للسنين", callback_data="eqyr_root")])
+        await query.edit_message_text(
+            f"✏️ <b>{year_label(year)}</b> — اختار الموديول:", parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    if query.data.startswith("eqmodule:") and query.data.count(":") == 2:
+        _, year, mod_idx_str = query.data.split(":")
+        mod_idx = int(mod_idx_str)
+        if year not in YEARS or not year_channel_id(year):
+            await query.edit_message_text("⚠️ السنة دي مش متاحة دلوقتي.")
+            return
+        modules = ready_modules(year)
+        if mod_idx >= len(modules):
+            await query.edit_message_text("⚠️ الموديول ده مش موجود دلوقتي.")
+            return
+        module = modules[mod_idx]
+        subjects = ready_subjects(year, module)
+        buttons = [
+            [InlineKeyboardButton(subject_label(s), callback_data=f"eqsubject:{year}:{mod_idx}:{i}")]
+            for i, s in enumerate(subjects)
+        ]
+        buttons.append([InlineKeyboardButton("🔎 Search in this module", callback_data=f"eqsrch:{year}:{mod_idx}")])
+        buttons.append([InlineKeyboardButton("🔙 رجوع للموديولات", callback_data=f"eqyr:{year}")])
+        await query.edit_message_text(
+            f"✏️ <b>{year_label(year)} — {module}</b> — اختار المادة:", parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    if query.data.startswith("eqsubject:"):
+        _, year, mod_idx_str, subj_idx_str = query.data.split(":")
+        mod_idx, subj_idx = int(mod_idx_str), int(subj_idx_str)
+        if year not in YEARS or not year_channel_id(year):
+            await query.edit_message_text("⚠️ السنة دي مش متاحة دلوقتي.")
+            return
+        modules = ready_modules(year)
+        if mod_idx >= len(modules):
+            await query.edit_message_text("⚠️ الموديول ده مش موجود دلوقتي.")
+            return
+        module = modules[mod_idx]
+        subjects = ready_subjects(year, module)
+        if subj_idx >= len(subjects):
+            await query.edit_message_text("⚠️ المادة دي مش موجودة دلوقتي.")
+            return
+        subject = subjects[subj_idx]
+        names = ready_lecture_keys(year, module, subject)
+        buttons = [
+            [InlineKeyboardButton(
+                f"Lecture {QUIZ_INDEX[year][name]['lecture_number'] or (i + 1)}: {QUIZ_INDEX[year][name]['name']}",
+                callback_data=f"eqlecture:{year}:{mod_idx}:{subj_idx}:{i}",
+            )]
+            for i, name in enumerate(names)
+        ]
+        buttons.append([InlineKeyboardButton("🔙 رجوع للمواد", callback_data=f"eqmodule:{year}:{mod_idx}")])
+        header = f"✏️ <b>{year_label(year)} — {module} - {subject}</b>"
+        if not names:
+            header += "\n\n📭 لسه مفيش محاضرات هنا."
+        await query.edit_message_text(
+            header, parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    # ── 📎 EQ ATTACH: add / replace / remove a case study or image on an ──
+    # EXISTING question (separate from the eqedit: menu).
+    # eqatt:<idx>   -> submenu showing what the question has now
+    # eqattc:<idx>  -> arm AWAITING_EQ_ATTACH kind=case, next text message
+    # eqatti:<idx>  -> arm AWAITING_EQ_ATTACH kind=image, next photo
+    # eqattxc:/eqattxi:<idx> -> remove the case study / image
+    # where <idx> = year:mod_idx:subj_idx:lec_idx:mid (the eqq: shape).
+    if query.data.startswith(("eqatt:", "eqattc:", "eqatti:", "eqattxc:", "eqattxi:")):
+        prefix, year, mod_str, subj_str, lec_str, mid_str = query.data.split(":")
+        mod_idx, subj_idx, lec_idx, mid = int(mod_str), int(subj_str), int(lec_str), int(mid_str)
+        AWAITING_EQ_ATTACH.pop(user_id, None)   # any menu tap cancels a half-finished attach
+        err, att_text, att_markup = _eq_att_menu(year, mod_idx, subj_idx, lec_idx, mid)
+        if err:
+            await query.edit_message_text(err)
+            return
+
+        if prefix in ("eqattc", "eqatti"):
+            if ADD_LECTURE_STATE.get(user_id):
+                await query.edit_message_text("⚠️ عندك محاضرة مفتوحة للإضافة بالفعل — اقفلها (End) أو الغيها (Cancel) الأول.")
+                return
+            kind = "case" if prefix == "eqattc" else "image"
+            AWAITING_EQ_ATTACH[user_id] = {
+                "kind": kind, "year": year, "mid": mid,
+                "mod_idx": mod_idx, "subj_idx": subj_idx, "lec_idx": lec_idx,
+            }
+            ask = (
+                "📝 ابعت دلوقتي الـ <b>Case study</b> (نص) — هيتبعت قبل السؤال ده."
+                if kind == "case" else
+                "🖼 ابعت دلوقتي <b>الصورة</b> — هتظهر مع السؤال ده."
+            )
+            await query.edit_message_text(
+                f"{ask}\n(لو فيه واحد قديم هيتستبدل.)",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                    "❌ Cancel", callback_data=f"eqatt:{year}:{mod_idx}:{subj_idx}:{lec_idx}:{mid}")]]),
+            )
+            return
+
+        if prefix in ("eqattxc", "eqattxi"):
+            lecture_key, entry = _eq_att_lecture_of(year, mid)
+            key = "poll_case_studies" if prefix == "eqattxc" else "poll_images"
+            if entry is not None and entry.get(key):
+                entry[key] = [x for x in entry[key] if x["mid"] != mid]
+                if not entry[key]:
+                    entry.pop(key, None)
+                await save_quiz_index(year)
+                await backup_quiz_to_channel(context, year)
+                await _send_toast_message(context, query.message.chat_id, "🗑 اتشال.")
+            err, att_text, att_markup = _eq_att_menu(year, mod_idx, subj_idx, lec_idx, mid)
+
+        await query.edit_message_text(att_text, parse_mode=ParseMode.HTML, reply_markup=att_markup)
+        return
+
+    # ── 🔎 EQ SEARCH ─────────────────────────────────────────────────
+    # eqsrch:<year>:<mod_idx|all>  -> arms AWAITING_EQ_SEARCH, asks for text
+    # eqsrchpage:<token>:<page>    -> flips the results list
+    # eqsrchpick:<token>:<mid>     -> preview of one hit: Delete / Edit / back
+    # eqsrchdel:<token>:<mid>      -> removes it (same effect as eqdel:) and
+    #                                 lands back on the results list
+    # <token> ties buttons to one specific search; a newer search or a bot
+    # restart (in-memory state) makes older lists read as expired. All of
+    # these start with "eq", so the admin + year gate above covers them.
+    if query.data.startswith("eqsrch:"):
+        _, year, mod_token = query.data.split(":")
+        if year not in YEARS or not year_channel_id(year):
+            await query.edit_message_text("⚠️ السنة دي مش متاحة دلوقتي.")
+            return
+        mod_idx = None if mod_token == "all" else int(mod_token)
+        if mod_idx is not None and mod_idx >= len(ready_modules(year)):
+            await query.edit_message_text("⚠️ الموديول ده مش موجود دلوقتي.")
+            return
+        AWAITING_EQ_SEARCH[user_id] = {"year": year, "mod_idx": mod_idx}
+        back = f"eqyr:{year}" if mod_idx is None else f"eqmodule:{year}:{mod_idx}"
+        await query.edit_message_text(
+            f"🔎 <b>Search Questions</b>\n✏️ 📚 {_eq_search_scope(year, mod_idx)}\n\n"
+            "اكتب كلمة أو جزء من السؤال (أو من الاختيارات) وهجيبلك كل الأسئلة المطابقة.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=back)]]),
+        )
+        return
+
+    if query.data.startswith(("eqsrchpage:", "eqsrchpick:", "eqsrchdel:")):
+        prefix, token, num_str = query.data.split(":")
+        chat_id = query.message.chat_id
+        state = EQ_SEARCH_RESULTS.get(user_id)
+        if not state or state["token"] != token:
+            await _send_toast_message(context, chat_id, "⚠️ نتيجة البحث دي انتهت — ابحث تاني.")
+            return
+        year = state["year"]
+        if not can_edit_year(update, year):
+            await query.edit_message_text(_wrong_year_msg(update))
+            return
+        num = int(num_str)
+
+        if prefix == "eqsrchpage":
+            text, markup = _eq_search_list_view(state, num)
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+            return
+
+        m = next((x for x in state["matches"] if x["mid"] == num), None)
+        lecture_key = next(
+            (k for k, v in QUIZ_INDEX[year].items() if num in v["ids"]), None
+        ) if m else None
+        if not m or lecture_key is None:
+            # Gone since the search (deleted elsewhere) — drop it and refresh the list.
+            state["matches"] = [x for x in state["matches"] if x["mid"] != num]
+            await _send_toast_message(context, chat_id, "⚠️ السؤال ده مش موجود دلوقتي.")
+            if state["matches"]:
+                text, markup = _eq_search_list_view(state, state["page"])
+                await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+            else:
+                await query.edit_message_text("📭 مفيش نتايج تانية.", reply_markup=_eq_search_back_markup(year, state["mod_idx"]))
+            return
+
+        if prefix == "eqsrchpick":
+            status = _poll_status_index(year).get(num) or {}
+            options = status.get("options") or []
+            correct = status.get("correct_option_id")
+            opts_text = "\n".join(
+                f"{string.ascii_uppercase[i]}) {'✅ ' if i == correct else ''}{o}" for i, o in enumerate(options)
+            )
+            idx = f"{year}:{m['mod_idx']}:{m['subj_idx']}:{m['lec_idx']}:{num}"
+            await query.edit_message_text(
+                f"✏️ <b>{html.escape(m['lecture_name'])}</b> — {subject_label(m['subject'])}\n\n"
+                f"❓ {html.escape(m['question'])}\n\n{html.escape(opts_text)}",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🗑 Delete this poll", callback_data=f"eqsrchdel:{token}:{num}")],
+                    [InlineKeyboardButton("✏️ Edit this poll", callback_data=f"eqedit:{idx}")],
+                    [InlineKeyboardButton("📎 Add case / image", callback_data=f"eqatt:{idx}")],
+                    [InlineKeyboardButton("🔙 رجوع للنتائج", callback_data=f"eqsrchpage:{token}:{state['page']}")],
+                ]),
+            )
+            return
+
+        # eqsrchdel — same steps as eqdel: (channel message itself is left alone)
+        QUIZ_INDEX[year][lecture_key]["ids"].remove(num)
+        await save_quiz_index(year)
+        for pid in [pid for pid, v in QUIZ_POLL_STATUS[year].items() if v["message_id"] == num]:
+            QUIZ_POLL_STATUS[year].pop(pid, None)
+        await save_quiz_poll_status(year)
+        await backup_quiz_to_channel(context, year)
+        state["matches"] = [x for x in state["matches"] if x["mid"] != num]
+        await _send_toast_message(context, chat_id, "🗑 اتشال السؤال (الرسالة لسه في القناة — احذفها يدوي لو عايز)")
+        if state["matches"]:
+            text, markup = _eq_search_list_view(state, state["page"])
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        else:
+            await query.edit_message_text(
+                "📭 مفيش نتايج تانية.", reply_markup=_eq_search_back_markup(year, state["mod_idx"]),
+            )
+        return
+
+    # ── EQLECTURE: list this lecture's questions (split across two
+    # messages for a long lecture — see _eq_lecture_list_view) ──
+    if query.data.startswith("eqlecture:"):
+        _, year, mod_idx_str, subj_idx_str, lec_idx_str = query.data.split(":")
+        mod_idx, subj_idx, lec_idx = int(mod_idx_str), int(subj_idx_str), int(lec_idx_str)
+        if year not in YEARS or not year_channel_id(year):
+            await query.edit_message_text("⚠️ السنة دي مش متاحة دلوقتي.")
+            return
+        modules = ready_modules(year)
+        if mod_idx >= len(modules):
+            await query.edit_message_text("⚠️ الموديول ده مش موجود دلوقتي.")
+            return
+        module = modules[mod_idx]
+        subjects = ready_subjects(year, module)
+        if subj_idx >= len(subjects):
+            await query.edit_message_text("⚠️ المادة دي مش موجودة دلوقتي.")
+            return
+        subject = subjects[subj_idx]
+        names = ready_lecture_keys(year, module, subject)
+        if lec_idx >= len(names):
+            await query.edit_message_text("⚠️ المحاضرة دي مش موجودة دلوقتي.")
+            return
+        lecture_key = names[lec_idx]
+        entry = QUIZ_INDEX[year][lecture_key]
+        ids = entry["ids"]
+        if not ids and not entry.get("written"):
+            await query.edit_message_text(
+                f"✏️ <b>{entry['name']}</b>\n\n📭 مفيش أسئلة في المحاضرة دي.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 رجوع", callback_data=f"eqsubject:{year}:{mod_idx}:{subj_idx}")
+                ]]),
+            )
+            return
+
+        parts = _eq_lecture_list_view(year, mod_idx, subj_idx, lec_idx, lecture_key, entry)
+        first_text, first_markup = parts[0]
+        await query.edit_message_text(first_text, parse_mode=ParseMode.HTML, reply_markup=first_markup)
+        for extra_text, extra_markup in parts[1:]:
+            await context.bot.send_message(
+                chat_id=query.message.chat_id, text=extra_text,
+                parse_mode=ParseMode.HTML, reply_markup=extra_markup,
+            )
+        return
+
+    # ── EQQ: one question picked — show its preview + action buttons ──
+    # Identified by mid (the question's own channel message_id), not by
+    # position — see the comment on the eqlecture: button-building above.
+    if query.data.startswith("eqq:"):
+        _, year, mod_idx_str, subj_idx_str, lec_idx_str, mid_str = query.data.split(":")
+        mod_idx, subj_idx, lec_idx, mid = int(mod_idx_str), int(subj_idx_str), int(lec_idx_str), int(mid_str)
+        if year not in YEARS or not year_channel_id(year):
+            await query.edit_message_text("⚠️ السنة دي مش متاحة دلوقتي.")
+            return
+        modules = ready_modules(year)
+        if mod_idx >= len(modules):
+            await query.edit_message_text("⚠️ الموديول ده مش موجود دلوقتي.")
+            return
+        module = modules[mod_idx]
+        subjects = ready_subjects(year, module)
+        if subj_idx >= len(subjects):
+            await query.edit_message_text("⚠️ المادة دي مش موجودة دلوقتي.")
+            return
+        subject = subjects[subj_idx]
+        names = ready_lecture_keys(year, module, subject)
+        if lec_idx >= len(names):
+            await query.edit_message_text("⚠️ المحاضرة دي مش موجودة دلوقتي.")
+            return
+        lecture_key = names[lec_idx]
+        entry = QUIZ_INDEX[year][lecture_key]
+        ids = entry["ids"]
+        if mid not in ids:
+            await query.edit_message_text("⚠️ السؤال ده مش موجود دلوقتي — يمكن اتعدل من حتة تانية.")
+            return
+        q_pos = ids.index(mid)   # display-only (e.g. "3/12") — never used to look anything up
+        status = next((v for v in QUIZ_POLL_STATUS[year].values() if v["message_id"] == mid), None)
+        preview = html.escape(status["question"]) if status and status.get("question") else "؟؟؟"
+
+        buttons = [
+            [InlineKeyboardButton("✏️ Edit this poll", callback_data=f"eqedit:{year}:{mod_idx}:{subj_idx}:{lec_idx}:{mid}")],
+            [InlineKeyboardButton("📎 Add case / image", callback_data=f"eqatt:{year}:{mod_idx}:{subj_idx}:{lec_idx}:{mid}")],
+            [InlineKeyboardButton("🗑 Delete this poll", callback_data=f"eqdel:{year}:{mod_idx}:{subj_idx}:{lec_idx}:{mid}")],
+            [InlineKeyboardButton("➕ Insert new poll after", callback_data=f"eqins:{year}:{mod_idx}:{subj_idx}:{lec_idx}:{mid}")],
+            [InlineKeyboardButton("🔙 رجوع للأسئلة", callback_data=f"eqlecture:{year}:{mod_idx}:{subj_idx}:{lec_idx}")],
+        ]
+        await query.edit_message_text(
+            f"✏️ <b>{entry['name']}</b> — سؤال {q_pos + 1}/{len(ids)}\n\n"
+            f"❓ {preview}\n\nاختار الإجراء:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    # ── EQDEL: remove this question from the lecture's index + poll status ──
+    # (channel message itself is left untouched — same convention as
+    # /quiz_delete for whole lectures.)
+    if query.data.startswith("eqdel:"):
+        _, year, mod_idx_str, subj_idx_str, lec_idx_str, mid_str = query.data.split(":")
+        mod_idx, subj_idx, lec_idx, mid = int(mod_idx_str), int(subj_idx_str), int(lec_idx_str), int(mid_str)
+        if year not in YEARS or not year_channel_id(year):
+            await query.edit_message_text("⚠️ السنة دي مش متاحة دلوقتي.")
+            return
+        modules = ready_modules(year)
+        if mod_idx >= len(modules):
+            await query.edit_message_text("⚠️ الموديول ده مش موجود دلوقتي.")
+            return
+        module = modules[mod_idx]
+        subjects = ready_subjects(year, module)
+        if subj_idx >= len(subjects):
+            await query.edit_message_text("⚠️ المادة دي مش موجودة دلوقتي.")
+            return
+        subject = subjects[subj_idx]
+        names = ready_lecture_keys(year, module, subject)
+        if lec_idx >= len(names):
+            await query.edit_message_text("⚠️ المحاضرة دي مش موجودة دلوقتي.")
+            return
+        lecture_key = names[lec_idx]
+        entry = QUIZ_INDEX[year][lecture_key]
+        ids = entry["ids"]
+        if mid not in ids:
+            await query.edit_message_text("⚠️ السؤال ده مش موجود دلوقتي — يمكن اتعدل من حتة تانية.")
+            return
+        ids.remove(mid)   # by value (mid), not by position — see eqlecture: button comment above
+        await save_quiz_index(year)
+        for pid in [pid for pid, v in QUIZ_POLL_STATUS[year].items() if v["message_id"] == mid]:
+            QUIZ_POLL_STATUS[year].pop(pid, None)
+        await save_quiz_poll_status(year)
+        await backup_quiz_to_channel(context, year)
+
+        buttons = [[InlineKeyboardButton("🔙 رجوع للأسئلة", callback_data=f"eqlecture:{year}:{mod_idx}:{subj_idx}:{lec_idx}")]]
+        await query.edit_message_text(
+            f"🗑 <b>اتشال السؤال من {entry['name']}</b>\n"
+            "(الرسالة نفسها لسه موجودة في القناة — احذفها يدوي لو عايز)",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    # ── EQW: one written (unscored) entry picked — preview + delete ──
+    # Identified by the entry's own "id" (its source message_id), never by
+    # position, same reasoning as eqq: for polls.
+    if query.data.startswith("eqw:"):
+        _, year, mod_idx_str, subj_idx_str, lec_idx_str, wid_str = query.data.split(":")
+        mod_idx, subj_idx, lec_idx = int(mod_idx_str), int(subj_idx_str), int(lec_idx_str)
+        err, entry, lecture_key, ids = _eq_resolve_lecture(year, mod_idx, subj_idx, lec_idx)
+        if err:
+            await query.edit_message_text(err)
+            return
+        w = next((x for x in (entry.get("written") or []) if str(x.get("id")) == wid_str), None)
+        if not w:
+            await query.edit_message_text("⚠️ الجزء المكتوب ده مش موجود دلوقتي — يمكن اتشال من حتة تانية.")
+            return
+        title   = html.escape(str(w.get("title") or "(من غير عنوان)"))
+        content = str(w.get("content") or "")
+        snippet = html.escape(content[:700]) + ("…" if len(content) > 700 else "")
+        buttons = [
+            [InlineKeyboardButton("🗑 Delete this entry", callback_data=f"eqwdel:{year}:{mod_idx}:{subj_idx}:{lec_idx}:{wid_str}")],
+            [InlineKeyboardButton("🔙 رجوع للأسئلة", callback_data=f"eqlecture:{year}:{mod_idx}:{subj_idx}:{lec_idx}")],
+        ]
+        await query.edit_message_text(
+            f"📝 <b>{entry['name']}</b> — سؤال/جزء مكتوب\n\n<b>{title}</b>\n\n{snippet}\n\nاختار الإجراء:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    # ── EQWDEL: remove this written entry from the lecture ────────────
+    if query.data.startswith("eqwdel:"):
+        _, year, mod_idx_str, subj_idx_str, lec_idx_str, wid_str = query.data.split(":")
+        mod_idx, subj_idx, lec_idx = int(mod_idx_str), int(subj_idx_str), int(lec_idx_str)
+        err, entry, lecture_key, ids = _eq_resolve_lecture(year, mod_idx, subj_idx, lec_idx)
+        if err:
+            await query.edit_message_text(err)
+            return
+        before = entry.get("written") or []
+        after  = [x for x in before if str(x.get("id")) != wid_str]
+        if len(after) == len(before):
+            await query.edit_message_text("⚠️ الجزء المكتوب ده مش موجود دلوقتي — يمكن اتشال من حتة تانية.")
+            return
+        if after:
+            entry["written"] = after
+        else:
+            entry.pop("written", None)
+        await save_quiz_index(year)
+        await backup_quiz_to_channel(context, year)
+        await query.edit_message_text(
+            f"🗑 <b>اتشال الجزء المكتوب من {entry['name']}</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                "🔙 رجوع للأسئلة", callback_data=f"eqlecture:{year}:{mod_idx}:{subj_idx}:{lec_idx}"
+            )]]),
+        )
+        return
+
+    # ── EQINS: reopen this lecture as a DM authoring session (same ──────
+    # machinery as /add_lecture — ADD_LECTURE_STATE, forwarded polls,
+    # images, case studies, spoiler written questions, End/Cancel buttons)
+    # with the new polls spliced in right after the chosen question
+    # instead of appended at the end (al_state["insert_after"], advanced
+    # to each newly inserted mid — see _capture_add_lecture_poll).
+    # eqtail: is the same session without a target question — new polls are
+    # appended at the END (tail) of the lecture instead of spliced in after
+    # one (al_state["insert_after"] stays None, which _capture_add_lecture_poll
+    # treats as "append"). Either way, an image / case study sent right before
+    # a forwarded poll binds to that poll and shows before it.
+    if query.data.startswith(("eqins:", "eqtail:")):
+        is_tail = query.data.startswith("eqtail:")
+        if is_tail:
+            _, year, mod_idx_str, subj_idx_str, lec_idx_str = query.data.split(":")
+            target_mid = None
+        else:
+            _, year, mod_idx_str, subj_idx_str, lec_idx_str, mid_str = query.data.split(":")
+            target_mid = int(mid_str)
+        mod_idx, subj_idx, lec_idx = int(mod_idx_str), int(subj_idx_str), int(lec_idx_str)
+        err, entry, lecture_key, ids = _eq_resolve_lecture(year, mod_idx, subj_idx, lec_idx)
+        if err:
+            await query.edit_message_text(err)
+            return
+        if target_mid is not None and target_mid not in ids:
+            await query.edit_message_text("⚠️ السؤال ده مش موجود دلوقتي — يمكن اتعدل من حتة تانية.")
+            return
+        if ADD_LECTURE_STATE.get(user_id):
+            await query.edit_message_text("⚠️ عندك محاضرة مفتوحة للإضافة بالفعل — اقفلها (End) أو الغيها (Cancel) الأول.")
+            return
+        other_current = QUIZ_STATE[year].get("current_lecture")
+        if other_current and other_current in QUIZ_INDEX[year] and not QUIZ_INDEX[year][other_current]["closed"]:
+            await query.edit_message_text(
+                f"⚠️ في محاضرة مفتوحة دلوقتي (<b>{other_current}</b>) — لازم تتقفل بـ -END الأول.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        was_closed_before = entry.get("closed", True)
+        entry["closed"] = False
+        await save_quiz_index(year)
+        QUIZ_STATE[year]["current_lecture"] = lecture_key
+        await save_quiz_state(year)
+        ADD_LECTURE_STATE[user_id] = {
+            "year": year, "lecture_key": lecture_key,
+            "existed_before": True, "was_closed_before": was_closed_before,
+            "session_ids": [], "session_written_ids": [],
+            "status_message_id": None, "pending_image": None, "pending_case_study": None,
+            "insert_after": target_mid,   # new polls splice in after this mid, one after another (None = append at the tail)
+        }
+        where_line = (
+            "هتتضاف في آخر المحاضرة (Tail)، بالترتيب اللي هتبعتهم بيه."
+            if is_tail else
+            "هتتحط بعد السؤال اللي اخترته على طول، بالترتيب اللي هتبعتهم بيه."
+        )
+        await query.edit_message_text(
+            f"➕ <b>{entry['name']}</b> اتفتحت للإضافة.\n\n"
+            "دلوقتي فوروارد الأسئلة (Quiz polls) واحد واحد، وشيل اسم المرسل من كل واحدة "
+            f"(Hide Sender's Name) — {where_line}\n"
+            "لو عايز تضيف صورة أو Case study (نص) لسؤال معين، ابعتها الأول وبعدين فوروارد السؤال. "
+            "وتقدر تبعت سؤال مكتوب وإجابته مخفية بـ Spoiler زي /add_lecture بالظبط.\n"
+            "لما تخلص دوس End Lecture (أو ابعت <code>-END</code>).",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_add_lecture_status_markup(),
+        )
+        return
+
+    # ── EQEDIT: edit-this-poll submenu (question / choices / correct ──
+    # choice / explanation). Only ever touches the saved QUIZ_POLL_STATUS
+    # snapshot used to resend this question everywhere (lecture delivery,
+    # mistakes bank, daily quiz, search) — same "channel message is just
+    # an archival copy" convention eqdel: above already follows. Telegram
+    # itself has no API to edit a live poll's text/options anyway (only
+    # stop_poll to close one), so the snapshot is the only thing that
+    # actually *can* be edited here.
+    if query.data.startswith("eqedit:"):
+        _, year, mod_idx_str, subj_idx_str, lec_idx_str, mid_str = query.data.split(":")
+        mod_idx, subj_idx, lec_idx, mid = int(mod_idx_str), int(subj_idx_str), int(lec_idx_str), int(mid_str)
+        err, entry, lecture_key, ids, pid, status = _eq_resolve(year, mod_idx, subj_idx, lec_idx, mid)
+        if err:
+            await query.edit_message_text(err)
+            return
+        await _render_eq_edit_menu(query, year, mod_idx, subj_idx, lec_idx, mid, entry, status)
+        return
+
+    # ── EQEDQ / EQEDO / EQEDEX: arm AWAITING_EQEDIT for the admin's ──
+    # next typed message (see the AWAITING_EQEDIT block in handle()).
+    if query.data.startswith("eqedq:") or query.data.startswith("eqedo:") or query.data.startswith("eqedex:"):
+        prefix = query.data.split(":", 1)[0]
+        kind_map = {"eqedq": "question", "eqedo": "options", "eqedex": "explanation"}
+        _, year, mod_idx_str, subj_idx_str, lec_idx_str, mid_str = query.data.split(":")
+        mod_idx, subj_idx, lec_idx, mid = int(mod_idx_str), int(subj_idx_str), int(lec_idx_str), int(mid_str)
+        err, entry, lecture_key, ids, pid, status = _eq_resolve(year, mod_idx, subj_idx, lec_idx, mid)
+        if err:
+            await query.edit_message_text(err)
+            return
+        AWAITING_EQEDIT[user_id] = {
+            "kind": kind_map[prefix], "year": year, "mid": mid,
+            "mod_idx": mod_idx, "subj_idx": subj_idx, "lec_idx": lec_idx,
+        }
+        cancel_markup = InlineKeyboardMarkup([[InlineKeyboardButton(
+            "❌ Cancel", callback_data=f"eqeditcancel:{year}:{mod_idx}:{subj_idx}:{lec_idx}:{mid}"
+        )]])
+        prompts = {
+            "question": "✏️ ابعت نص السؤال الجديد:",
+            "options": (
+                "🔤 ابعت الاختيارات الجديدة، سطر لكل اختيار (من غير حروف A)/B) — هيتحطوا تلقائي):\n\n"
+                "⚠️ ده بيستبدل كل الاختيارات القديمة. لو عدد الاختيارات اتغير أو الإجابة الصح "
+                "القديمة طلعت برّه المدى الجديد، هتحتاج تختار الإجابة الصح تاني بعدها من "
+                "<b>✅ Choose different correct choice</b>."
+            ),
+            "explanation": "💬 ابعت الـ explanation الجديد (أو ابعت <code>-</code> عشان تشيله):",
+        }
+        await query.edit_message_text(
+            prompts[kind_map[prefix]], parse_mode=ParseMode.HTML, reply_markup=cancel_markup,
+        )
+        return
+
+    # ── EQEDITCANCEL: drop a pending AWAITING_EQEDIT, back to eqedit: ──
+    if query.data.startswith("eqeditcancel:"):
+        _, year, mod_idx_str, subj_idx_str, lec_idx_str, mid_str = query.data.split(":")
+        mod_idx, subj_idx, lec_idx, mid = int(mod_idx_str), int(subj_idx_str), int(lec_idx_str), int(mid_str)
+        AWAITING_EQEDIT.pop(user_id, None)
+        err, entry, lecture_key, ids, pid, status = _eq_resolve(year, mod_idx, subj_idx, lec_idx, mid)
+        if err:
+            await query.edit_message_text(err)
+            return
+        await _render_eq_edit_menu(query, year, mod_idx, subj_idx, lec_idx, mid, entry, status)
+        return
+
+    # ── EQEDC: pick a new correct choice from the current options ──────
+    # (checked before eqedcpick: further down since that's a longer
+    # prefix sharing this one's first few characters)
+    if query.data.startswith("eqedc:") and not query.data.startswith("eqedcpick:"):
+        _, year, mod_idx_str, subj_idx_str, lec_idx_str, mid_str = query.data.split(":")
+        mod_idx, subj_idx, lec_idx, mid = int(mod_idx_str), int(subj_idx_str), int(lec_idx_str), int(mid_str)
+        err, entry, lecture_key, ids, pid, status = _eq_resolve(year, mod_idx, subj_idx, lec_idx, mid)
+        if err:
+            await query.edit_message_text(err)
+            return
+        buttons = [
+            [InlineKeyboardButton(
+                f"{'✅ ' if i == status.get('correct_option_id') else ''}{string.ascii_uppercase[i]}) {opt[:40]}",
+                callback_data=f"eqedcpick:{year}:{mod_idx}:{subj_idx}:{lec_idx}:{mid}:{i}",
+            )]
+            for i, opt in enumerate(status["options"])
+        ]
+        buttons.append([InlineKeyboardButton("🔙 رجوع", callback_data=f"eqedit:{year}:{mod_idx}:{subj_idx}:{lec_idx}:{mid}")])
+        await query.edit_message_text("✅ اختار الإجابة الصح الجديدة:", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    # ── EQEDCPICK: apply the newly-picked correct choice ───────────────
+    if query.data.startswith("eqedcpick:"):
+        _, year, mod_idx_str, subj_idx_str, lec_idx_str, mid_str, idx_str = query.data.split(":")
+        mod_idx, subj_idx, lec_idx, mid, new_idx = (
+            int(mod_idx_str), int(subj_idx_str), int(lec_idx_str), int(mid_str), int(idx_str)
+        )
+        err, entry, lecture_key, ids, pid, status = _eq_resolve(year, mod_idx, subj_idx, lec_idx, mid)
+        if err:
+            await query.edit_message_text(err)
+            return
+        if new_idx >= len(status["options"]):
+            await query.edit_message_text("⚠️ الاختيار ده مش موجود دلوقتي.")
+            return
+        QUIZ_POLL_STATUS[year][pid]["correct_option_id"] = new_idx
+        await save_quiz_poll_status(year)
+        await backup_quiz_to_channel(context, year)
+        status = QUIZ_POLL_STATUS[year][pid]
+        await _render_eq_edit_menu(query, year, mod_idx, subj_idx, lec_idx, mid, entry, status)
+        return
+
+    # ═══════════════════════════════════════════════════════════
+    # BATCH DELETE (EQMS*) — select-multiple-then-delete for one lecture's
+    # question list. Every handler below answers the tap FIRST (clears
+    # Telegram's loading spinner on the button immediately, no matter what
+    # happens next — including the "message is not modified" no-op edit
+    # case _eqms_render swallows), then does its own state change, then
+    # calls _eqms_render to redraw. EQMS_SELECTED[user_id] is the whole
+    # session: {year, mod_idx, subj_idx, lec_idx, lecture_key, mids, page}.
+    # ═══════════════════════════════════════════════════════════
+
+    # ── EQMSSTART: enter multiselect mode for this lecture ─────────────
+    if query.data.startswith("eqmsstart:"):
+        await query.answer()
+        _, year, mod_idx_str, subj_idx_str, lec_idx_str = query.data.split(":")
+        mod_idx, subj_idx, lec_idx = int(mod_idx_str), int(subj_idx_str), int(lec_idx_str)
+        err, entry, lecture_key, ids = _eq_resolve_lecture(year, mod_idx, subj_idx, lec_idx)
+        if err:
+            await query.edit_message_text(err)
+            return
+        if not ids:
+            await query.edit_message_text("📭 مفيش أسئلة نحذف منها.")
+            return
+        EQMS_SELECTED[user_id] = {
+            "year": year, "mod_idx": mod_idx, "subj_idx": subj_idx, "lec_idx": lec_idx,
+            "lecture_key": lecture_key, "mids": set(), "page": 1,
+        }
+        await _eqms_render(query, user_id, page=1)
+        return
+
+    # ── EQMSPAGE: Previous/Next through a long lecture's selection list ──
+    # (selected mids on other pages stay selected, they just aren't shown).
+    if query.data.startswith("eqmspage:"):
+        await query.answer()
+        if user_id not in EQMS_SELECTED:
+            await query.edit_message_text("⚠️ انتهت جلسة الاختيار دي — ابدأ تاني من قايمة الأسئلة.")
+            return
+        page = int(query.data.split(":", 1)[1])
+        await _eqms_render(query, user_id, page=page)
+        return
+
+    # ── EQMSTOGGLE: flip one question's selected/not-selected state ────
+    # Only carries the mid — year/mod/subj/lec/page all live in
+    # EQMS_SELECTED, keyed by user_id, same as every other
+    # AWAITING_*-style flow here.
+    if query.data.startswith("eqmstoggle:"):
+        await query.answer()
+        state = EQMS_SELECTED.get(user_id)
+        if not state:
+            await query.edit_message_text("⚠️ انتهت جلسة الاختيار دي — ابدأ تاني من قايمة الأسئلة.")
+            return
+        mid = int(query.data.split(":", 1)[1])
+        if mid in state["mids"]:
+            state["mids"].discard(mid)
+        else:
+            state["mids"].add(mid)
+        await _eqms_render(query, user_id, page=state.get("page", 1))
+        return
+
+    # ── EQMSCONFIRM: delete every selected question in one go ──────────
+    if query.data == "eqmsconfirm":
+        await query.answer()
+        state = EQMS_SELECTED.pop(user_id, None)
+        if not state or not state["mids"]:
+            await query.edit_message_text("⚠️ مفيش أسئلة متحددة نحذفها.")
+            return
+        year = state["year"]
+        err, entry, lecture_key, ids = _eq_resolve_lecture(state["year"], state["mod_idx"], state["subj_idx"], state["lec_idx"])
+        if err:
+            await query.edit_message_text(err)
+            return
+        deleted = 0
+        for mid in state["mids"]:
+            if mid in ids:
+                ids.remove(mid)
+                deleted += 1
+            for pid in [p for p, v in QUIZ_POLL_STATUS[year].items() if v["message_id"] == mid]:
+                QUIZ_POLL_STATUS[year].pop(pid, None)
+        await save_quiz_index(year)
+        await save_quiz_poll_status(year)
+        await backup_quiz_to_channel(context, year)
+        buttons = [[InlineKeyboardButton(
+            "🔙 رجوع للأسئلة",
+            callback_data=f"eqlecture:{state['year']}:{state['mod_idx']}:{state['subj_idx']}:{state['lec_idx']}",
+        )]]
+        await query.edit_message_text(
+            f"🗑 اتشال {deleted} سؤال من <b>{entry['name']}</b>\n"
+            "(الرسايل نفسها لسه موجودة في القناة — احذفها يدوي لو عايز)",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    # ── EQMSCANCEL: drop the selection, back to the plain question list ──
+    if query.data == "eqmscancel":
+        await query.answer()
+        state = EQMS_SELECTED.pop(user_id, None)
+        if not state:
+            await query.edit_message_text("تم الإلغاء.")
+            return
+        err, entry, lecture_key, ids = _eq_resolve_lecture(state["year"], state["mod_idx"], state["subj_idx"], state["lec_idx"])
+        if err:
+            await query.edit_message_text(err)
+            return
+        buttons = [[InlineKeyboardButton(
+            "🔙 رجوع للمحاضرات", callback_data=f"eqsubject:{state['year']}:{state['mod_idx']}:{state['subj_idx']}"
+        )]]
+        await query.edit_message_text(
+            f"إلغاء الاختيار. {entry['name']}.", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+
+    # ── RETAKE_WRONG: practice round of just the questions missed in the ──
+    # most recently finished lecture. Always awards XP (no already_attempted
+    # gating — a retake isn't "the lecture", it's remedial practice), and
+    # explicitly never touches the leaderboard/best-score file: see the
+    # is_retake branch in _advance_lecture_session.
+    if query.data == "retake_wrong":
+        staged = RETAKE_STAGING.pop(user_id, None)
+        if not staged or not staged["mids"]:
+            await query.edit_message_text("⚠️ مفيش أسئلة غلط اتسجلت — يمكن خلصت المراجعة دي قبل كده.")
+            return
+
+        year = staged["year"]
+        module, subject, lecture_key = staged["module"], staged["subject"], staged["lecture_key"]
+        entry = QUIZ_INDEX[year].get(lecture_key, {})
+        mids  = staged["mids"]
+
+        auto_next = get_auto_next_enabled(user_id)
+
+        poll_status_by_mid = {
+            v["message_id"]: v
+            for v in QUIZ_POLL_STATUS[year].values()
+            if v["lecture"] == lecture_key
+        }
+
+        session = {
+            "year": year, "module": module, "subject": subject, "lecture_key": lecture_key,
+            "queue": list(mids), "current_poll_id": None, "current_correct_id": None,
+            "total": len(mids), "answered": 0, "correct": 0,
+            "mode": "auto" if auto_next else "batch",
+            "pending_polls": {},
+            "award_xp": True,      # retakes always earn XP
+            "is_retake": True,     # ...but never touch the leaderboard/results file
+            "poll_status_by_mid": poll_status_by_mid,
+            "kind": "lecture",
+        }
+        LECTURE_SESSIONS[user_id] = session
+
+        await query.edit_message_text(
+            f"🔁 <b>مراجعة الأسئلة الغلط — {year_label(year)} — {module} - {subject}: {entry.get('name', lecture_key)}</b> — "
+            f"{len(mids)} سؤال، "
+            + ("هيتبعتولك واحد واحد 👇" if auto_next else "هيتبعتولك كلهم دلوقتي 👇"),
+            parse_mode=ParseMode.HTML,
+        )
+
+        if auto_next:
+            sent = await _deliver_next_lecture_question(context, user_id, session)
+        else:
+            session["total"] = 0
+            sent_count = await _deliver_all_lecture_questions(context, user_id, session)
+            session["total"] = sent_count
+            sent = sent_count > 0
+        if not sent:
+            LECTURE_SESSIONS.pop(user_id, None)
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="⚠️ الأسئلة دي اتحذفت من القناة، فاتشالت من قايمة المراجعة.",
+            )
+            await backup_quiz_to_channel(context, year)
+        return
+
+    # ── START MENU BUTTONS ──────────────────────────────────────
+    if query.data == "back_home":
+        await query.edit_message_text(
+            f"{quizzy_block(QUIZZY_HAPPY_ART, random.choice(QUIZZY_WELCOME_LINES))}\n\n"
+            "تحب تعمل أي؟!:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=start_menu_keyboard(),
+        )
+        return
+
+    if query.data == "menu_how":
+        await query.edit_message_text(
+            HOW_TO_USE_TEXT, parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🏠 Back to Home", callback_data="back_home"),
+            ]]),
+        )
+        return
+
+    if query.data == "view_achievements":
+        await _send_achievements(context, user_id, query.message, edit=True)
+        return
+
+    if query.data == "menu_mystats":
+        await _send_mystats(context, user_id, query.message, edit=True)
+        return
+
+    if query.data == "menu_bookmarks":
+        await _send_bookmarks(context, user_id, query.message, edit=True, page=1)
+        return
+
+    # ── Bookmarks: Clear Bookmarks (with confirmation) ──
+    # Clears every ❤️ bookmark of the tapping user only (bookmarks aren't
+    # scoped by /daily_module). Confirm screen count == toast count ==
+    # what gets removed. Mistakes-bank entries are never touched.
+    if query.data == "clear_bookmarks_ask":
+        count = len(_bookmark_entries(user_id))
+        if not count:
+            return   # "already empty" toast was shown by _tap_toast
+        await query.edit_message_text(
+            f"⚠️ <b>متأكد إنك عايز تمسح كل الـ Bookmarks بتاعتك؟</b>\n\n"
+            f"هيتمسح <b>{count}</b> سؤال، والعملية دي مش هترجع تاني.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🗑 أيوه، امسح", callback_data="clear_bookmarks_yes")],
+                [InlineKeyboardButton("🔙 لأ، رجّعني", callback_data="menu_bookmarks")],
+            ]),
+        )
+        return
+
+    if query.data == "clear_bookmarks_yes":
+        _clear_user_bookmarks(user_id)
+        await save_mistakes_bank()
+        await backup_mistakes_bank_to_channel(context)
+        await _send_bookmarks(context, user_id, query.message, edit=True, page=1)
+        return
+
+    if query.data.startswith("bookmarks_page:"):
+        page = int(query.data.split(":", 1)[1])
+        await _send_bookmarks(context, user_id, query.message, edit=True, page=page)
+        return
+
+    if query.data == "settings_about_us":
+        await _send_info_page(context, query, ABOUT_US_TEXT, "About Us")
+        return
+
+    if query.data == "settings_support_us":
+        await _send_info_page(context, query, SUPPORT_US_TEXT, "Support Us")
+        return
+
+    if query.data == "settings_terms":
+        await _send_info_page(context, query, TERMS_OF_SERVICE_TEXT, "Terms of Service")
+        return
+
+    if query.data == "leaderboard_menu":
+        # Main-menu 🏆 Leaderboard button: a small hub that lets the user
+        # pick which board to open (Weekly or Global).
+        await query.edit_message_text(
+            "🏆 <b>Leaderboard</b>\n\nاختار الترتيب اللي عايز تشوفه:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("📅 Weekly", callback_data="weekly_leaderboard"),
+                    InlineKeyboardButton("🌍 Global", callback_data="year_leaderboard"),
+                ],
+                [InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")],
+            ]),
+        )
+        return
+
+    if query.data == "weekly_leaderboard" or query.data.startswith("weekly_leaderboard:"):
+        # Weekly board: this week's correct answers only (resets every
+        # Friday 00:00 Cairo time — see _weekly_window), same cohort filter
+        # and paging as the global board, plus each user's current level
+        # and level title.
+        page = 1
+        if query.data.startswith("weekly_leaderboard:"):
+            page = int(query.data.split(":")[1])
+        year_class = get_year_class(user_id)
+        rows = _weekly_leaderboard(year_class)
+        title = f"📅 <b>Weekly Leaderboard — {year_class_label(year_class)}</b>"
+        reset_line = f"⏳ بيتصفّر كل جمعة 12 بالليل — فاضل {_weekly_reset_countdown()}"
+        if not rows:
+            text = f"{title}\n{reset_line}\n\nمفيش حد جاوب أسئلة الأسبوع ده لسه — كن أول واحد! 🔥"
+            nav_buttons = []
+        else:
+            page_size   = YEAR_LEADERBOARD_PAGE_SIZE
+            total_pages = (len(rows) + page_size - 1) // page_size
+            page        = max(1, min(page, total_pages))
+            start       = (page - 1) * page_size
+            page_rows   = rows[start:start + page_size]
+
+            lines = [title, reset_line, ""]
+            for i, r in enumerate(page_rows, start + 1):
+                lines.append(
+                    f"{i}# {html.escape(r['name'])} — {r['correct']} ✅ · {r['accuracy']:.0f}% دقة"
+                )
+                lines.append(f"      ⭐ Lv {r['level']} · <i>{html.escape(r['title'])}</i>")
+            text = "\n".join(lines)
+
+            nav_buttons = []
+            if page > 1:
+                nav_buttons.append(InlineKeyboardButton("⬅️ Back", callback_data=f"weekly_leaderboard:{page - 1}"))
+            if page < total_pages:
+                nav_buttons.append(InlineKeyboardButton("➡️ Next", callback_data=f"weekly_leaderboard:{page + 1}"))
+
+        keyboard_rows = ([nav_buttons] if nav_buttons else []) + [
+            [InlineKeyboardButton("🏆 Global Leaderboard", callback_data="year_leaderboard")],
+            [InlineKeyboardButton("⬅️ Leaderboard Menu", callback_data="leaderboard_menu")],
+            [InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")],
+        ]
+        await query.edit_message_text(
+            text, parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(keyboard_rows),
+        )
+        return
+
+    if query.data == "year_leaderboard" or query.data.startswith("year_leaderboard:"):
+        # year_class is guaranteed set by this point — mandatory onboarding
+        # (see _onboarding_gate) means no update reaches here otherwise.
+        # Global leaderboard: top 100 overall, paged YEAR_LEADERBOARD_PAGE_SIZE
+        # (20) at a time via Next/Back buttons — see year_leaderboard: callback.
+        page = 1
+        if query.data.startswith("year_leaderboard:"):
+            page = int(query.data.split(":")[1])
+        year_class = get_year_class(user_id)
+        rows = _year_leaderboard(year_class)   # top 100, already sorted
+        title = f"🏆 <b>Leaderboard — {year_class_label(year_class)}</b>"
+        if not rows:
+            text = f"{title}\n\nمفيش حد جاوب أسئلة محاضرات في السنة دي لسه."
+            nav_buttons = []
+        else:
+            page_size   = YEAR_LEADERBOARD_PAGE_SIZE
+            total_pages = (len(rows) + page_size - 1) // page_size
+            page        = max(1, min(page, total_pages))
+            start       = (page - 1) * page_size
+            page_rows   = rows[start:start + page_size]
+
+            lines = [title]
+            for i, r in enumerate(page_rows, start + 1):
+                lines.append(
+                    f"{i}# {html.escape(r['name'])} — {r['correct']} ✅ · {r['accuracy']:.0f}% دقة"
+                )
+            text = "\n".join(lines)
+
+            nav_buttons = []
+            if page > 1:
+                nav_buttons.append(InlineKeyboardButton("⬅️ Back", callback_data=f"year_leaderboard:{page - 1}"))
+            if page < total_pages:
+                nav_buttons.append(InlineKeyboardButton("➡️ Next", callback_data=f"year_leaderboard:{page + 1}"))
+
+        keyboard_rows = ([nav_buttons] if nav_buttons else []) + [
+            [InlineKeyboardButton("📅 Weekly Leaderboard", callback_data="weekly_leaderboard")],
+            [InlineKeyboardButton("⬅️ Leaderboard Menu", callback_data="leaderboard_menu")],
+            [InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")],
+        ]
+        await query.edit_message_text(
+            text, parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(keyboard_rows),
+        )
+        return
+
+    if query.data == "daily_quiz_leaderboard":
+        # Kept as an alias for any older button still floating around in
+        # chat history — the hub (which "daily_quiz" opens) now always
+        # shows the leaderboard itself, so this just routes there too.
+        await show_daily_quiz_menu(context, user_id, query.message)
+        return
+
+    if query.data == "menu_settings":
+        AWAITING_NICKNAME.pop(user_id, None)
+        await _send_settings(context, user_id, query.message, edit=True)
+        return
+
+    if query.data.startswith("settings_page:"):
+        page = int(query.data.split(":")[1])
+        await _send_settings(context, user_id, query.message, edit=True, page=page)
+        return
+
+    if query.data == "toggle_daily_notifs":
+        entry = _get_settings_entry(user_id)
+        entry["daily_notifs"] = not entry.get("daily_notifs", True)
+        await save_settings()
+        await backup_settings_to_channel(context)
+        await _send_settings(context, user_id, query.message, edit=True, page=2)
+        await _maybe_award_curious(context, user_id)
+        return
+
+    if query.data == "toggle_zikr":
+        entry = _get_settings_entry(user_id)
+        entry["zikr_reminders"] = not entry.get("zikr_reminders", False)
+        await save_settings()
+        await backup_settings_to_channel(context)
+        await _send_settings(context, user_id, query.message, edit=True, page=2)
+        await _maybe_award_curious(context, user_id)
+        return
+
+    # ── settings_year / setyc: — change Year/Class from Settings ──────
+    # Only rewrites SETTINGS[uid]["year_class"]; mistakes/bookmarks keep
+    # their own stored quiz year, stats aren't year-keyed, and
+    # daily_quiz_last_date is per user, so nothing else needs migrating.
+    if query.data == "settings_year":
+        current = get_year_class(user_id)
+        rows = list(year_class_keyboard("setyc").inline_keyboard)
+        rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="menu_settings")])
+        await query.edit_message_text(
+            f"📚 <b>غيّر سنتك/فرقتك</b>\n\n"
+            f"دلوقتي: <b>{html.escape(year_class_label(current))}</b>\n"
+            "اختار السنة الجديدة:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+        return
+
+    if query.data.startswith("setyc:"):
+        year_class = query.data.split(":", 1)[1]
+        if year_class not in YEAR_CLASS_NUMBER:
+            await query.edit_message_text("⚠️ الاختيار ده مش متاح.")
+            return
+        entry = _get_settings_entry(user_id)
+        if entry.get("year_class") != year_class:
+            entry["year_class"] = year_class
+            await save_settings()
+            await backup_settings_to_channel(context)
+        await _send_settings(context, user_id, query.message, edit=True)
+        return
+
+    if query.data == "edit_nickname":
+        AWAITING_NICKNAME[user_id] = True
+        await query.edit_message_text(
+            "✏️ ابعت الاسم المستعار اللي عايزه (حتى 32 حرف).\n"
+            "⚠️ استخدم اسم لائق 🙊 — هو اللي هيظهر في الـ Leaderboard وقدام زمايلك.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 رجوع", callback_data="menu_settings"),
+            ]]),
+        )
+        return
+
+    # ── onboard_yc: / dqyc: — year/class picker tap, from onboarding ──
+    # (right after the first-ever nickname save) or from the Daily Quiz
+    # hub prompting for it first — year/class is set once here and can't
+    # be changed later from Settings -> Change Year (settings_year / setyc:).
+    if query.data.startswith("onboard_yc:") or query.data.startswith("dqyc:"):
+        prefix, year_class = query.data.split(":")
+        is_onboarding = (prefix == "onboard_yc")
+        is_daily_quiz = (prefix == "dqyc")
+        if year_class not in YEAR_CLASS_NUMBER:
+            await query.edit_message_text("⚠️ الاختيار ده مش متاح.")
+            return
+        entry = _get_settings_entry(user_id)
+        entry["year_class"] = year_class
+        await save_settings()
+        await backup_settings_to_channel(context)
+        if is_onboarding:
+            # Quizzy's year quip is no longer a chat message — it went out
+            # as a toast on this very tap (see _tap_toast /
+            # ONBOARDING_YEAR_QUIPS), so the confirmation and the bully
+            # question are one edited message, not two separate ones — the
+            # whole walkthrough flows through a single message via its
+            # buttons rather than piling up new sends. The bully question's
+            # two buttons lead to the "just kidding" step — see
+            # onboard_bully below.
+            await query.edit_message_text(
+                f"{quizzy_block(QUIZZY_HAPPY_ART, 'Do you want me to bully you when you get questions wrong?')}",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("What???", callback_data="onboard_bully:what"),
+                    InlineKeyboardButton("No 😭",   callback_data="onboard_bully:no"),
+                ]]),
+            )
+        elif is_daily_quiz:
+            await show_daily_quiz_menu(context, user_id, query.message)
+        else:
+            await _send_settings(context, user_id, query.message, edit=True)
+        return
+
+    # ── onboarding steps after the year pick ─────────────────────────
+    # bully question -> "just kidding" (onboard_bully) -> either door
+    # (onboard_how / onboard_where) -> the admin's special message ->
+    # onboard_go, the actual finish line into the real main menu.
+    # Either answer to the bully question ("What???" / "No 😭") gets the
+    # same follow-up — the choice isn't stored or acted on, it's just the
+    # joke's setup. Edited in place so the question doesn't linger.
+    if query.data.startswith("onboard_bully:"):
+        await query.edit_message_text(
+            quizzy_block(QUIZZY_WINK_ART, "Haha i am just kidding (maybe)"),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("what is this place?! 🙂", callback_data="onboard_how"),
+                InlineKeyboardButton("Where are we?! 🙃",       callback_data="onboard_where"),
+            ]]),
+        )
+        return
+
+    # BOTH "what is this place?! 🙂" (onboard_how) and "Where are we?! 🙃"
+    # (onboard_where) deliver the same thing: the fixed welcome-tour message
+    # (ONBOARDING_SPECIAL_TEXT, see _send_onboarding_special). They're two
+    # differently-worded doors into the same room.
+    if query.data in ("onboard_how", "onboard_where"):
+        await _send_onboarding_special(query)
+        return
+
+    if query.data == "onboard_go":
+        # Onboarding just finished for real — if they got here by tapping
+        # a lecture quick-link before ever finishing onboarding (stashed
+        # in PENDING_LECTURE_LINK by start()), drop them into that
+        # lecture's preview screen instead of the normal welcome menu.
+        pending_payload = PENDING_LECTURE_LINK.pop(user_id, None)
+        preview = _lecture_quicklink_preview(pending_payload, user_id) if pending_payload else None
+        if preview:
+            text, markup = preview
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+            return
+
+        # Same as a plain /start: a fresh welcome-menu message (Quizzy's
+        # line included — no toast anymore). The welcome-tour message
+        # above it stays readable; only its "يلا بينا" button is removed
+        # so it can't be tapped a second time.
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=_welcome_menu_text(get_nickname(user_id)),
+            parse_mode=ParseMode.HTML,
+            reply_markup=start_menu_keyboard(),
+        )
+        return
+
+    if query.data in ("toggle_reactions", "toggle_auto_next", "toggle_randomize", "toggle_mix_written", "toggle_achievement_notifs", "toggle_spaced_repetition"):
+        key = {
+            "toggle_reactions": "reactions",
+            "toggle_auto_next": "auto_next",
+            "toggle_randomize": "randomize",
+            "toggle_mix_written": "mix_written",
+            "toggle_achievement_notifs": "achievement_notifs",
+            "toggle_spaced_repetition": "spaced_repetition",
+        }[query.data]
+        page = 2 if key in ("reactions", "achievement_notifs") else 1
+        entry = _get_settings_entry(user_id)
+        entry[key] = not entry.get(key, True)
+        await save_settings()
+        await backup_settings_to_channel(context)
+        # Spaced Repetition only ever fires in auto-next mode (see
+        # _maybe_deliver_spaced_repetition) — warn right away if this
+        # toggle just created that mismatch — shown as a toast (_tap_toast),
+        # on top of the persistent warning line _send_settings shows while
+        # it's in effect.
+        # (the mismatch toast for this tap was already shown by _tap_toast)
+        await _send_settings(context, user_id, query.message, edit=True, page=page)
+        await _maybe_award_curious(context, user_id)
+        return
+
+    if query.data == "toggle_question_timer":
+        # 3-way cycle: Off -> 60s -> 30s -> Off
+        entry = _get_settings_entry(user_id)
+        current = entry.get("question_timer", 0)
+        entry["question_timer"] = {0: 60, 60: 30, 30: 0}.get(current, 0)
+        await save_settings()
+        await backup_settings_to_channel(context)
+        await _send_settings(context, user_id, query.message, edit=True)
+        await _maybe_award_curious(context, user_id)
+        return
+
+    # ── Mistakes Bank menu: Clear Mistakes Bank (with confirmation) ──
+    # MISTAKES_BANK holds every user's entries in one file, but each entry
+    # is tagged with its owner (see MISTAKES BANK schema note), so this
+    # action only ever touches the tapping user's own entries — and, when
+    # an admin has set a /daily_module scope, only the ones in that
+    # module (other modules' mistakes are left alone). With no scope set
+    # it clears all of the user's mistakes, as before. Asks for an
+    # explicit tap-to-confirm before wiping them, since it's destructive.
+    # The confirm screen, the toast and the deletion all use
+    # _scoped_mistakes_bank, so the number the user was shown is the
+    # number that gets removed.
+    if query.data == "clear_mistakes_bank_ask":
+        count = len(_scoped_mistakes_bank(user_id))
+        if not count:
+            return   # "already empty" toast was shown by _tap_toast
+        scope = get_daily_quiz_scope()
+        scope_line = f"📚 {year_label(scope['year'])} — {module_label(scope['module'])}\n\n" if scope else ""
+        await query.edit_message_text(
+            f"⚠️ <b>متأكد إنك عايز تمسح بنك الأخطاء بتاعك؟</b>\n\n"
+            f"{scope_line}"
+            f"هيتمسح <b>{count}</b> سؤال، والعملية دي مش هترجع تاني.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🗑 أيوه، امسح", callback_data="clear_mistakes_bank_yes")],
+                [InlineKeyboardButton("🔙 لأ، رجّعني", callback_data="mistakes_bank_menu")],
+            ]),
+        )
+        return
+
+    if query.data == "clear_mistakes_bank_yes":
+        # Remove only this user's entries in the current /daily_module
+        # scope (all of theirs if no scope is set) — the same set the
+        # confirm screen counted. Matched by object identity, not just by
+        # count, so the removal is exact even if the bank changed between
+        # the confirm screen and this tap.
+        doomed = {id(m) for m in _scoped_mistakes_bank(user_id)}
+        MISTAKES_BANK[:] = [m for m in MISTAKES_BANK if id(m) not in doomed]
+        # Patch this user's bucket in the per-user index to match. Other
+        # modules' entries stay in it, so it can't just be popped anymore.
+        remaining = [m for m in _MISTAKES_BY_USER.get(user_id, []) if id(m) not in doomed]
+        if remaining:
+            _MISTAKES_BY_USER[user_id] = remaining
+        else:
+            _MISTAKES_BY_USER.pop(user_id, None)
+        await save_mistakes_bank()
+        await backup_mistakes_bank_to_channel(context)
+        # ("✅ N cleared" toast was shown by _tap_toast, which counts this
+        # same set of entries before they're removed here.)
+        text, markup = _mistakes_bank_menu_view(user_id)
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        return
+
+    # ── /quiz_delete confirmation (admin) ────────────────────────────
+    # PENDING_QUIZ_DELETE[admin_id] was set by quiz_delete_cmd right
+    # before showing the confirm/cancel buttons — same tap-to-confirm
+    # pattern as Clear Mistake Bank above, keyed by (year, lecture_key)
+    # rather than position so it stays correct even if the index shifted
+    # between the confirm screen and this tap.
+    if query.data == "quizdel_yes":
+        if not is_admin(update):
+            await query.answer(MSG_ADMIN_ONLY, show_alert=True)
+            return
+        pending = PENDING_QUIZ_DELETE.pop(user_id, None)
+        if not pending:
+            await query.answer("⚠️ الطلب ده مش متاح دلوقتي — جرب /quiz_delete تاني.", show_alert=True)
+            return
+        year, key = pending
+        index = QUIZ_INDEX[year]
+        if key not in index:
+            await query.edit_message_text("⚠️ المحاضرة دي اتشالت أو اتغيرت أصلاً.")
+            return
+        removed = index.pop(key)
+        await save_quiz_index(year)
+        if QUIZ_STATE[year].get("current_lecture") == key:
+            QUIZ_STATE[year]["current_lecture"] = None
+            await save_quiz_state(year)
+        stale_polls = [pid for pid, v in QUIZ_POLL_STATUS[year].items() if v["lecture"] == key]
+        for pid in stale_polls:
+            QUIZ_POLL_STATUS[year].pop(pid, None)
+        await save_quiz_poll_status(year)
+        await backup_quiz_to_channel(context, year)
+        await query.edit_message_text(
+            f"🗑 اتشالت محاضرة من {year_label(year)}: {removed['module']} - {removed['subject']}: {removed['name']}\n"
+            "(الرسايل نفسها لسه موجودة في القناة — احذفهم يدوي لو عايز)"
+        )
+        return
+
+    if query.data == "quizdel_no":
+        PENDING_QUIZ_DELETE.pop(user_id, None)
+        await query.edit_message_text("🔙 اتلغى — المحاضرة لسه موجودة.")
+        return
+
+    # ── /reset_analytics confirmation (admin) ────────────────────────
+    if query.data == "reset_analytics_yes":
+        if not is_admin(update):
+            await query.answer(MSG_ADMIN_ONLY, show_alert=True)
+            return
+        global _analytics_backup_msg_id, _analytics_dirty
+        ANALYTICS.clear()
+        await save_analytics()
+        _analytics_dirty = False   # disk now matches memory — nothing left for the periodic flush to do
+        if _analytics_backup_msg_id and ANALYTICS_GROUP_ID:
+            try:
+                await context.bot.delete_message(
+                    chat_id=ANALYTICS_GROUP_ID,
+                    message_id=_analytics_backup_msg_id,
+                )
+            except Exception:
+                pass
+        _analytics_backup_msg_id = None
+        await query.edit_message_text("🗑 Analytics wiped — local file cleared and backup deleted.")
+        return
+
+    if query.data == "reset_analytics_no":
+        await query.edit_message_text("🔙 اتلغى — الـ Analytics لسه زي ما هي.")
+        return
+
+    if query.data == "menu_quizzes":
+        # Same as typing /quiz — sends a fresh message (not an edit) so the
+        # welcome message with its buttons stays intact above it.
+        years = configured_years()
+        if not years:
+            await query.message.reply_text("📭 مفيش سنين متاحة دلوقتي.")
+            return
+        view = _locked_year_modules_view(user_id, years)
+        if view:
+            text, markup = view
+            await query.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+            return
+        buttons = [[InlineKeyboardButton(year_label(y), callback_data=f"yr:{y}")] for y in years]
+        buttons.append([InlineKeyboardButton("Search Content 🔎", callback_data="search_pick_year")])
+        await query.message.reply_text(
+            "📚 <b>اختار السنة:</b>", parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    if query.data == "daily_quiz":
+        await show_daily_quiz_menu(context, user_id, message=query.message)
+        return
+
+    if query.data == "daily_quiz_begin":
+        # The Quizzy toast for this tap ("already done today" / late night)
+        # was already shown by _tap_toast at the top of button_handler.
+        await start_daily_quiz(context, user_id, message=query.message)
+        return
+
+    # ── 🧠 Mistakes Bank menu button ──────────────────────────────
+    if query.data == "mistakes_bank_menu":
+        # The Quizzy toast for an empty / very full bank was already shown
+        # by _tap_toast at the top of button_handler.
+        text, markup = _mistakes_bank_menu_view(user_id)
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        return
+
+    if query.data == "mistakes_retake":
+        await start_mistakes_retake(context, user_id, message=query.message)
+        return
+
+    if query.data == "bookmarks_retake":
+        await start_bookmarks_retake(context, user_id, message=query.message)
+        return
+
+    # ── Admin: /daily_module picker (dqy:/dqm:/dq_scope_off) ─────────
+    if query.data.startswith("dqy:"):
+        if not is_admin(update):
+            await query.edit_message_text(MSG_ADMIN_ONLY)
+            return
+        year = query.data.split(":")[1]
+        if year not in configured_years():
+            await query.edit_message_text("⚠️ السنة دي مش متاحة دلوقتي.")
+            return
+        modules = ready_modules(year)
+        if not modules:
+            await query.edit_message_text(f"📭 مفيش موديولات متظبطة لـ {year_label(year)} لسه.")
+            return
+        buttons = [[InlineKeyboardButton(module_label(m), callback_data=f"dqm:{year}:{i}")] for i, m in enumerate(modules)]
+        buttons.append([InlineKeyboardButton("🔙 رجوع", callback_data="daily_module_years")])
+        await query.edit_message_text(
+            f"📚 <b>{year_label(year)}</b> — اختار الموديول:", parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    if query.data == "daily_module_years":
+        if not is_admin(update):
+            await query.edit_message_text(MSG_ADMIN_ONLY)
+            return
+        years = configured_years()
+        buttons = [[InlineKeyboardButton(year_label(y), callback_data=f"dqy:{y}")] for y in years]
+        scope = get_daily_quiz_scope()
+        if scope:
+            buttons.append([InlineKeyboardButton("🔓 شيل التحديد (رجّع كل المنهج)", callback_data="dq_scope_off")])
+        await query.edit_message_text(
+            "📚 <b>Daily Quiz — اختار الموديول اللي هيتحدد عليه:</b>",
+            parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    if query.data.startswith("dqm:"):
+        if not is_admin(update):
+            await query.edit_message_text(MSG_ADMIN_ONLY)
+            return
+        _, year, mod_idx_str = query.data.split(":")
+        mod_idx = int(mod_idx_str)
+        modules = ready_modules(year)
+        if mod_idx >= len(modules):
+            await query.edit_message_text("⚠️ الموديول ده مش موجود دلوقتي.")
+            return
+        module = modules[mod_idx]
+        await set_daily_quiz_scope(year, module)
+        await backup_settings_to_channel(context)
+        await query.edit_message_text(
+            f"✅ Daily Quiz دلوقتي محدد على: {year_label(year)} — {module_label(module)}\n\n"
+            f"(أسئلة الـ Daily Quiz لسنة {year_label(year)} هيتسحبوا من الموديول ده بس)",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if query.data == "dq_scope_off":
+        if not is_admin(update):
+            await query.edit_message_text(MSG_ADMIN_ONLY)
+            return
+        await set_daily_quiz_scope(None, None)
+        await backup_settings_to_channel(context)
+        await query.edit_message_text("✅ اتشال التحديد — Daily Quiz دلوقتي بيسحب من المنهج كله تاني.")
+        return
+
+    # ── /report_issue — user sends a message, admin replies from
+# REPORT_ISSUE_GROUP_ID, both sides visible on the same message, and the
+# reporter can send follow-ups back into the same thread.
+#
+# Flow:
+#   1. /report_issue -> AWAITING_REPORT_ISSUE[user_id] = time.time(), bot
+#      asks for the text (optionally with a photo). Expires after
+#      REPORT_ISSUE_AWAIT_TIMEOUT, and /cancel clears it early — either
+#      way, a message sent after the wait lapsed is handled normally
+#      instead of being swallowed as a report.
+#   2. The user's next text (handle()) or photo (handle_image()) is
+#      staged as a DRAFT (_stage_report_draft), not sent yet — they get a
+#      preview back with "✅ ابعت" / "❌ إلغاء" buttons.
+#   3. Tapping "✅ ابعت" (report_draft_send, in button_handler) calls
+#      _submit_report, which does what step 2 used to do directly: posts
+#      the card to REPORT_ISSUE_GROUP_ID with a "↩️ Reply" button, and
+#      records it in REPORT_THREADS keyed by that group message's id —
+#      this id is also shown on the card itself as the "Reply ID". A
+#      photo, if any, goes out as its own message right after, threaded
+#      under the card via reply_to_message_id (see _submit_report's
+#      docstring for why it's not just the card's caption). Rejected if
+#      more than REPORT_DRAFT_CONFIRM_TIMEOUT has passed since the draft
+#      was staged. "❌ إلغاء" (report_draft_cancel) just discards it.
+#   4. Admin replies one of two ways:
+#        a) Type "-Reply <id> <text>" directly in the group. Preferred —
+#           parsed straight out of the message text with no per-user
+#           state, so it works even if the group has "remain anonymous"
+#           enabled for admins (a typed message then arrives with
+#           effective_user = GroupAnonymousBot, not the admin's real id,
+#           which silently breaks any flow keyed on real_uid).
+#        b) Tap the "↩️ Reply" button -> AWAITING_REPORT_REPLY[admin_id]
+#           = {...}, bot asks for the text in the group, and the admin's
+#           next message there is picked up in handle(). Kept as a
+#           convenience alongside (a), with a same-chat fallback lookup
+#           for the anonymous-admin case — see the comment at that check.
+#      Either way: appended to the thread via _append_report_message, then
+#      _refresh_report_thread posts the FULL thread as a fresh message to
+#      BOTH sides (admin group card + reporter's DM, each with its own
+#      Reply/Close or Reply button) and collapses whichever full-thread
+#      message each side had before — see that function's docstring for
+#      why a plain edit isn't enough (no push notification) and why the
+#      old message is collapsed rather than left in place (no duplicate
+#      thread dumps piling up).
+#   5. Reporter taps their own "↩️ Reply" -> AWAITING_USER_FOLLOWUP[user_id]
+#      = {...}; their next DM text is appended to the same thread (shown
+#      to the admin under their name) and _refresh_report_thread runs
+#      again, same as step 4. Blocked once the thread is closed.
+#   6. Close just strips the buttons and marks the thread closed in place
+#      (no new message on either side — it's not a reply) — no further
+#      replies possible from that message (a re-tapped Reply, from either
+#      side, is rejected with a toast/message).
+#
+# REPORT_THREADS is persisted the same way as MISTAKES_BANK: a local JSON
+# file plus a pinned backup in REPORT_ISSUE_GROUP_ID, restored on startup
+# (see restore_report_threads_from_channel). A restart mid-thread no
+# longer loses the ability to keep replying to an old report — the thread
+# reloads from the channel backup before polling starts. REPORT_DRAFTS
+# (an unconfirmed draft between steps 2 and 3) is NOT persisted this way
+# — it's short-lived, in-memory only, and a restart mid-draft just means
+# the user re-does /report_issue, same as if the bot had been down when
+# they first tried.
+# ═══════════════════════════════════════════════════════════════
+def _report_reply_keyboard(group_message_id: int, closed: bool) -> InlineKeyboardMarkup:
+    if closed:
+        return InlineKeyboardMarkup([[InlineKeyboardButton("🔒 Closed", callback_data="report_noop")]])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("↩️ Reply", callback_data=f"report_reply:{group_message_id}")],
+        [InlineKeyboardButton("✅ Close", callback_data=f"report_close:{group_message_id}")],
+    ])
+
+def _report_thread_text(thread: dict, group_message_id: int) -> str:
+    """Renders the full report message: the user's identity + original
+    text, then every message after it (admin replies AND user follow-ups,
+    see AWAITING_USER_FOLLOWUP) in chronological order. group_message_id
+    is shown as the reply ID — the number to use with "-Reply <id> <text>"
+    (see the plain-text handler in handle()) — distinct from the
+    reporter's own Telegram ID shown just above it.
+
+    thread["messages"] is the single source of truth for everything after
+    the opening report: [{"from": "admin"|"user", "text": str}, ...] in
+    the order they happened. Threads created before follow-ups existed
+    only have the older "replies" list (admin-only, no "messages" key at
+    all) — that's read here as a fallback so old threads still render,
+    but nothing new is ever written to "replies" again; see
+    _append_report_message."""
+    lines = [
+        "📩 <b>New issue report</b>",
+        f"👤 {html.escape(thread['name'])}",
+        f"🔗 @{html.escape(thread['username'])}" if thread.get("username") else "🔗 (no username)",
+        f"🆔 Reporter ID: <code>{thread['user_id']}</code>",
+        f"🔖 Reply ID: <code>{group_message_id}</code>  (use <code>-Reply {group_message_id} &lt;text&gt;</code>)",
+        "",
+        html.escape(thread["user_text"]),
+    ]
+    messages = thread.get("messages")
+    if messages is None:
+        # Pre-follow-up thread — every entry in "replies" was an admin
+        # message; render it exactly as before.
+        messages = [{"from": "admin", "text": r} for r in thread.get("replies", [])]
+    for msg in messages:
+        lines.append("")
+        lines.append("➖➖➖➖➖➖➖➖")
+        if msg["from"] == "admin":
+            lines.append(f"👨‍💼 <b>Admin:</b>\n{html.escape(msg['text'])}")
+        else:
+            lines.append(f"👤 <b>{html.escape(thread['name'])}:</b>\n{html.escape(msg['text'])}")
+    return "\n".join(lines)
+
+def _append_report_message(thread: dict, sender: str, text: str) -> None:
+    """Adds one message (sender is 'admin' or 'user') to the thread's
+    unified timeline, migrating an old replies-only thread to the
+    "messages" schema on first touch. See _report_thread_text for why."""
+    if "messages" not in thread:
+        thread["messages"] = [{"from": "admin", "text": r} for r in thread.get("replies", [])]
+    thread["messages"].append({"from": sender, "text": text})
+
+def _report_thread_text_for_user(thread: dict) -> str:
+    """User-facing rendering of the same timeline _report_thread_text
+    builds for the admin side — same messages, same order, but without
+    the Reporter ID / Reply ID / "-Reply <id>" lines that only make
+    sense in the admin group."""
+    lines = ["📩 <b>مشكلتك:</b>", "", html.escape(thread["user_text"])]
+    messages = thread.get("messages")
+    if messages is None:
+        messages = [{"from": "admin", "text": r} for r in thread.get("replies", [])]
+    for msg in messages:
+        lines.append("")
+        lines.append("➖➖➖➖➖➖➖➖")
+        if msg["from"] == "admin":
+            lines.append(f"👨‍💼 <b>الأدمن:</b>\n{html.escape(msg['text'])}")
+        else:
+            lines.append(f"👤 <b>انت:</b>\n{html.escape(msg['text'])}")
+    return "\n".join(lines)
+
+async def _collapse_old_report_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int | None) -> None:
+    """Shrinks a superseded report message once a fresh full-thread
+    message has replaced it — deletion is tried first (cleanest), and
+    only falls back to editing it down to a single '•' (buttons
+    stripped, so a stale Reply/Close can't sit alongside the new
+    message's own) if deletion isn't possible for any reason (message
+    already gone, too old, permissions, etc.). message_id=None (nothing
+    to collapse yet — the very first message on that side) is a no-op."""
+    if message_id is None:
+        return
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        return
+    except Exception:
+        pass
+    try:
+        await context.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="•", reply_markup=None)
+    except Exception:
+        pass   # already gone, too old to edit, etc. — fine either way, the new message is what matters now
+
+async def _refresh_report_thread(context: ContextTypes.DEFAULT_TYPE, group_message_id: int, thread: dict) -> bool:
+    """Called right after _append_report_message, on every new reply or
+    follow-up in either direction. Posts the FULL thread as a brand-new
+    message to BOTH sides — admin group and reporter's DM — rather than
+    editing the existing one in place: an edit doesn't trigger a push
+    notification on Telegram, so a reply sitting in an already-read,
+    silently-edited message is easy to miss entirely. Whichever
+    full-thread message each side had before (if any) is then collapsed
+    via _collapse_old_report_message, so old chat history doesn't turn
+    into a wall of duplicate thread dumps — only the latest copy on each
+    side is ever left full-length.
+
+    group_message_id is the thread's STABLE key: REPORT_THREADS is keyed
+    by the id of the very first card ever sent, and every "-Reply <id>",
+    Reply button, and Close button always references that same stable id
+    (via _report_reply_keyboard) — never whichever physical message
+    happens to be showing it right now. So this is safe to call
+    regardless of how many times the thread has already been refreshed.
+
+    Returns whether the reporter's DM send succeeded — callers use this
+    to warn the admin in-group when it didn't (e.g. the user blocked the
+    bot); the thread itself is still updated and saved either way."""
+    closed = thread.get("closed", False)
+
+    # ── Admin-facing card, in REPORT_ISSUE_GROUP_ID ──
+    try:
+        sent = await context.bot.send_message(
+            chat_id=REPORT_ISSUE_GROUP_ID,
+            text=_report_thread_text(thread, group_message_id), parse_mode=ParseMode.HTML,
+            reply_markup=_report_reply_keyboard(group_message_id, closed=closed),
+        )
+        await _collapse_old_report_message(context, REPORT_ISSUE_GROUP_ID, thread.get("latest_group_message_id"))
+        thread["latest_group_message_id"] = sent.message_id
+    except Exception as e:
+        print("REPORT THREAD GROUP REFRESH FAILED:", e)
+
+    # ── User-facing DM, to the reporter ──
+    user_dm_ok = True
+    try:
+        sent = await context.bot.send_message(
+            chat_id=thread["user_id"],
+            text=_report_thread_text_for_user(thread), parse_mode=ParseMode.HTML,
+            reply_markup=(
+                None if closed else
+                InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Reply", callback_data=f"report_user_reply:{group_message_id}")]])
+            ),
+        )
+        await _collapse_old_report_message(context, thread["user_id"], thread.get("latest_user_message_id"))
+        thread["latest_user_message_id"] = sent.message_id
+    except Exception as e:
+        print("REPORT THREAD USER DM FAILED:", e)   # e.g. the user blocked the bot
+        user_dm_ok = False
+
+    await save_report_threads()
+    await backup_report_threads_to_channel(context)
+    return user_dm_ok
+
+def _report_draft_preview_text(text: str, has_photo: bool) -> str:
+    photo_note = "\n📎 هيتبعت مع الصورة اللي بعتها." if has_photo else ""
+    body = html.escape(text) if text else "<i>(من غير نص — صورة بس)</i>"
+    return f"👀 <b>ده اللي هيتبعت للأدمن:</b>\n\n{body}{photo_note}\n\nتمام كده؟"
+
+async def _stage_report_draft(update: Update, context: ContextTypes.DEFAULT_TYPE, real_uid: int, text: str, photo_file_id: str | None) -> None:
+    """Parks the user's message as an unconfirmed draft instead of
+    posting it straight to REPORT_ISSUE_GROUP_ID, and shows them a
+    preview with Send/Cancel buttons (report_draft_send /
+    report_draft_cancel in button_handler). Overwrites any earlier
+    unconfirmed draft from the same user — only the latest one they
+    typed can ever be sent."""
+    REPORT_DRAFTS[real_uid] = {
+        "text": (text or "").strip(),
+        "photo_file_id": photo_file_id,
+        "created_at": time.time(),
+    }
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ ابعت", callback_data="report_draft_send"),
+        InlineKeyboardButton("❌ إلغاء", callback_data="report_draft_cancel"),
+    ]])
+    await update.message.reply_text(
+        _report_draft_preview_text(text, has_photo=bool(photo_file_id)),
+        parse_mode=ParseMode.HTML, reply_markup=keyboard,
+    )
+
+async def _submit_report(context: ContextTypes.DEFAULT_TYPE, real_uid: int, tg_user, text: str, photo_file_id: str | None) -> bool:
+    """Actually posts a confirmed draft to REPORT_ISSUE_GROUP_ID and
+    records the thread — the part that used to run directly off the
+    user's first message (see the AWAITING_REPORT_ISSUE block in
+    handle()), now run only once they've tapped "✅ ابعت" on the
+    preview. Returns whether it succeeded.
+
+    The card itself is always a plain text message, even when a photo
+    is attached — a photo goes out as its own message right after,
+    threaded under the card via reply_to_message_id. Using the photo's
+    caption for the growing thread text instead (admin replies, user
+    follow-ups) would run into Telegram's 1024-char caption cap on any
+    thread that gets a few exchanges long; a plain text card has no
+    such limit. This first card is also the thread's first "latest"
+    message on the group side — every reply after this one refreshes it
+    via _refresh_report_thread instead of editing it in place."""
+    name     = " ".join(p for p in (tg_user.first_name, tg_user.last_name) if p).strip() if tg_user else "?"
+    username = tg_user.username if tg_user else None
+    thread = {
+        "user_id": real_uid, "name": name or "?", "username": username,
+        "user_text": text, "photo_file_id": photo_file_id, "replies": [], "closed": False,
+    }
+    try:
+        sent = await context.bot.send_message(
+            chat_id=REPORT_ISSUE_GROUP_ID,
+            text="📩 New issue report — loading…",   # placeholder; fixed up right below once we have the real id
+            reply_markup=_report_reply_keyboard(0, closed=False),   # placeholder id, fixed up right below too
+        )
+    except Exception as e:
+        print("REPORT ISSUE SEND FAILED:", e)
+        return False
+    # Both the displayed Reply ID and the keyboard's callback_data need
+    # this message's own id, which we only get back after sending —
+    # one edit to fix up both text and keyboard together.
+    try:
+        await context.bot.edit_message_text(
+            chat_id=REPORT_ISSUE_GROUP_ID, message_id=sent.message_id,
+            text=_report_thread_text(thread, sent.message_id), parse_mode=ParseMode.HTML,
+            reply_markup=_report_reply_keyboard(sent.message_id, closed=False),
+        )
+    except Exception as e:
+        print("REPORT ISSUE ID FIXUP FAILED:", e)
+    if photo_file_id:
+        try:
+            await context.bot.send_photo(
+                chat_id=REPORT_ISSUE_GROUP_ID, photo=photo_file_id,
+                caption="📎 Attached to the report above.",
+                reply_to_message_id=sent.message_id,
+            )
+        except Exception as e:
+            print("REPORT ISSUE PHOTO FORWARD FAILED:", e)
+    thread["latest_group_message_id"] = sent.message_id
+    REPORT_THREADS[sent.message_id] = thread
+    await save_report_threads()
+    await backup_report_threads_to_channel(context)
+    return True
+
+async def report_issue_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not REPORT_ISSUE_GROUP_ID:
+        await update.message.reply_text("⚠️ الميزة دي مش متاحة دلوقتي.")
+        return
+    real_uid = update.effective_user.id if update.effective_user else update.effective_chat.id
+    AWAITING_REPORT_ISSUE[real_uid] = time.time()
+    await update.message.reply_text(
+        "✏️ اكتب مشكلتك أو ملاحظتك في رسالة واحدة (تقدر تبعت صورة معاها كمان لو حابب)، "
+        "وهعرضهالك الأول قبل ما تتبعت للأدمن.\n\n"
+        "غيرت رأيك؟ ابعت /cancel."
+    )
+
+async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Bails out of a pending image that's waiting for its question, or
+    (admin only) a /broadcast composer waiting on the message text, or a
+    /report_issue that hasn't been sent/confirmed yet."""
+    user_id = update.effective_chat.id
+    was_doing_something = bool(PENDING_IMAGE.get(user_id))
+    _clear_pending_image(user_id)
+    if AWAITING_BROADCAST_MESSAGE.pop(user_id, None):
+        was_doing_something = True
+    if AWAITING_REPORT_ISSUE.pop(user_id, None) is not None:
+        was_doing_something = True
+    if REPORT_DRAFTS.pop(user_id, None) is not None:
+        was_doing_something = True
+    if AWAITING_SEARCH_QUERY.pop(user_id, None) is not None:
+        was_doing_something = True
+    if AWAITING_EQ_SEARCH.pop(update.effective_user.id, None) is not None:
+        was_doing_something = True
+    if AWAITING_EQ_ATTACH.pop(update.effective_user.id, None) is not None:
+        was_doing_something = True
+    if was_doing_something:
+        await update.message.reply_text(MSG_CANCEL_DONE)
+    else:
+        await update.message.reply_text(MSG_CANCEL_NOTHING)
+
+async def feedback_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/feedback <message> — sends the user's nickname, Telegram
+    username, and Telegram ID together with their feedback text straight
+    to the Creator's DM (ADMIN_ID). Simple one-shot command (no draft/confirm step,
+    unlike /report_issue) — whatever follows /feedback on the same
+    message is sent as-is."""
+    if not ADMIN_ID:
+        await update.message.reply_text("⚠️ الميزة دي مش متاحة دلوقتي.")
+        return
+    if not context.args:
+        await update.message.reply_text("استخدام: /feedback <رسالتك>")
+        return
+
+    real_uid = update.effective_user.id if update.effective_user else update.effective_chat.id
+    _update_telegram_name(real_uid, update.effective_user)
+    nickname = get_nickname(real_uid) or "—"
+    username = update.effective_user.username if update.effective_user else None
+    username_label = f"@{username}" if username else "—"
+    feedback_text = " ".join(context.args)
+
+    message = (
+        f"📩 <b>Feedback جديد</b>\n"
+        f"👤 الاسم: {html.escape(nickname)}\n"
+        f"🔗 اليوزر: {html.escape(username_label)}\n"
+        f"🆔 ID: <code>{real_uid}</code>\n\n"
+        f"💬 {html.escape(feedback_text)}"
+    )
+    try:
+        await context.bot.send_message(chat_id=ADMIN_ID, text=message, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        print("FEEDBACK SEND FAILED:", e)
+        await update.message.reply_text("⚠️ حصل خطأ وأنا بحاول أبعت الفيدباك، جرب تاني كمان شوية.")
+        return
+
+    await update.message.reply_text(
+        quizzy_block(QUIZZY_ADORE_ART, "✅ تم إرسال الفيدباك بتاعك، شكراً ليك!"),
+        parse_mode=ParseMode.HTML,
+    )
+
+# ═══════════════════════════════════════════════════════════════
+# START  (also wakes bot from sleep)
+# ═══════════════════════════════════════════════════════════════
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    SLEEPING.discard(chat_id)
+
+    if chat_id not in USERS:
+        USERS.add(chat_id)
+        await save_users()
+        await backup_storage_to_channel(context)
+
+    real_uid = update.effective_user.id if update.effective_user else chat_id
+    _update_telegram_name(real_uid, update.effective_user)
+    nickname = get_nickname(real_uid)
+
+    # ── Quick-access lecture link — /start payload from a shared
+    # https://t.me/<bot>?start=L_... link (see _build_lecture_quicklink_payload
+    # / the 🔗 button on the lecture preview screen). Stashed here as soon
+    # as it arrives, BEFORE the onboarding gates below, so someone who
+    # taps a lecture link before ever finishing onboarding doesn't lose
+    # it — onboard_go (the true finish line) checks PENDING_LECTURE_LINK
+    # and drops them straight into the lecture instead of the normal
+    # welcome menu once they're done. An already-onboarded user instead
+    # gets the lecture preview immediately, below.
+    if context.args:
+        PENDING_LECTURE_LINK[real_uid] = context.args[0]
+
+    if nickname is None:
+        # First-ever /start (no nickname on file yet, for this specific
+        # person): ask for one before showing the main menu at all. Marked
+        # "onboarding" (rather than True, same as the Settings ✏️ flow) so
+        # the text handler knows to continue into the welcome menu
+        # afterwards instead of bouncing back to the Settings screen.
+        AWAITING_NICKNAME[real_uid] = "onboarding"
+        prompt_msg = await update.message.reply_text(
+            quizzy_block(
+                QUIZZY_EXCITED_ART,
+                "Hello there! My name is Quizzy! what's your name? "
+                "(Use an appropriate name or Quizzy will bite you 🙊 - you can change it again later )",
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+        ONBOARDING_PROMPT_MSG[real_uid] = (prompt_msg.chat_id, prompt_msg.message_id)
+        return
+
+    if get_year_class(real_uid) not in YEAR_CLASS_NUMBER:
+        # Nickname's set but they never finished picking a year/class
+        # (or got interrupted mid-onboarding) — send them back to this
+        # step instead of the main menu. Also mandatory, also permanent.
+        await update.message.reply_text(
+            f"{quizzy_block(QUIZZY_HAPPY_ART, 'What a lovely name Dr.' + nickname + ' 🥰')}\n\n"
+            "What Year/Class are you currently in?\n\n",
+            parse_mode=ParseMode.HTML,
+            reply_markup=year_class_keyboard("onboard_yc"),
+        )
+        return
+
+    # Fully onboarded already — resolve the pending link (this /start's
+    # own args, just stashed above) right away instead of waiting for
+    # onboard_go, which a fully-onboarded user never taps.
+    pending_payload = PENDING_LECTURE_LINK.pop(real_uid, None)
+    if pending_payload:
+        preview = _lecture_quicklink_preview(pending_payload, real_uid)
+        if preview:
+            text, markup = preview
+            await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+            return
+
+    await update.message.reply_text(
+        _welcome_menu_text(nickname),
+        parse_mode=ParseMode.HTML,
+        reply_markup=start_menu_keyboard(),
+    )
+
+def _welcome_menu_text(nickname: str | None) -> str:
+    """The main-menu greeting /start sends (Quizzy art + a random welcome
+    line + "تحب تعمل أي؟!"). Shared by start() and the end-of-onboarding
+    "يلا بينا" button so the two always look identical."""
+    greeting = f"يا {html.escape(nickname)}! " if nickname else ""
+    return (
+        f"{quizzy_block(QUIZZY_HAPPY_ART, random.choice(QUIZZY_WELCOME_LINES))}\n\n"
+        f"{greeting}تحب تعمل أي؟!:"
+    )
+
+async def preview_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/preview — admin-only walkthrough of exactly what a brand-new
+    user sees on their very first /start: nickname prompt -> Year/Class
+    picker -> the bully joke -> "just kidding" (how/where) -> the fixed
+    welcome-tour message (ONBOARDING_SPECIAL_TEXT) -> 🗣️🗣️🔥 يلا بينا ->
+    welcome menu (see start() and the onboard_yc:/onboard_bully:/onboard_how/
+    onboard_where/onboard_go callback branches — this mirrors that exact
+    sequence, same text/art/buttons throughout).
+
+    Purely a preview, never touches real state for the two steps that
+    normally DO write something: it does NOT set AWAITING_NICKNAME (so
+    typing anything afterwards isn't read as a nickname), and the
+    Year/Class step's buttons are inert (preview_noop) look-alikes of
+    the real picker rather than the real onboard_yc: ones — tapping them
+    can't set (and, per that step's own warning, permanently lock) a
+    year/class on the admin's own account. Everything from the bully
+    joke onward (onboard_bully:/onboard_how/onboard_where/onboard_go)
+    hands off to the REAL production callbacks — none of those write any
+    state (the joke's answer isn't stored, the final screen is just
+    start_menu_keyboard()), so it's already safe to trigger here."""
+    if not is_admin(update):
+        await update.message.reply_text(MSG_ADMIN_ONLY)
+        return
+    await update.message.reply_text(
+        quizzy_block(
+            QUIZZY_EXCITED_ART,
+            "Hello there! My name is Quizzy! what's your name? "
+            "(Use an appropriate name or Quizzy will bite you 🙊 - you can change it again later )",
+        ),
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("▶️ Next (Year/Class step)", callback_data="preview_step2"),
+        ]]),
+    )
+
+def _chunk_text(text: str, limit: int = 3500) -> list[str]:
+    """Splits text into <= limit-char chunks, cutting on blank lines where
+    possible so a section never gets torn in half mid-paragraph. Telegram
+    caps messages at 4096 chars — stay well under that."""
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > limit:
+        cut = remaining.rfind("\n\n", 0, limit)
+        if cut == -1:
+            cut = remaining.rfind("\n", 0, limit)
+        if cut == -1:
+            cut = limit
+        chunks.append(remaining[:cut].rstrip())
+        remaining = remaining[cut:].lstrip("\n")
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+def _build_previewtxt_sections() -> list[str]:
+    """Dumps every static, hardcoded piece of copy a normal (non-admin)
+    user can see anywhere in the bot — one continuous text, not a live
+    walkthrough like /preview. Doesn't include: content that's actually
+    data (live leaderboard rows, a user's own stats/XP numbers,
+    per-exception error text) since that isn't "text the bot wrote" so
+    much as data it's displaying — those are noted below instead of
+    reproduced."""
+    out: list[str] = []
+
+    out.append(
+        "📋 <b>/previewtxt — every static piece of copy a normal user can see</b>\n"
+        "(admin-only; not a live walkthrough — see /preview for that)"
+    )
+
+    out.append(
+        "── ONBOARDING ──\n\n"
+        "[nickname prompt, first /start]\n"
+        + quizzy_block(
+            QUIZZY_EXCITED_ART,
+            "Hello there! My name is Quizzy! what's your name? "
+            "(Use an appropriate name or Quizzy will bite you 🙊 - you can change it again later )",
+        )
+        + "\n\n[empty nickname during onboarding]\n"
+        "⚠️ الاسم فاضي — اكتب اسم تحب أتنادي بيه عليك.\n\n"
+        "[vulgar nickname during onboarding]\n"
+        + quizzy_block(QUIZZY_ANGRY_ART, "do you know that i had to make AN ENTIRE FILTER FOR PEOPLE LIKE YOU?!")
+        + "\n\n[Year/Class prompt]\n"
+        + quizzy_block(QUIZZY_HAPPY_ART, "What a lovely name Dr.<nickname> 🥰")
+        + "\n\nWhat Year/Class are you currently in?\n\n"
+        "[Year/Class confirmed → bully joke]\n"
+        + quizzy_block(QUIZZY_HAPPY_ART, "Do you want me to bully you when you get questions wrong?")
+        + "\n  buttons: What??? / No 😭\n\n"
+        "[bully joke punchline]\n"
+        + quizzy_block(QUIZZY_WINK_ART, "Haha i am just kidding (maybe)")
+        + "\n  buttons: what is this place?! 🙂 / Where are we?! 🙃\n\n"
+        "[after tapping either button]\n"
+        + ONBOARDING_SPECIAL_TEXT
+        + "\n  button: 🗣️🗣️🔥 يلا بينا\n\n"
+        "[onboarding finished → main menu]\n"
+        + quizzy_block(QUIZZY_HAPPY_ART, "<one of the welcome lines below> يا <nickname>! تحب تعمل أي؟!:")
+    )
+
+    out.append(
+        "── RETURNING-USER GREETINGS ──\n\n"
+        "[/start with nickname+year already set, and the 🏠 Back to Home button]\n"
+        + quizzy_block(QUIZZY_HAPPY_ART, "<one of the welcome lines below>")
+        + "\n\n<b>Welcome lines (random pick):</b>\n"
+        + "\n".join(f"• {l}" for l in QUIZZY_WELCOME_LINES)
+        + "\n\n<b>Success lines (random pick, shown after correct-answer streak beats):</b>\n"
+        + "\n".join(f"• {l}" for l in QUIZZY_SUCCESS_LINES)
+        + "\n\n<b>Error lines (random pick, shown alongside the sad-cat error block):</b>\n"
+        + "\n".join(f"• {l}" for l in QUIZZY_ERROR_LINES)
+    )
+
+    out.append(
+        "── MAIN MENU / SETTINGS BUTTON LABELS ──\n\n"
+        "Main menu: 🦦 How To Use · Quizzes ⁉️ · 📊 My Stats · ⚙️ Settings · "
+        "💥Daily Quiz💥 · 🧠 Mistakes Bank · 🏆 Leaderboard (→ 📅 Weekly / 🌍 Global) · 🔥COMING SOON🔥\n\n"
+        "Settings (page 1): ✏️ Edit Nickname · 📚 Change Year · ⏭️ Auto-Next · 🔀 Randomize · "
+        "🔀 Mix Written · 🔁 Spaced Repetition · ⏱️ Question Timer · "
+        "➡️ More Settings · 🏠 Back to Home\n\n"
+        "Settings (page 2): 🎭 Reactions · 🏆 Achievement Alerts · "
+        "🔔 Daily Notification · 📿 Zikr · ⬅️ Back · 🏠 Back to Home\n\n"
+        "── HOW TO USE ──\n\n" + HOW_TO_USE_TEXT
+    )
+
+    ach_lines = ["── ACHIEVEMENTS (name — quip, per tier) ──\n"]
+    for category, tiers in ACHIEVEMENTS.items():
+        ach_lines.append(f"\n<b>{category}</b>")
+        for threshold, name, xp_bonus, emoji, quip in tiers:
+            ach_lines.append(f"  {emoji} {name} ({threshold}) — {quip}")
+    ach_lines.append("\n<b>Extras (one-off)</b>")
+    for key, (name, emoji, xp_bonus, desc, quip) in EXTRA_ACHIEVEMENTS.items():
+        ach_lines.append(f"  {emoji} {name} — {desc} — {quip}")
+    out.append("\n".join(ach_lines))
+
+    out.append(
+        "── MISC MESSAGES SEEN AROUND THE BOT ──\n\n"
+        "[error, anywhere in the bot]\n" + quizzy_block(QUIZZY_SAD_ART, "<random error line above>")
+        + "\n\n[currently banned]\n"
+        + quizzy_block(QUIZZY_ANGRY_ART, "مبروك، اتبنيت 🚫")
+        + "\n🚫 انت متبنن من البوت لسه.\n⏰ هيترفع البان بعد <hours> ساعة.\n📝 السبب: <reason>\n\n"
+        "[not onboarded yet, tried something else]\n"
+        "⚠️ لازم تعمل /start الأول وتسجل اسمك وسنتك/فرقتك قبل أي حاجة تانية.\n\n"
+        "[/mystats with no activity yet]\n"
+        + quizzy_block(QUIZZY_ANNOYED_ART, "bro you didn't even start anything yet 😂, go take a quiz first 💥")
+        + "\n\n[/feedback sent]\n"
+        + quizzy_block(QUIZZY_ADORE_ART, "✅ تم إرسال الفيدباك بتاعك، شكراً ليك!")
+        + "\n\n[Daily Quiz hub / a lecture's leaderboard preview, on top]\n"
+        + quizzy_block(QUIZZY_READY_ART, "CHALLENGE YOURSELF!")
+        + "\n\n[finishing a lecture (not a mistakes-retake), on top of the results summary]\n"
+        + quizzy_block(QUIZZY_VICTORY_ART, "Nice one! 🎉")
+        + f"\n\n[non-admin, admin-only command/button]\n{MSG_ADMIN_ONLY}\n\n"
+        f"[/cancel with something to cancel]\n{MSG_CANCEL_DONE}\n\n"
+        f"[/cancel with nothing to cancel]\n{MSG_CANCEL_NOTHING}"
+    )
+
+    out.append(
+        "── NOT INCLUDED (it's data, not fixed copy) ──\n\n"
+        "• live leaderboard rows (names/scores/medals)\n"
+        "• a user's own /mystats numbers\n"
+        "• per-exception error report text\n"
+        "• achievement UNLOCK announcements (name and quip are above; the "
+        "surrounding congratulations wrapper isn't reproduced here)"
+    )
+
+    return out
+
+async def previewtxt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/previewtxt — admin-only. Sends the admin every static piece of
+    copy a normal user can encounter, as a straight text dump (as opposed
+    to /preview, which walks the real onboarding flow interactively).
+    Chunked across several messages since the whole dump is well past
+    Telegram's 4096-char single-message cap."""
+    if not is_admin(update):
+        await update.message.reply_text(MSG_ADMIN_ONLY)
+        return
+    for section in _build_previewtxt_sections():
+        for chunk in _chunk_text(section):
+            await update.message.reply_text(chunk, parse_mode=ParseMode.HTML)
+
+async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/c — lists every command, admin-only ones only shown to the admin."""
+    lines = ["📖 <b>Available commands:</b>\n"]
+    lines.append("👤 <b>For everyone</b>")
+    lines.append("/start — main menu")
+    lines.append("/sleep — pauses the bot temporarily in this chat")
+    lines.append("/mystats — your stats (day streak, accuracy, current module's subjects strongest → weakest, achievements)")
+    lines.append("⚙️ Settings — from the /start menu: set your nickname")
+    lines.append("/cancel — cancels whatever's currently in progress (pending image, etc.)")
+    lines.append("/report_issue — send a message straight to the admin")
+    lines.append("/feedback &lt;message&gt; — send feedback (nickname + username included) to the Creator's DM")
+    lines.append("/quiz — browse lectures (year → module → subject → lecture) and pull their questions")
+    lines.append("/time — current time, and when the next 💥Daily Quiz💥 push is")
+    lines.append("/c — this list")
+
+    if is_admin(update):
+        lines.append("\n🔐 <b>Admin only</b>")
+        if is_creator(update):
+            lines.append("/dev_panel — stats snapshot + shortcuts (Set year, Users, Backups, Daily module) — Creator only")
+        lines.append("/set_year &lt;Nickname or ID&gt;")
+        lines.append("/tell &lt;ID or Nickname&gt; &lt;message&gt;")
+        lines.append("/preview — walk through the onboarding flow (nickname → year/class → bully joke → welcome)")
+        lines.append("/previewtxt — text dump of every static message a normal user can see")
+        lines.append("/health")
+        lines.append("/restore")
+        lines.append("/broadcast &lt;message&gt;  (or attach a file/photo/video with /broadcast as its caption)")
+        lines.append("/ban &lt;ID&gt; &lt;hours&gt; &lt;reason&gt;")
+        lines.append("/unban &lt;ID&gt;")
+        lines.append("/backup_now")
+        lines.append("/quiz_list &lt;year&gt;")
+        lines.append("/quiz_delete &lt;year&gt; &lt;number&gt;")
+        lines.append("/daily_module")
+        lines.append("/edit_quiz, /quiz_edit")
+        years_line = ", ".join(f"{y} ({year_label(y)})" for y in YEAR_ORDER)
+        lines.append(f"    year keys: {years_line}")
+
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+# ═══════════════════════════════════════════════════════════════
+# ADMIN HELPERS
+# ═══════════════════════════════════════════════════════════════
+def is_admin(update: Update) -> bool:
+    """True for the Creator (ADMIN_ID) or any secondary admin
+    (SECONDARY_ADMIN_IDS) — i.e. "any admin". This is the gate every
+    admin command/callback uses EXCEPT /dev_panel itself (and its own
+    callbacks/typed-reply flows), which uses is_creator() below instead
+    so secondary admins don't get the full panel."""
+    uid = update.effective_user.id if update.effective_user else None
+    return uid is not None and (uid == ADMIN_ID or uid in SECONDARY_ADMIN_IDS)
+
+def is_creator(update: Update) -> bool:
+    """True only for the Creator (ADMIN_ID) — secondary admins pass
+    is_admin() but NOT this. Reserved for /dev_panel and its own
+    callbacks/flows; every other admin surface uses is_admin()."""
+    return bool(update.effective_user and update.effective_user.id == ADMIN_ID)
+
+def admin_bound_year(user_id: int) -> str | None:
+    """The single year (y1/y2/y3) a secondary admin is restricted to for
+    quiz-content changes, per SECONDARY_ADMIN_YEARS — or None for the
+    Creator (unrestricted, touches every year) and for anyone who isn't a
+    secondary admin at all."""
+    return SECONDARY_ADMIN_YEARS.get(user_id)
+
+def can_edit_year(update: Update, year: str) -> bool:
+    """True if this admin is allowed to add/edit/delete quiz content for
+    `year`. The Creator can touch every year; a secondary admin can ONLY
+    touch the one year they're bound to in SECONDARY_ADMIN_YEARS — this is
+    the gate /add_lecture, /edit_quiz, /quiz_list, and /quiz_delete (plus
+    their alyr:/eqyr: entry-point callbacks) all check before letting a
+    year selection through."""
+    if not is_admin(update):
+        return False
+    if is_creator(update):
+        return True
+    return admin_bound_year(update.effective_user.id) == year
+
+def _wrong_year_msg(update: Update) -> str:
+    """Denial text for a secondary admin trying to touch quiz content
+    outside their bound year — names the one year they ARE allowed."""
+    bound = admin_bound_year(update.effective_user.id) if update.effective_user else None
+    your_year = year_label(bound) if bound else "؟"
+    return f"🚫 إنت أدمن {your_year} بس — مينفعش تعدل في سنة تانية."
+
+def admin_role_label(user_id: int) -> str:
+    """Role string shown on /mystats: 'The Creator' for ADMIN_ID, 'Admin
+    (Y1/Y2/Y3)' for a secondary admin (naming the year they're bound to),
+    'Student' for everyone else."""
+    if user_id == ADMIN_ID:
+        return "The Creator"
+    bound = admin_bound_year(user_id)
+    if bound:
+        return f"Admin ({year_label(bound)})"
+    return "Student"
+
+
+def _stamp_last_answer(user_id: int) -> None:
+    """Records "this user just answered a poll" on each of their live sessions
+    (lecture / daily quiz / mistakes retake / bookmarks retake). Stored in the
+    session dict so it's persisted + restored with the session."""
+    now = time.time()
+    for store in (LECTURE_SESSIONS, DAILY_QUIZ_SESSIONS, MISTAKES_RETAKE_SESSIONS, BOOKMARKS_RETAKE_SESSIONS):
+        session = store.get(user_id)
+        if session is not None:
+            session["last_answer_at"] = now
+
+def _count_registered_users() -> int:
+    """Users = people who actually registered a nickname (SETTINGS[uid]['nickname']).
+    USERS is every chat that ever hit /start, including people who never finished
+    onboarding, so it over-counts."""
+    return sum(1 for entry in SETTINGS.values() if entry.get("nickname"))
+
+def _count_active_sessions() -> int:
+    """People who answered a poll in the last ACTIVE_SESSION_WINDOW_SECONDS and
+    still have a live session. Counted per user (not per session entry), so
+    nobody is counted twice. Finishing a session removes it from its dict,
+    which makes the user inactive right away. Sessions restored after a
+    redeploy keep their last_answer_at; ones saved before this field existed
+    read as inactive until their owner answers again."""
+    now = time.time()
+    active = set()
+    for store in (LECTURE_SESSIONS, DAILY_QUIZ_SESSIONS, MISTAKES_RETAKE_SESSIONS, BOOKMARKS_RETAKE_SESSIONS):
+        for uid, session in store.items():
+            if now - (session.get("last_answer_at") or 0) <= ACTIVE_SESSION_WINDOW_SECONDS:
+                active.add(uid)
+    return len(active)
+
+
+def _dev_panel_stats() -> tuple[int, int, int, int]:
+    """(total_users, total_lectures, total_questions, active_sessions) —
+    the four numbers shown at the top of the Dev Panel. Lectures/questions
+    are summed across every configured year's QUIZ_INDEX; a lecture's
+    question count is len(ids) (see the QUIZ_INDEX schema comment)."""
+    total_users     = _count_registered_users()
+    total_lectures  = sum(len(QUIZ_INDEX.get(y, {})) for y in YEAR_ORDER)
+    total_questions = sum(
+        len(entry.get("ids", []))
+        for y in YEAR_ORDER
+        for entry in QUIZ_INDEX.get(y, {}).values()
+    )
+    active_sessions = _count_active_sessions()
+    return total_users, total_lectures, total_questions, active_sessions
+
+def _dev_panel_view() -> tuple[str, InlineKeyboardMarkup]:
+    """The Dev Panel's home screen: stats header + one row of buttons per
+    tool. 🔢 Set year / 👥 Users need a free-text nickname-or-ID the admin
+    hasn't typed yet, so those buttons arm an AWAITING_DEVPANEL_* flag and
+    prompt for it (see AWAITING_DEVPANEL_SETYEAR / _MYSTATS in handle());
+    💾 Backups / 📆 Daily Module open a submenu directly."""
+    total_users, total_lectures, total_questions, active_sessions = _dev_panel_stats()
+    text = (
+        "🐾 <b>QUIZICIAN ADMIN PANEL</b>\n\n"
+        f"👥 Total {total_users:,} users\n"
+        f"📚 Total {total_lectures:,} lectures\n"
+        f"❓ Total {total_questions:,} questions\n"
+        f"🔥 {active_sessions} active sessions\n\n"
+        "━━━━━━━━━━━━━━\n"
+        "🔢 <b>Set year</b> — يعدل سنة/كلاس حد (<code>/set_year &lt;Nickname or ID&gt;</code>)\n"
+        "👥 <b>Users</b> — يعرض إحصائيات حد (<code>/mystats &lt;Nickname or ID&gt;</code>)\n"
+        "💾 <b>Backups</b> — Backup Now / Restore\n"
+        "📆 <b>Daily module</b> — يحدد موديول الـ Daily Quiz لكل سنة"
+    )
+    buttons = [
+        [
+            InlineKeyboardButton("🔢 Set year", callback_data="devpanel_setyear"),
+            InlineKeyboardButton("👥 Users",     callback_data="devpanel_mystats"),
+        ],
+        [
+            InlineKeyboardButton("💾 Backups",      callback_data="devpanel_backups"),
+            InlineKeyboardButton("📆 Daily Module",  callback_data="devpanel_daily_module"),
+        ],
+    ]
+    return text, InlineKeyboardMarkup(buttons)
+
+def _dev_panel_backups_view() -> tuple[str, InlineKeyboardMarkup]:
+    text = "💾 <b>Backups</b>\n\nدوس على اللي عايز تعمله:"
+    buttons = [
+        [InlineKeyboardButton("💾 Backup Now", callback_data="devpanel_backup_now")],
+        [InlineKeyboardButton("🔄 Restore",    callback_data="devpanel_restore")],
+        [InlineKeyboardButton("🔙 رجوع",        callback_data="devpanel_back")],
+    ]
+    return text, InlineKeyboardMarkup(buttons)
+
+async def dev_panel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/dev_panel — replaces the old /admincheck. Creator-only control
+    panel: a quick stats snapshot plus shortcuts into the admin tools
+    that need a free-text argument (Set year / Users) or open a submenu
+    (Backups / Daily module).
+
+    Gated on is_creator() specifically (exactly "== ADMIN_ID"), NOT
+    is_admin() — secondary admins (SECONDARY_ADMIN_IDS) pass is_admin()
+    and so get every other admin command/callback, but not this panel.
+    Every devpanel_* callback and AWAITING_DEVPANEL_* typed-reply flow
+    below uses the same is_creator() gate for consistency."""
+    if not is_creator(update):
+        await update.message.reply_text(MSG_ADMIN_ONLY)
+        return
+    text, markup = _dev_panel_view()
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+async def set_year_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: /set_year <Nickname or ID> — looks the person up, then shows
+    the same year/class picker used at onboarding so the admin can set or
+    correct their Year/Class. Users can also change their own year from
+    Settings -> Change Year — this command is the admin override for
+    fixing someone else's pick. Also reachable via
+    the Dev Panel's 🔢 Set year button (see AWAITING_DEVPANEL_SETYEAR)."""
+    if not is_admin(update):
+        await update.message.reply_text(MSG_ADMIN_ONLY)
+        return
+    if not context.args:
+        await update.message.reply_text("استخدام: /set_year <Nickname or ID>")
+        return
+    await _prompt_set_year(update.message, " ".join(context.args))
+
+async def tell_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: /tell <ID or Nickname> <message> — resolves the target via
+    _resolve_user_ref (same nickname/ID lookup used by /set_year — the
+    reference itself must be a single token, so a multi-word nickname
+    won't match here) and DMs them the rest of the text directly from
+    the bot."""
+    if not is_admin(update):
+        await update.message.reply_text(MSG_ADMIN_ONLY)
+        return
+
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text(
+            "⚠️ استخدام:\n<code>/tell &lt;Nickname or ID&gt; &lt;رسالة&gt;</code>\n"
+            "مثال: <code>/tell 123456789 اهلا بيك!</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    ref = args[0]
+    message_text = " ".join(args[1:])
+    target_id = _resolve_user_ref(ref)
+    if target_id is None:
+        await update.message.reply_text(f"⚠️ مش لاقي حد بالاسم/الـ ID ده: {html.escape(ref)}")
+        return
+
+    try:
+        await context.bot.send_message(
+            chat_id=target_id,
+            text=f"📩 <b>رسالة من الأدمن:</b>\n{html.escape(message_text)}",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        print("TELL SEND FAILED:", e)
+        await update.message.reply_text("⚠️ مقدرتش أبعت الرسالة — ممكن يكون حاظر البوت أو ملهوش شات معاه.")
+        return
+
+    label = get_nickname(target_id) or str(target_id)
+    await update.message.reply_text(f"✅ اتبعتت الرسالة لـ {html.escape(label)}.")
+
+def _format_uptime(seconds: float) -> str:
+    seconds = int(seconds)
+    days, rem   = divmod(seconds, 86400)
+    hours, rem  = divmod(rem, 3600)
+    minutes, _  = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only at-a-glance dashboard: is the bot up, how many users/
+    lectures exist, whether each channel backup is currently trustworthy
+    (RESTORE_OK — see the comment where it's defined: False there means
+    that system's backups are actively being *refused* right now, not
+    just "unchecked"), how many sessions are live in memory, how many
+    unhandled errors hit the global error handler in the last 24h, and
+    how long this process has been running.
+
+    Two numbers here are explicitly since-last-restart, not lifetime,
+    because their backing state is in-memory only (see _ERROR_LOG_TIMES
+    and the LECTURE_SESSIONS/DAILY_QUIZ_SESSIONS/MISTAKES_RETAKE_SESSIONS
+    dicts) — called out in the footer so a low error count right after a
+    restart doesn't get misread as "no errors in the last day"."""
+    if not is_admin(update):
+        await update.message.reply_text(MSG_ADMIN_ONLY)
+        return
+
+    lecture_counts = {y: len(QUIZ_INDEX.get(y, {})) for y in YEAR_ORDER}
+
+    backup_rows = [
+        ("Analytics", RESTORE_OK.get("analytics", True)),
+        ("Settings",  RESTORE_OK.get("settings", True)),
+        ("Storage",   RESTORE_OK.get("storage", True)),
+    ] + [
+        (year_label(y), RESTORE_OK.get(f"quiz_{y}", True)) for y in YEAR_ORDER
+    ] + [
+        ("Mistakes",  RESTORE_OK.get("mistakes_bank", True)),
+        ("Reports",   RESTORE_OK.get("report_threads", True)),
+    ]
+    label_width = max(len(label) for label, _ in backup_rows)
+    backup_lines = "\n".join(
+        f"{label.ljust(label_width)}  {'✅' if ok else '❌'}" for label, ok in backup_rows
+    )
+
+    active_sessions = _count_active_sessions()
+
+    now = time.time()
+    errors_24h = sum(1 for t in _ERROR_LOG_TIMES if now - t < 24 * 3600)
+
+    uptime = _format_uptime(time.monotonic() - _BOT_STARTED_AT)
+
+    lecture_lines = "\n".join(
+        f"📚 {year_label(y)} lectures: {lecture_counts[y]}" for y in YEAR_ORDER
+    )
+
+    text = (
+        f"🟢 Bot: ONLINE\n"
+        f"👥 Users: {_count_registered_users()}\n"
+        f"{lecture_lines}\n\n"
+        f"💾 Backups:\n"
+        f"<code>{backup_lines}</code>\n\n"
+        f"⚠️ Active sessions (answered in last 10 min): {active_sessions}\n"
+        f"❌ Errors last 24h: {errors_24h}\n"
+        f"⏱ Uptime: {uptime}\n\n"
+        f"<i>Error count is since the last restart — it resets when the process does.</i>"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+# ═══════════════════════════════════════════════════════════════
+# /restore — admin-only, on-demand re-run of the same pinned-backup
+# restore logic that normally only happens once at startup, per system.
+# Doesn't touch anything backup-related beyond what restore_*_from_channel
+# already does: reads whatever's CURRENTLY PINNED in that system's
+# channel (the Bot API has no way to list or browse older, unpinned
+# backup messages — see the backup_*_to_channel functions' comments on
+# why old backups are kept, just unpinned, instead of deleted) and
+# overwrites the local file with it, same as boot does.
+#
+# Practical use: if a bad backup got pinned (e.g. RESTORE_OK was False
+# for a while and then something manually re-pinned an old/wrong file),
+# re-pin the RIGHT backup message in the channel yourself first, THEN run
+# /restore for that system — it'll pick up whatever is pinned at the
+# moment you run it, not necessarily the newest one ever taken.
+# ═══════════════════════════════════════════════════════════════
+_RESTORE_TARGETS = {
+    "analytics":       ("Analytics",        lambda app: restore_analytics_from_channel(app)),
+    "settings":        ("Settings",         lambda app: restore_settings_from_channel(app)),
+    "storage":         ("Storage",          lambda app: restore_storage_from_channel(app)),
+    "quiz_y1":         ("Quiz Index — Y1",  lambda app: restore_quiz_from_channel(app, "y1")),
+    "quiz_y2":         ("Quiz Index — Y2",  lambda app: restore_quiz_from_channel(app, "y2")),
+    "quiz_y3":         ("Quiz Index — Y3",  lambda app: restore_quiz_from_channel(app, "y3")),
+    "mistakes_bank":   ("Mistakes Bank",    lambda app: restore_mistakes_bank_from_channel(app)),
+    "report_threads":  ("Report Threads",   lambda app: restore_report_threads_from_channel(app)),
+}
+
+# ── RESET actions — "create a new/blank file" for one system ─────────
+# Offered only from the /restore flow, only when restore_go finds
+# nothing pinned to restore from (status "no_backup"). Each action
+# wipes the system's in-memory state to blank, saves that blank state
+# locally, then pushes it as a brand-new pinned backup — so afterwards
+# there IS something pinned, exactly as if the system had started
+# fresh. context here is the update's ContextTypes.DEFAULT_TYPE (has
+# .bot), same as what the backup_*_to_channel functions expect —
+# not the `app` that the restore functions above take.
+async def _reset_analytics_system(context):
+    ANALYTICS.clear()
+    await save_analytics()
+    RESTORE_OK["analytics"] = True
+    await backup_analytics_to_channel(context)
+
+async def _reset_settings_system(context):
+    SETTINGS.clear()
+    await save_settings()
+    RESTORE_OK["settings"] = True
+    await backup_settings_to_channel(context)
+
+async def _reset_storage_system(context):
+    USERS.clear()
+    STORAGE_INDEX.clear()
+    await save_users()
+    await save_storage_index()
+    RESTORE_OK["storage"] = True
+    await backup_storage_to_channel(context)
+
+async def _reset_quiz_system(context, year: str):
+    QUIZ_INDEX[year].clear()
+    QUIZ_STATE[year].clear()
+    QUIZ_POLL_STATUS[year].clear()
+    await save_quiz_index(year)
+    await save_quiz_state(year)
+    await save_quiz_poll_status(year)
+    RESTORE_OK[f"quiz_{year}"] = True
+    await backup_quiz_to_channel(context, year)
+
+async def _reset_mistakes_bank_system(context):
+    MISTAKES_BANK.clear()
+    _reindex_mistakes_bank()
+    await save_mistakes_bank()
+    RESTORE_OK["mistakes_bank"] = True
+    await backup_mistakes_bank_to_channel(context)
+
+async def _reset_report_threads_system(context):
+    REPORT_THREADS.clear()
+    await save_report_threads()
+    RESTORE_OK["report_threads"] = True
+    await backup_report_threads_to_channel(context)
+
+_RESET_ACTIONS = {
+    "analytics":       lambda context: _reset_analytics_system(context),
+    "settings":        lambda context: _reset_settings_system(context),
+    "storage":         lambda context: _reset_storage_system(context),
+    "quiz_y1":         lambda context: _reset_quiz_system(context, "y1"),
+    "quiz_y2":         lambda context: _reset_quiz_system(context, "y2"),
+    "quiz_y3":         lambda context: _reset_quiz_system(context, "y3"),
+    "mistakes_bank":   lambda context: _reset_mistakes_bank_system(context),
+    "report_threads":  lambda context: _reset_report_threads_system(context),
+}
+
+def _restore_picker_keyboard() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(label, callback_data=f"restore_go:{key}")]
+        for key, (label, _) in _RESTORE_TARGETS.items()
+    ]
+    rows.append([InlineKeyboardButton("🛑 Everything 🛑", callback_data="restore_all")])
+    rows.append([InlineKeyboardButton("🆕 🛑 RESET EVERYTHING 🛑", callback_data="reset_all")])
+    return InlineKeyboardMarkup(rows)
+
+async def restore_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        await update.message.reply_text(MSG_ADMIN_ONLY)
+        return
+    await update.message.reply_text(
+        "🔄 اختار الـ system اللي عايز تعمله restore من آخر نسخة مثبتة (pinned) في القناة بتاعته:",
+        reply_markup=_restore_picker_keyboard(),
+    )
+
+# ═══════════════════════════════════════════════════════════════
+# BROADCAST COMMAND  (admin only)
+# ═══════════════════════════════════════════════════════════════
+# Interactive composer: pick an audience, set a message, preview it
+# exactly as recipients will see it, check the live estimated-recipient
+# count, then SEND with a progress bar + rolling ETA. State lives in
+# BROADCAST_DRAFTS (see the STATE section near the top for the field
+# shapes) — one in-progress draft per admin, RAM-only like every other
+# AWAITING_*/PENDING_* flow in this file.
+BROADCAST_ACTIVE_WINDOW_DAYS = 7   # "Active users" = engaged with the bot at least once in this many days
+BROADCAST_PROGRESS_EDIT_INTERVAL = 2.0   # seconds between progress-bar edits — Telegram's edit-rate limits are per-chat, so this only needs to be sane, not aggressive
+BROADCAST_SEND_DELAY             = 0.05  # seconds between sends — a light throttle against Telegram's global flood limits on a big broadcast
+
+BROADCAST_AUDIENCE_ORDER  = ["all", "y1", "y2", "y3", "active", "inactive"]
+BROADCAST_AUDIENCE_LABELS = {
+    "all": "All users", "y1": "Year 1", "y2": "Year 2", "y3": "Year 3",
+    "active": "Active users", "inactive": "Inactive users",
+}
+
+def _broadcast_audience_user_ids(audience: str) -> list:
+    """Resolves an audience key to the user_ids it currently matches.
+    y1/y2/y3 read each user's own locked year_class (get_year_class) —
+    mandatory since onboarding (see _onboarding_gate), so this is a
+    straight equality check, no guessing needed. active/inactive split
+    on whether ANALYTICS' last_active_date falls within
+    BROADCAST_ACTIVE_WINDOW_DAYS of today (UTC, matching _today()/
+    _record_activity elsewhere) — a user who's never been active at all
+    counts as inactive."""
+    if audience == "all":
+        return list(USERS)
+    if audience in ("y1", "y2", "y3"):
+        return [uid for uid in USERS if get_year_class(uid) == audience]
+    if audience in ("active", "inactive"):
+        from datetime import timezone
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=BROADCAST_ACTIVE_WINDOW_DAYS)).strftime("%Y-%m-%d")
+        def _is_active(uid):
+            last = ANALYTICS.get(str(uid), {}).get("last_active_date")
+            return bool(last) and last >= cutoff
+        want_active = (audience == "active")
+        return [uid for uid in USERS if _is_active(uid) == want_active]
+    return []
+
+def _broadcast_composer_view(admin_id: int) -> tuple:
+    """Renders the /broadcast composer screen: an audience picker
+    (radio-style — one selected at a time, marked with ✅), the current
+    message (or a prompt to set one), and a live estimated-recipient
+    count for whichever audience is currently selected. Shared by
+    broadcast_cmd and every bcaud:/bcmsg/bccancel button in
+    button_handler so the screen re-renders identically no matter which
+    one triggered it."""
+    draft    = BROADCAST_DRAFTS.setdefault(admin_id, {"audience": "all", "text": None})
+    audience = draft["audience"]
+    text     = draft["text"]
+    media    = draft.get("media")
+    count    = len(_broadcast_audience_user_ids(audience))
+
+    lines = ["📡 <b>BROADCAST</b>", "", "👥 <b>Audience</b>"]
+    for i, key in enumerate(BROADCAST_AUDIENCE_ORDER):
+        branch = "└─" if i == len(BROADCAST_AUDIENCE_ORDER) - 1 else "├─"
+        mark   = "✅ " if key == audience else ""
+        lines.append(f"{branch} {mark}{BROADCAST_AUDIENCE_LABELS[key]}")
+    lines.append("")
+    lines.append("📝 <b>Message</b>")
+    if media:
+        lines.append(f"📎 <b>Attachment:</b> {media['kind']}")
+    if text:
+        preview = html.escape(text[:200]) + ("…" if len(text) > 200 else "")
+        lines.append(preview)
+    elif not media:
+        lines.append("<i>⚠️ لسه مفيش رسالة — دوس ✏️ Set Message تحت</i>")
+    lines.append("")
+    lines.append(f"📊 <b>Estimated:</b> {count:,} recipient(s)")
+
+    buttons, row = [], []
+    for key in BROADCAST_AUDIENCE_ORDER:
+        mark  = "✅ " if key == audience else ""
+        row.append(InlineKeyboardButton(f"{mark}{BROADCAST_AUDIENCE_LABELS[key]}", callback_data=f"bcaud:{key}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+
+    msg_row = [InlineKeyboardButton("✏️ Set Message", callback_data="bcmsg")]
+    if text or media:
+        msg_row.append(InlineKeyboardButton("👁 Preview", callback_data="bcpreview"))
+    buttons.append(msg_row)
+
+    action_row = []
+    if (text or media) and count:   # SEND only offered once there's actually something, to someone, to send
+        action_row.append(InlineKeyboardButton("🚀 SEND", callback_data="bcsend"))
+    action_row.append(InlineKeyboardButton("❌ CANCEL", callback_data="bccancel"))
+    buttons.append(action_row)
+
+    return "\n".join(lines), InlineKeyboardMarkup(buttons)
+
+# ── Formatting-preserving broadcast text ──────────────────────────
+# A text message's bold/italic/spoiler/etc. never lives in message.text —
+# Telegram sends it separately as entities (UTF-16 offsets), which is why
+# the old code (message.text / context.args) silently dropped it. Draft
+# text is sent with parse_mode=HTML, so the entities are converted back
+# into HTML tags here. A message with NO formatting entities is passed
+# through untouched, which keeps the old "type raw <b>…</b> yourself"
+# behavior working exactly as before.
+_BROADCAST_FORMAT_ENTITY_TYPES = {
+    "bold", "italic", "underline", "strikethrough", "spoiler", "code", "pre",
+    "text_link", "text_mention", "blockquote", "expandable_blockquote", "custom_emoji",
+}
+
+def _entity_html_tags(e) -> tuple | None:
+    """(open_tag, close_tag) for one MessageEntity, or None if it isn't a
+    formatting entity (url/mention/hashtag/... need no tag — Telegram
+    re-detects those from the plain text on its own)."""
+    t = str(getattr(e, "type", ""))
+    if t == "bold":          return "<b>", "</b>"
+    if t == "italic":        return "<i>", "</i>"
+    if t == "underline":     return "<u>", "</u>"
+    if t == "strikethrough": return "<s>", "</s>"
+    if t == "spoiler":       return "<tg-spoiler>", "</tg-spoiler>"
+    if t == "code":          return "<code>", "</code>"
+    if t == "blockquote":    return "<blockquote>", "</blockquote>"
+    if t == "expandable_blockquote": return "<blockquote expandable>", "</blockquote>"
+    if t == "pre":
+        lang = getattr(e, "language", None)
+        if lang:
+            return f'<pre><code class="language-{html.escape(lang, quote=True)}">', "</code></pre>"
+        return "<pre>", "</pre>"
+    if t == "text_link" and getattr(e, "url", None):
+        return f'<a href="{html.escape(e.url, quote=True)}">', "</a>"
+    if t == "text_mention" and getattr(e, "user", None):
+        return f'<a href="tg://user?id={e.user.id}">', "</a>"
+    if t == "custom_emoji" and getattr(e, "custom_emoji_id", None):
+        return f'<tg-emoji emoji-id="{html.escape(str(e.custom_emoji_id), quote=True)}">', "</tg-emoji>"
+    return None
+
+def _entities_to_html(text: str, entities, cut_chars: int = 0) -> str:
+    """Rebuilds `text[cut_chars:]` as Telegram-HTML, re-applying `entities`
+    (offsets/lengths in UTF-16 code units, as Telegram sends them).
+    Entities that start before the cut (e.g. the /broadcast command
+    itself) are dropped. Overlapping entities that don't nest cleanly are
+    closed and re-opened so the HTML stays valid."""
+    units = text.encode("utf-16-le")
+    total = len(units) // 2
+    cut   = len(text[:cut_chars].encode("utf-16-le")) // 2
+
+    spans = []   # (start, end, open_tag, close_tag)
+    for e in entities or []:
+        tags = _entity_html_tags(e)
+        if not tags:
+            continue
+        start, end = e.offset, min(e.offset + e.length, total)
+        if start < cut or end <= start:
+            continue
+        spans.append((start, end, tags[0], tags[1]))
+    spans.sort(key=lambda sp: (sp[0], -sp[1]))   # outer (longer) entity opens first
+
+    def _seg(a: int, b: int) -> str:
+        return html.escape(units[2 * a:2 * b].decode("utf-16-le"), quote=False)
+
+    points = sorted({cut, total} | {sp[0] for sp in spans} | {sp[1] for sp in spans})
+    out, stack = [], []
+    for i, pt in enumerate(points):
+        ending = {id(sp) for sp in stack if sp[1] <= pt}
+        if ending:
+            low    = min(k for k, sp in enumerate(stack) if id(sp) in ending)
+            popped = stack[low:]
+            del stack[low:]
+            for sp in reversed(popped):
+                out.append(sp[3])
+            for sp in popped:              # still-open ones that were sitting above a closed one
+                if id(sp) not in ending:
+                    out.append(sp[2])
+                    stack.append(sp)
+        for sp in spans:
+            if sp[0] == pt:
+                out.append(sp[2])
+                stack.append(sp)
+        if i + 1 < len(points):
+            out.append(_seg(pt, points[i + 1]))
+    return "".join(out)
+
+def _broadcast_text_from_message(text: str, entities, cut_chars: int = 0) -> str:
+    """Broadcast-ready HTML for `text[cut_chars:]`. Formatted text (any
+    formatting entity after the cut) is converted via _entities_to_html;
+    unformatted text is returned as-is so typed raw HTML tags keep working."""
+    cut = len(text[:cut_chars].encode("utf-16-le")) // 2
+    has_format = any(
+        str(getattr(e, "type", "")) in _BROADCAST_FORMAT_ENTITY_TYPES and e.offset >= cut
+        for e in (entities or [])
+    )
+    if not has_format:
+        return text[cut_chars:]
+    return _entities_to_html(text, entities, cut_chars)
+
+async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        await update.message.reply_text(MSG_ADMIN_ONLY)
+        return
+    admin_id = update.effective_user.id
+
+    # Old shortcut still works: /broadcast <message>, or reply to a
+    # message with /broadcast — pre-fills the composer's message so the
+    # admin doesn't have to retype it via ✏️ Set Message. Audience stays
+    # whatever it was last set to (defaulting to "all" the first time).
+    # Replying to a message that carries an ATTACHMENT (photo, video,
+    # file, audio, voice, GIF, video note, sticker) pre-fills that
+    # attachment too; any text typed after /broadcast then replaces its
+    # caption. (An attachment sent WITH a "/broadcast ..." caption goes
+    # through broadcast_media_cmd instead — CommandHandler never sees
+    # captions.)
+    reply     = update.message.reply_to_message
+    reply_kind = _broadcast_media_kind(reply) if reply else None
+    # Read the text (and its formatting) straight off the message instead
+    # of context.args, which drops bold/italic/spoiler entities and
+    # collapses newlines. Falls back to context.args if the message text
+    # somehow doesn't start with the command.
+    msg_text = update.message.text or ""
+    cmd_m    = _BROADCAST_CMD_CAPTION_RE.match(msg_text)
+    if cmd_m:
+        args_text = _broadcast_text_from_message(msg_text, update.message.entities, cmd_m.end()).strip() or None
+    else:
+        args_text = " ".join(context.args) if context.args else None
+
+    draft = BROADCAST_DRAFTS.setdefault(admin_id, {"audience": "all", "text": None})
+    if reply_kind:
+        media = {
+            "chat_id": reply.chat_id, "message_id": reply.message_id, "kind": reply_kind,
+            "caption": args_text, "entities": None, "html": True,   # caption=None keeps the original caption as-is
+        }
+        draft["media"] = media
+        draft["text"]  = args_text if args_text is not None else (reply.caption or "")
+    elif args_text:
+        draft["text"], draft["media"] = args_text, None
+    elif reply and reply.text:
+        draft["text"], draft["media"] = _broadcast_text_from_message(reply.text, reply.entities), None
+    AWAITING_BROADCAST_MESSAGE.pop(admin_id, None)
+
+    body, markup = _broadcast_composer_view(admin_id)
+    await update.message.reply_text(body, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+# ── Broadcast attachments ─────────────────────────────────────────
+BROADCAST_CAPTIONABLE_KINDS = {"photo", "video", "document", "audio", "voice", "animation"}   # kinds copy_message accepts a caption override for
+_BROADCAST_CMD_CAPTION_RE   = re.compile(r"^/broadcast(?:@\w+)?(?:\s+|$)")
+
+def _broadcast_media_kind(msg) -> str | None:
+    """The attachment type on `msg` ("photo", "video", ...) or None if
+    it carries none (plain text, poll, location, ...)."""
+    if msg is None:
+        return None
+    for kind in ("photo", "video", "document", "audio", "voice", "animation", "video_note", "sticker"):
+        if getattr(msg, kind, None):
+            return kind
+    return None
+
+class _BroadcastAttachmentFilter(filters.MessageFilter):
+    """Matches an admin's private-chat attachment that is meant for the
+    broadcast composer: either it's captioned "/broadcast ..." or the
+    composer is currently waiting for its message (✏️ Set Message).
+    Everything else falls through to the normal handlers untouched."""
+    def filter(self, message) -> bool:
+        user = message.from_user
+        if message.chat.type != "private" or not user:
+            return False
+        if user.id != ADMIN_ID and user.id not in SECONDARY_ADMIN_IDS:
+            return False
+        if _broadcast_media_kind(message) is None:
+            return False
+        return bool(AWAITING_BROADCAST_MESSAGE.get(user.id)) or bool(
+            _BROADCAST_CMD_CAPTION_RE.match(message.caption or "")
+        )
+
+async def broadcast_media_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """An attachment sent (a) with a "/broadcast <caption>" caption, or
+    (b) while the composer is waiting on its message: it becomes the
+    broadcast body, delivered to everyone via copy_message so every
+    attachment type (and its formatting) goes through as-is."""
+    msg      = update.message
+    admin_id = update.effective_user.id
+    kind     = _broadcast_media_kind(msg)
+    draft    = BROADCAST_DRAFTS.setdefault(admin_id, {"audience": "all", "text": None})
+    AWAITING_BROADCAST_MESSAGE.pop(admin_id, None)
+
+    caption = msg.caption or ""
+    m = _BROADCAST_CMD_CAPTION_RE.match(caption)
+    if m:
+        # Strip the "/broadcast " prefix from the caption and shift the
+        # formatting entities left to match (drops the /command entity).
+        cut       = m.end()
+        stripped  = caption[cut:]
+        entities  = [
+            MessageEntity(
+                type=e.type, offset=e.offset - cut, length=e.length, url=e.url,
+                user=e.user, language=e.language, custom_emoji_id=e.custom_emoji_id,
+            )
+            for e in (msg.caption_entities or []) if e.offset >= cut
+        ]
+        media = {"chat_id": msg.chat_id, "message_id": msg.message_id, "kind": kind,
+                 "caption": stripped, "entities": entities or None, "html": False}
+        draft["text"] = stripped
+    else:
+        media = {"chat_id": msg.chat_id, "message_id": msg.message_id, "kind": kind,
+                 "caption": None, "entities": None, "html": False}   # keep the original caption untouched
+        draft["text"] = caption
+    draft["media"] = media
+
+    body, markup = _broadcast_composer_view(admin_id)
+    await msg.reply_text(body, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+async def _deliver_broadcast_item(bot, uid: int, text: str | None, media: dict | None) -> None:
+    """One broadcast delivery to one chat: the attachment (copy_message,
+    so any type works, with the caption override when there is one) or
+    the plain HTML text. Raises whatever Telegram raises — callers
+    decide what a failure means."""
+    if not media:
+        await bot.send_message(chat_id=uid, text=text, parse_mode=ParseMode.HTML)
+        return
+    kwargs = dict(chat_id=uid, from_chat_id=media["chat_id"], message_id=media["message_id"])
+    if media.get("caption") is not None and media["kind"] in BROADCAST_CAPTIONABLE_KINDS:
+        kwargs["caption"] = media["caption"]
+        if media.get("entities"):
+            kwargs["caption_entities"] = media["entities"]
+        elif media.get("html"):
+            kwargs["parse_mode"] = ParseMode.HTML
+    await bot.copy_message(**kwargs)
+
+async def _send_broadcast(context: ContextTypes.DEFAULT_TYPE, status_message, audience: str, text: str | None, recipients: list, media: dict | None = None) -> None:
+    """Sends text to every id in recipients, editing status_message into
+    a live progress bar + rolling ETA (re-estimated from the actual
+    send rate so far, refreshed at most every
+    BROADCAST_PROGRESS_EDIT_INTERVAL seconds) and finishing with the
+    same success/failed/blocked summary the old one-shot /broadcast
+    used to show, plus the audience and total duration."""
+    total = len(recipients)
+    success, failed, blocked = 0, 0, []
+    started   = time.monotonic()
+    last_edit = 0.0
+
+    def _bar(done: int) -> str:
+        filled = int((done / total) * 20) if total else 20
+        return "█" * filled + "░" * (20 - filled)
+
+    def _fmt_duration(seconds: float) -> str:
+        seconds = max(0, int(seconds))
+        return f"{seconds // 60}m {seconds % 60}s" if seconds >= 60 else f"{seconds}s"
+
+    async def _update_progress(done: int, force: bool = False):
+        nonlocal last_edit
+        now = time.monotonic()
+        if not force and now - last_edit < BROADCAST_PROGRESS_EDIT_INTERVAL:
+            return
+        last_edit = now
+        elapsed = now - started
+        rate    = done / elapsed if elapsed > 0 else 0
+        eta     = (total - done) / rate if rate > 0 else 0
+        pct     = int(done / total * 100) if total else 100
+        try:
+            await status_message.edit_text(
+                f"📡 <b>بيتبعت...</b>\n\n"
+                f"[{_bar(done)}] {pct}%\n"
+                f"{done}/{total} — ⏳ متبقي تقريبًا {_fmt_duration(eta)}",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass   # a failed progress-bar edit should never interrupt the actual send loop below
+
+    await _update_progress(0, force=True)
+
+    for i, uid in enumerate(recipients, 1):
+        try:
+            await _deliver_broadcast_item(context.bot, uid, text, media)
+            success += 1
+        except Forbidden:
+            # The user actually blocked the bot (or deleted their account) —
+            # this is the only case where removing them from USERS is safe.
+            failed += 1
+            blocked.append(uid)
+        except Exception as e:
+            # Any other error (network blip, rate limit, Telegram hiccup) is
+            # NOT proof the user blocked us — keep them in USERS so a
+            # transient failure doesn't silently and permanently unsubscribe
+            # a real, still-active user.
+            failed += 1
+            print(f"Broadcast failed for {uid} (not removed — not a block):", e)
+        await _update_progress(i)
+        if BROADCAST_SEND_DELAY:
+            await asyncio.sleep(BROADCAST_SEND_DELAY)
+
+    if blocked:
+        for uid in blocked:
+            USERS.discard(uid)
+        await save_users()
+        await backup_storage_to_channel(context)
+
+    summary = (
+        f"✅ <b>Broadcast اتبعت!</b>\n\n"
+        f"👥 الجمهور: <b>{BROADCAST_AUDIENCE_LABELS.get(audience, audience)}</b>\n"
+        f"📨 المستهدفين: <b>{total}</b>\n"
+        f"✔️ نجح: <b>{success}</b>\n"
+        f"❌ فشل / بلوك: <b>{failed}</b>\n"
+        f"⏱ المدة: <b>{_fmt_duration(time.monotonic() - started)}</b>"
+    )
+    if blocked:
+        summary += f"\n🗑 تم حذف {len(blocked)} يوزر بلوك البوت من القائمة"
+    try:
+        await status_message.edit_text(summary, parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+
+async def ban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: /ban <user_id> <hours> <reason> — blocks that user from
+    using the bot for the given number of hours. What's actually saved
+    is the *unban* moment itself (banned_until, an epoch timestamp in
+    their settings — see get_ban_info), not the duration, so it's a
+    plain comparison against time.time() on every update (see
+    _ban_gate) rather than needing a scheduled unban job. A second
+    /ban on the same user just overwrites banned_until/ban_reason."""
+    if not is_admin(update):
+        await update.message.reply_text(MSG_ADMIN_ONLY)
+        return
+
+    args = context.args
+    if len(args) < 3:
+        await update.message.reply_text(
+            "⚠️ استخدام:\n<code>/ban ID عدد_الساعات السبب</code>\n"
+            "مثال: <code>/ban 123456789 24 سبام</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    try:
+        target_id = int(args[0])
+        hours     = float(args[1])
+    except ValueError:
+        await update.message.reply_text("⚠️ الـ ID وعدد الساعات لازم يكونوا أرقام.")
+        return
+    if hours <= 0:
+        await update.message.reply_text("⚠️ عدد الساعات لازم يكون أكبر من صفر.")
+        return
+
+    reason = " ".join(args[2:])
+    until  = time.time() + hours * 3600
+
+    entry = _get_settings_entry(target_id)
+    entry["banned_until"] = until
+    entry["ban_reason"]   = reason
+    await save_settings()
+    await backup_settings_to_channel(context)
+
+    until_label = datetime.fromtimestamp(until, DAILY_QUIZ_TZ).strftime("%Y-%m-%d %I:%M %p")
+    await update.message.reply_text(
+        f"🚫 <b>{target_id}</b> اتعمله بان لمدة {hours:g} ساعة.\n"
+        f"⏰ هيترفع البان: {until_label}\n"
+        f"📝 السبب: {html.escape(reason)}",
+        parse_mode=ParseMode.HTML,
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=target_id,
+            text=(
+                f"🚫 اتعمللك بان من البوت لمدة {hours:g} ساعة.\n"
+                f"📝 السبب: {html.escape(reason)}\n"
+                f"⏰ هيترفع البان: {until_label}"
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        pass  # they may have blocked the bot, or never opened a DM with it — not fatal to the ban itself
+
+async def unban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: /unban <user_id> — clears banned_until/ban_reason early,
+    instead of waiting out the timer set by /ban. Safe to run on someone
+    who isn't currently banned (or whose ban already lifted on its own)
+    — it just reports that and does nothing further."""
+    if not is_admin(update):
+        await update.message.reply_text(MSG_ADMIN_ONLY)
+        return
+
+    args = context.args
+    if len(args) < 1:
+        await update.message.reply_text(
+            "⚠️ استخدام:\n<code>/unban ID</code>", parse_mode=ParseMode.HTML,
+        )
+        return
+    try:
+        target_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("⚠️ الـ ID لازم يكون رقم.")
+        return
+
+    until, _ = get_ban_info(target_id)
+    if until is None:
+        await update.message.reply_text(f"ℹ️ <b>{target_id}</b> مش متبنن أصلاً.", parse_mode=ParseMode.HTML)
+        return
+
+    entry = _get_settings_entry(target_id)
+    entry["banned_until"] = None
+    entry["ban_reason"]   = None
+    await save_settings()
+    await backup_settings_to_channel(context)
+
+    await update.message.reply_text(f"✅ اتشال البان عن <b>{target_id}</b>.", parse_mode=ParseMode.HTML)
+    try:
+        await context.bot.send_message(
+            chat_id=target_id,
+            text="✅ اتشال البان عنك — تقدر تستخدم البوت تاني.",
+        )
+    except Exception:
+        pass  # same best-effort DM as ban_cmd — not fatal if it fails
+
+# ═══════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════
+ACHIEVEMENT_CATEGORY_LABEL = {
+    "questions_answered": "📚 Questions Answered",
+    "correct_streak":     "🔥 Correct Streak",
+    "lectures_completed": "📖 Lectures Completed",
+    "xp_levels":          "⭐ XP / Levels",
+    "daily_quiz":         "📅 Daily Quiz",
+    "daily_streak":       "🔥 Daily Streak",
+    "achievement_collector": "🔍 Achievement Collector",
+}
+
+async def _send_achievements(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_target, edit: bool = False) -> None:
+    """Full achievements breakdown — every tiered category (all its tiers,
+    varies by category — see ACHIEVEMENTS) plus the one-off Extras
+    section. Unlocked ones show their real name/threshold/description;
+    locked ones are masked with ???? (mystery-box style — no spoilers on
+    what's still ahead). Shared by the /mystats 'Achievements' button
+    (only entry point for now). reply_target is a Message — edit=True
+    rewrites it in place (button flow); edit=False sends a fresh reply
+    (there's nothing bot-owned to edit yet, e.g. a freshly typed
+    command)."""
+    entry = _get_entry(user_id)
+    ach   = entry.get("achievements", {})
+
+    lines = ["🏆 <b>كل الإنجازات</b>\n"]
+    for key, tiers in ACHIEVEMENTS.items():
+        current = ach.get(key, 0)
+        label   = ACHIEVEMENT_CATEGORY_LABEL.get(key, key)
+        lines.append(f"{label} ({current}/{len(tiers)})")
+        for i, (threshold, name, xp_bonus, emoji, quip) in enumerate(tiers):
+            tier = i + 1
+            if tier <= current:
+                name = _personalize_ach_text(name, user_id)
+                quip = _personalize_ach_text(quip, user_id)
+                if key == "achievement_collector":
+                    lines.append(f"  ✅ {name} — x{xp_bonus} XP")
+                else:
+                    lines.append(f"  ✅ {name} — {threshold}+")
+                lines.append(f"     💬 <i>{quip}</i>")
+            else:
+                lines.append("  🔒 ???????? — ???")
+        lines.append("")
+
+    extras = ach.get("extras", {})
+    lines.append(f"🌚 Extras ({sum(1 for v in extras.values() if v)}/{len(EXTRA_ACHIEVEMENTS)})")
+    for key, (name, emoji, xp_bonus, desc, quip) in EXTRA_ACHIEVEMENTS.items():
+        if extras.get(key):
+            lines.append(f"  ✅ {emoji} {name} — {desc}")
+            lines.append(f"     💬 <i>{_personalize_ach_text(quip, user_id)}</i>")
+        else:
+            lines.append("  🔒 ???????? — ????????")
+
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")]])
+    send = reply_target.edit_text if edit else reply_target.reply_text
+    await send("\n".join(lines).strip(), parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+async def _send_mystats(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_target, edit: bool = False) -> None:
+    """Builds and sends the /mystats profile card to reply_target (an
+    update.message or a callback_query.message — both support
+    reply_text/edit_text). Shared by the /mystats command and the
+    main-menu button. edit=True rewrites reply_target in place instead of
+    sending a new message — only valid for a bot-owned message (button
+    flow), not a freshly typed command."""
+    entry = ANALYTICS.get(str(user_id))
+    if not entry or not entry.get("last_active_date"):
+        send = reply_target.edit_text if edit else reply_target.reply_text
+        await send(
+            quizzy_block(QUIZZY_ANNOYED_ART, "bro you didn't even start anything yet 😂, go take a quiz first 💥"),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    streak      = entry.get("streak", 0)
+    # streak_best is new — fall back to streak itself for an entry that
+    # predates it and hasn't gone through _get_entry's backfill yet (e.g.
+    # right after a restore, before this user's first action this run).
+    streak_best = entry.get("streak_best", streak)
+    lec_answered = entry.get("lecture_questions_answered", 0)
+    lec_correct  = entry.get("lecture_questions_correct", 0)
+    accuracy     = (lec_correct / lec_answered * 100) if lec_answered else 0.0
+    xp    = entry.get("xp", 0)
+    level = entry.get("level", 0)
+    xp_multiplier = entry.get("xp_multiplier", 1.0)
+    title = _level_title(level)
+
+    xp_start, xp_end = _level_xp_range(level)
+    xp_into_level    = xp - xp_start
+    xp_needed        = xp_end - xp_start
+    bar_filled       = int((xp_into_level / xp_needed) * 10) if xp_needed else 10
+    bar              = "█" * bar_filled + "░" * (10 - bar_filled)
+
+    nickname = get_nickname(user_id) or "—"
+    year_class = get_year_class(user_id)
+    year_line = (
+        f"{year_class[1:]} (Class {YEAR_CLASS_NUMBER[year_class]})"
+        if year_class in YEAR_CLASS_NUMBER else "—"
+    )
+
+    mistake_count = _user_mistake_count(user_id)
+
+    # Current module's subjects, strongest -> weakest. "Current module" is
+    # the admin-set /daily_module scope when there is one, else the module
+    # of the user's own latest answer — see _current_module_for_stats.
+    # Omitted entirely (no empty header) until they've answered something
+    # in that module.
+    stats_module = _current_module_for_stats(entry)
+    ranking      = _subject_ranking(entry, stats_module)
+    if ranking:
+        subj_lines = []
+        for i, (subject, pct, correct, answered) in enumerate(ranking):
+            marker = "💪" if i == 0 and len(ranking) > 1 else ("⚠️" if i == len(ranking) - 1 and len(ranking) > 1 else "▫️")
+            subj_lines.append(
+                f"  {marker} {html.escape(subject_label(subject))}: <b>{pct:.0f}%</b> ({correct}/{answered})"
+            )
+        subjects_block = (
+            f"📈 <b>{html.escape(stats_module)}</b> — strongest → weakest\n"
+            + "\n".join(subj_lines) + "\n\n"
+        )
+    else:
+        subjects_block = ""
+
+    # achievements summary
+    ach        = entry.get("achievements", {})
+    ach_lines  = []
+    icons      = {
+        "questions_answered": "📚", "correct_streak": "🔥",
+        "lectures_completed": "📖", "xp_levels": "⭐",
+        "daily_quiz": "📅", "daily_streak": "🔥",
+        "achievement_collector": "🔍",
+    }
+    for key, emoji in icons.items():
+        tier = ach.get(key, 0)
+        if tier:
+            name = _personalize_ach_text(ACHIEVEMENTS[key][tier - 1][1], user_id)
+            emoji = ACHIEVEMENTS[key][tier - 1][3]   # tier 5 swaps to 🪄 for "The Quizician"
+            if key == "achievement_collector":
+                mult = ACHIEVEMENTS[key][tier - 1][2]
+                ach_lines.append(f"  {emoji} {name} (x{mult})")
+            else:
+                ach_lines.append(f"  {emoji} {name} {'⭐' * tier}")
+    for key, unlocked in ach.get("extras", {}).items():
+        if unlocked:
+            name, emoji, _xp, _desc, _quip = EXTRA_ACHIEVEMENTS[key]
+            ach_lines.append(f"  {emoji} {name}")
+
+    ach_text = "\n".join(ach_lines) if ach_lines else "  لسه مفيش إنجازات"
+
+    # Daily Quiz leaderboard medals — lifetime top-3 finishes, see
+    # _finalize_daily_leaderboard. Always shows all three, 0 included,
+    # so it reads as a running tally rather than only appearing once
+    # someone's actually won something.
+    medals = entry.get("daily_medals", {"gold": 0, "silver": 0, "bronze": 0})
+    medals_line = f"🥇({medals['gold']}) 🥈({medals['silver']}) 🥉({medals['bronze']})"
+
+    send = reply_target.edit_text if edit else reply_target.reply_text
+    await send(
+        f"╔══════════════════╗\n"
+        f"     🌐     YOUR PROFILE      🌐\n"
+        f"╚══════════════════╝\n"
+        f"Nickname: {html.escape(nickname)}\n"
+        f"Role: {admin_role_label(user_id)}\n"
+        f"Year: {year_line}\n\n"
+        f"🏅 Level: {level} — <i>{title}</i>\n"
+        f"✨ XP: {xp:,}  [{bar}]  → {xp_end:,}"
+        + (f"  (x{xp_multiplier} 🔍)" if xp_multiplier != 1.0 else "") + "\n\n"
+        f"🔥 Current streak: {streak} days\n"
+        f"🏅 Best streak: {streak_best} days\n\n"
+        f"📚 Questions\n"
+        f"   Answered: {lec_answered:,}\n"
+        f"   Correct: {lec_correct:,}\n"
+        f"   Accuracy: {accuracy:.1f}%\n\n"
+        f"{subjects_block}"
+        f"🧠 Mistakes Bank\n"
+        f"  current: {mistake_count} questions\n\n"
+        f"Your medals\n"
+        f"{medals_line}\n\n"
+        f"🏆 <b>Achievements</b>\n{ach_text}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🏆 Achievements", callback_data="view_achievements"),
+            InlineKeyboardButton("🏠 Back to Home",  callback_data="back_home"),
+        ]]),
+    )
+
+ABOUT_US_TEXT = (
+    f"{quizzy_block(QUIZZY_HAPPY_ART, 'أهلاً يا دكتور المستقبل ❤️')}\n\n"
+    "مرحبا يا عزيزي طبيب المستقبل، تم صنع بوت \"Quizician\" ليكون بوت مساعد في صنع أسئلة تيم كويز، "
+    "وتطور فيما بعد ليصبح منصه كامله لتنزيل الأسئلة وحلها مباشرة مع إضافات العديد من الخدمات مثل تتبع الأخطاء وحفظها لمراجعتها، "
+    "المراجعه التكرارية للأسئلة أول بأول، المنافسات اليوميه على المراكز العاليه بين زملائك، وأشياء آخرى كثير لتحسين قدراتك "
+    "وتهيئتك بأفضل ما يمكن علشان تتفوق في دراستك وتقديراتك.\n\n"
+    "جزيل الشكر لكل من ساعد بأفكاره وإضافاته وتشجيعه، وشكرا لكل حد بيحل أسئلتنا وبيحط ثقته فينا ❤️‍🔥"
+)
+
+SUPPORT_US_TEXT = (
+    f"{quizzy_block(QUIZZY_ADORE_ART, 'كويزي بيحبكم أوي 🥰')}\n\n"
+    "البوت دا معمول علشان يكون 100٪ مجاني ومتاح لكل الدفعات اللي موجودة في MFM\n"
+    "وبدون أي مقابل!\n\n"
+    "تقدر تساعدنا بدعواتك لينا ولآبائنا ولكل حد ساعد فالمشروع ده، وتساعدنا فنشرة بين زمايلك 🫶\n"
+    "ولو عندك أي إضافات أو شكاوي متترددش تتواصل معانا ب /feedback و /report_issue 🫡"
+)
+
+TERMS_OF_SERVICE_TEXT = (
+    "<b>Terms of Service — The Quizician</b>\n"
+    "Last updated: September 24, 2026\n"
+    "By using The Quizician (the “Bot”) on Telegram, you agree to these Terms. "
+    "The Bot is operated by an independent \"Developer\". Contact us via /feedback or /report_issue.\n\n"
+    "<b>1. User-Submitted Content</b>\n"
+    "• If you submit a quiz question to the Bot (in the question/choices/answer format it accepts), you agree that question is free to be shared in any channel, and free to be used as part of the Bot’s Quizzes — by the Developer, without further permission, credit, or compensation to you.\n"
+    "• Only submit content you have the right to share. Do not submit content that is false, plagiarized, or infringes someone else’s rights.\n"
+    "• The Developer may edit, reject, or remove any submitted question at any time, for any reason.\n\n"
+    "<b>2. Acceptable Use</b>\n"
+    "You agree not to:\n"
+    "• Send abusive, hateful, or sexually explicit content to the Bot, its admins, or other users (including in nicknames, feedback, or submitted questions);\n"
+    "• Cheat or manipulate scoring or leaderboards (automation, exploiting bugs, sharing accounts, etc.);\n"
+    "• Attempt to access admin features, other users’ data, or the Bot’s systems without authorization;\n"
+    "• Spam, phish, or otherwise disrupt the Bot’s normal operation;\n"
+    "• Violate Telegram’s own Terms of Service or applicable law while using the Bot.\n"
+    "Violations may lead to a warning, a temporary or permanent ban (via the Bot’s own ban tools), or removal of content, at the Developer’s discretion.\n\n"
+    "<b>3. General</b>\n"
+    "The Bot is a study aid provided “as is,” with no guarantee that quiz content is error-free — report issues with /report_issue. Features, availability, and these Terms may change at any time."
+)
+
+async def _send_info_page(context: ContextTypes.DEFAULT_TYPE, query, text: str, title: str) -> None:
+    await query.edit_message_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 Back to Settings", callback_data="menu_settings")],
+            [InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")],
+        ]),
+    )
+
+
+async def _send_settings(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_target, edit: bool = False, page: int = 1) -> None:
+    """Builds and sends the Settings screen to reply_target (an
+    update.message or a callback_query.message). Mirrors _send_mystats:
+    edit=True rewrites reply_target in place (button flow), edit=False
+    sends a fresh reply. page 2 is the "➡️ More Settings" overflow page —
+    Reactions / Achievement Alerts / Daily Notification / Zikr;
+    page 1 is everything else (Username, Year/Class, Auto-Next,
+    Randomize, Spaced Repetition, Question Timer)."""
+    if page == 2:
+        text = (
+            "⚙️ <b>الإعدادات — صفحة 2</b>\n\n"
+            "🎭 <b>Reactions</b>: البوت يرد بإيموجي عشوائي على رسايلك.\n"
+            "🏆 <b>Achievement Alerts</b>: تنبيه لما تفتح achievement جديد.\n"
+            "🔔 <b>Daily Notification</b>: تنبيه يومي الساعة 2 الضهر لما الـ Daily Quiz يتجدد.\n"
+            "📿 <b>Zikr</b>: بوسترة ذكر كل ٧ أسئلة."
+        )
+    else:
+        nickname = get_nickname(user_id)
+        nick_line = f"<b>{html.escape(nickname)}</b>" if nickname else "<i>مش متسجل — دوس تحت تحطه</i>"
+        yc_line = html.escape(year_class_label(get_year_class(user_id)))
+        spaced_rep_on = get_spaced_repetition_enabled(user_id)
+        auto_next_on  = get_auto_next_enabled(user_id)
+        text = (
+            f"⚙️ <b>الإعدادات</b>\n\n"
+            f"👤 الاسم المستعار: {nick_line}\n"
+            f"⚠️ استخدم اسم لائق 🙊 — هو اللي هيظهر في الـ Leaderboard وقدام زمايلك.\n\n"
+            f"📚 <b>Year/Class</b>: {yc_line}\n"
+            "⏭️ <b>Auto-Next</b>: الأسئلة تتبعت واحد واحد بدل ما تتبعت كلها مرة واحدة.\n"
+            "🔀 <b>Randomize</b>: ترتيب الأسئلة يبقى عشوائي كل مرة.\n"
+            "🔁 <b>Spaced Repetition</b>: بيعيد سؤال غلطت فيه بعد شوية عشان يثبت في ذاكرتك."
+            + ("\n⚠️ لازم الـ Auto-Next يكون شغال عشان الميزة دي تشتغل." if spaced_rep_on and not auto_next_on else "")
+            + "\n⏱️ <b>Question Timer</b>: وقت محدد لكل سؤال قبل ما يتقفل تلقائي."
+        )
+
+    send = reply_target.edit_text if edit else reply_target.reply_text
+    await send(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=settings_menu_keyboard(user_id, page=page),
+    )
+
+async def mystats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Analytics are keyed by the person's real Telegram user id — not the
+    # chat id — so this shows the same numbers whether /mystats is run in
+    # a DM or inside a group/channel the bot is in.
+    user_id = update.effective_user.id if update.effective_user else update.effective_chat.id
+    # Admin-only extra: /mystats <Nickname or ID> looks up someone ELSE's
+    # stats instead of the caller's own — see _resolve_user_ref. A
+    # non-admin's args are just ignored; they always get their own stats.
+    if context.args and is_admin(update):
+        ref = " ".join(context.args)
+        target_id = _resolve_user_ref(ref)
+        if target_id is None:
+            await update.message.reply_text(f"⚠️ مش لاقي حد بالاسم/الـ ID ده: {html.escape(ref)}")
+            return
+        user_id = target_id
+    await _send_mystats(context, user_id, update.message)
+
+
+async def reset_analytics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only: asks for confirmation, then wipes all analytics data
+    locally and deletes the pinned backup in the analytics group. The
+    actual wipe happens in button_handler's reset_analytics_yes branch
+    once the admin taps to confirm — this is irreversible, unlike most
+    other admin actions here."""
+    if not is_admin(update):
+        return
+    await update.message.reply_text(
+        f"⚠️ <b>متأكد إنك عايز تمسح كل الـ Analytics؟</b>\n\n"
+        f"دلوقتي فيه بيانات <b>{len(ANALYTICS)}</b> يوزر، والعملية دي مش هترجع تاني.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑 أيوه، امسح كل حاجة", callback_data="reset_analytics_yes")],
+            [InlineKeyboardButton("🔙 لأ، سيبها", callback_data="reset_analytics_no")],
+        ]),
+    )
+
+async def restore_analytics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only: manually re-pull analytics.json from the pinned backup
+    in ANALYTICS_GROUP_ID — the same restore that runs automatically on
+    startup. Use this if the local file ever gets wiped, corrupted, or
+    out of sync with the backup, without needing to restart the bot."""
+    if not is_admin(update):
+        return
+    before = len(ANALYTICS)
+    await restore_analytics_from_channel(context)
+    await update.message.reply_text(
+        f"♻️ Restored from pinned backup.\n"
+        f"Users on file: <b>{len(ANALYTICS)}</b> (was {before} before restore).",
+        parse_mode=ParseMode.HTML,
+    )
+
+async def import_analytics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only: import analytics from an uploaded .json file. Reply to
+    the file's message with /import_analytics. This is the fallback for
+    when the pinned backup itself is missing/corrupted — e.g. importing a
+    copy you saved elsewhere. Merges into (does not wipe) existing data,
+    then re-saves and re-pins so the channel backup reflects the import."""
+    global _analytics_dirty
+    if not is_admin(update):
+        return
+    reply = update.message.reply_to_message
+    doc   = reply.document if reply else None
+    if not doc:
+        await update.message.reply_text(
+            "⚠️ Reply to the analytics .json file with /import_analytics."
+        )
+        return
+    try:
+        tg_file  = await context.bot.get_file(doc.file_id)
+        raw      = await tg_file.download_as_bytearray()
+        imported = json.loads(bytes(raw).decode("utf-8"))
+        if not isinstance(imported, dict):
+            raise ValueError("File doesn't look like an analytics export (expected a JSON object).")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Import failed: {e}")
+        return
+    cleaned = _clean_analytics_dict(imported)
+    if not cleaned:
+        await update.message.reply_text(
+            "❌ Import failed: nothing in that file looked like a valid analytics entry "
+            "(expected {\"<telegram_user_id>\": {...}, ...}). Wrong file?"
+        )
+        return
+    ANALYTICS.update(cleaned)
+    await save_analytics()
+    _analytics_dirty = False   # disk now matches memory — nothing left for the periodic flush to do
+    await backup_analytics_to_channel(context)
+    dropped = len(imported) - len(cleaned)
+    note = f" ({dropped} malformed entr{'y' if dropped == 1 else 'ies'} skipped)" if dropped else ""
+    await update.message.reply_text(
+        f"✅ Imported <b>{len(cleaned)}</b> user(s){note} — merged into current data, "
+        f"saved locally, and re-pinned to the backup channel.\n"
+        f"Total users on file now: <b>{len(ANALYTICS)}</b>.",
+        parse_mode=ParseMode.HTML,
+    )
+
+async def _migrate_legacy_bookmarks_into_mistakes_bank() -> None:
+    """One-time compatibility migration from the old bookmarks.json layout.
+
+    New code never writes bookmarks.json. Existing bookmark snapshots are
+    imported into QUIZICIAN_MISTAKES_BANK as type="bookmarked", deduplicated
+    by user + question_key, and then the shared bank is saved/backed up."""
+    raw = _load_json_safe(LEGACY_BOOKMARKS_FILE, dict, dict, "LEGACY BOOKMARKS")
+    if not raw:
+        return
+
+    added = 0
+    updated_index = False
+    for user_key, items in raw.items():
+        try:
+            uid = int(user_key)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(items, list):
+            continue
+
+        existing_keys = {
+            str(item.get("question_key"))
+            for item in _bookmark_entries(uid)
+            if item.get("question_key")
+        }
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            question = str(item.get("question", "") or "").strip()
+            if not question:
+                continue
+            options = list(item.get("options", []) or [])
+            qkey = item.get("question_key") or _question_content_key(
+                question, options, prefix="bookmark"
+            )
+            if qkey in existing_keys:
+                continue
+            entry = {
+                "user_id": uid,
+                "type": BOOKMARK_ENTRY_TYPE,
+                "mid": item.get("source_mid"),
+                "year": item.get("year"),
+                "module": item.get("module"),
+                "subject": item.get("subject"),
+                "lecture": item.get("lecture"),
+                "source_mid": item.get("source_mid"),
+                "question_key": qkey,
+                "question": question,
+                "options": options,
+                "correct_option_id": item.get("correct_option_id"),
+                "explanation": item.get("explanation"),
+                "saved_at": int(item.get("saved_at") or time.time()),
+            }
+            MISTAKES_BANK.append(entry)
+            _mistakes_index_add(entry)
+            existing_keys.add(qkey)
+            added += 1
+            updated_index = True
+
+    if not updated_index:
+        return
+    _mark_mistakes_bank_dirty()
+    await save_mistakes_bank()
+    await backup_mistakes_bank_to_channel(SimpleNamespace(bot=app.bot))
+    print(f"BOOKMARK MIGRATION: imported {added} legacy bookmark(s) into MISTAKES_BANK.")
+
+
+async def _post_init(app):
+    """Runs once after the bot connects, before polling starts — restores
+    the storage-group and each year's quiz-channel indexes from their
+    pinned backup messages, so a wiped/switched local disk doesn't orphan
+    content that's still sitting safely in the channels themselves."""
+    # asyncio.to_thread() (used by every save_*() function's disk write)
+    # runs on Python's DEFAULT ThreadPoolExecutor, sized
+    # min(32, cpu_count()+4) — on a small Railway instance (1-2 vCPUs)
+    # that's as few as 5-6 threads, shared across the ENTIRE bot. Every
+    # save_*() call (which fires on essentially every answered question —
+    # XP, streak, mistakes-bank updates) queues behind that tiny pool
+    # once concurrent students exceed it. Under load-testing (see the
+    # load-test harness from this conversation), this was the leading
+    # suspect for latency going strongly super-linear with concurrency
+    # (p95 growing ~44x for a 7x increase in users) rather than roughly
+    # linearly, since it's a real queueing bottleneck, not a CPU-bound
+    # one — these are disk-I/O-bound calls (fsync), so a pool much larger
+    # than the CPU core count is appropriate and safe, not wasteful.
+    #
+    # Done here, not at module level: this is the first point in the
+    # file guaranteed to be running ON the actual event loop PTB will use
+    # for the rest of the bot's life (_post_init is an async callback PTB
+    # itself awaits during startup, per its own post_init contract) — so
+    # asyncio.get_running_loop() here is guaranteed correct, unlike
+    # calling asyncio.get_event_loop() at bare module-import time, which
+    # can silently attach to the wrong loop object depending on Python
+    # version and how run_polling() manages its own loop internally.
+    import concurrent.futures as _cf
+    asyncio.get_running_loop().set_default_executor(
+        _cf.ThreadPoolExecutor(max_workers=64, thread_name_prefix="quizician-io")
+    )
+
+    await restore_storage_from_channel(app)
+    for y in configured_years():
+        await restore_quiz_from_channel(app, y)
+    await _freeze_legacy_lecture_links(app)   # lecture uids + legacy-link table — see _lecture_uid
+    await restore_analytics_from_channel(app)
+    await restore_settings_from_channel(app)
+    await restore_lecture_results_from_channel(app)
+    await restore_mistakes_bank_from_channel(app)
+    await _migrate_legacy_bookmarks_into_mistakes_bank()
+    await restore_report_threads_from_channel(app)
+    await restore_sessions_from_channel(app)
+
+    if app.job_queue is None:
+        print(
+            "⚠️ No JobQueue available — periodic backup reconciliation, the "
+            "analytics/settings/mistakes-bank flushes, stale-session cleanup, "
+            "session persistence, the Daily Quiz push, "
+            "reminder, and the daily zipped backup export are disabled. "
+            "Local analytics/settings/mistakes-bank changes from hot paths "
+            "(poll answers, Daily Quiz starts, wrong answers) will only hit "
+            "disk on the next immediate-save call site "
+            "(restore/reset/import/toggle) or on a clean shutdown, not every "
+            "60s. Install with: pip install \"python-telegram-bot[job-queue]\""
+        )
+    else:
+        app.job_queue.run_repeating(
+            _reconcile_backups_job, interval=BACKUP_RECONCILE_INTERVAL, first=BACKUP_RECONCILE_INTERVAL,
+        )
+        app.job_queue.run_repeating(
+            _flush_analytics_job, interval=ANALYTICS_FLUSH_INTERVAL, first=ANALYTICS_FLUSH_INTERVAL,
+        )
+        app.job_queue.run_repeating(
+            _flush_settings_job, interval=SETTINGS_FLUSH_INTERVAL, first=SETTINGS_FLUSH_INTERVAL,
+        )
+        app.job_queue.run_repeating(
+            _flush_mistakes_bank_job, interval=MISTAKES_BANK_FLUSH_INTERVAL, first=MISTAKES_BANK_FLUSH_INTERVAL,
+        )
+        app.job_queue.run_repeating(
+            _cleanup_stale_sessions_job, interval=STALE_SESSION_CHECK_INTERVAL, first=STALE_SESSION_CHECK_INTERVAL,
+        )
+        app.job_queue.run_repeating(
+            _sessions_backup_job, interval=SESSIONS_BACKUP_MIN_INTERVAL, first=SESSIONS_BACKUP_MIN_INTERVAL,
+        )
+        app.job_queue.run_repeating(
+            _sessions_stale_sweep_job, interval=SESSIONS_STALE_SWEEP_INTERVAL, first=SESSIONS_STALE_SWEEP_INTERVAL,
+        )
+        app.job_queue.run_daily(
+            _daily_quiz_push_job, time=dt_time(hour=DAILY_QUIZ_HOUR, minute=DAILY_QUIZ_MIN, tzinfo=DAILY_QUIZ_TZ),
+        )
+        app.job_queue.run_daily(
+            _daily_backup_export_job,
+            time=dt_time(hour=DAILY_BACKUP_EXPORT_HOUR, minute=DAILY_BACKUP_EXPORT_MIN, tzinfo=DAILY_QUIZ_TZ),
+        )
+
+async def _flush_analytics_job(context: ContextTypes.DEFAULT_TYPE):
+    """Periodic tick for the hot-path debounce described above
+    _analytics_dirty: writes analytics.json only if a poll answer marked it
+    dirty since the last tick. No-ops (no deepcopy, no I/O) on a quiet tick."""
+    await _flush_analytics_if_dirty()
+
+async def _flush_settings_job(context: ContextTypes.DEFAULT_TYPE):
+    """Periodic tick for the hot-path debounce described above
+    _settings_dirty: writes settings.json only if a Daily Quiz start (or
+    other dirty-marking call site) changed it since the last tick."""
+    await _flush_settings_if_dirty()
+
+async def _flush_mistakes_bank_job(context: ContextTypes.DEFAULT_TYPE):
+    """Periodic tick for the hot-path debounce described above
+    _mistakes_bank_dirty: writes mistakes_bank.json only if a wrong answer
+    (record_mistake) changed it since the last tick."""
+    await _flush_mistakes_bank_if_dirty()
+
+# ═══════════════════════════════════════════════════════════════
+# STALE SESSION CLEANUP — a student who leaves mid-lecture (closes the
+# app, loses signal, just gets distracted) and never comes back leaves
+# LECTURE_SESSIONS[user_id] (or the Daily Quiz / Mistakes Retake
+# equivalent) sitting in memory forever — nothing removes it on its own.
+# The question-timer fix (see poll_update_handler) only closes a session
+# out once ITS poll actually closes, and with the timer set to Off (the
+# default), a poll never closes by itself at all.
+#
+# Not a crash or lockout risk — confirmed: starting a fresh lecture just
+# overwrites the old entry (LECTURE_SESSIONS[user_id] = session, no
+# "already in a lecture" guard anywhere), and @_serialize_per_user's
+# lock is released between updates, never held across a whole session.
+# It IS a genuine slow memory leak, though, and a stale poll left open
+# means Telegram would still silently accept a vote on it days later
+# even though nothing's listening for it anymore by then (whatever
+# session exists for that user_id won't match that old poll_id).
+#
+# STALE_SESSION_IDLE_SECONDS is deliberately generous — this must never
+# fire on someone taking a normal break mid-lecture who fully intends to
+# come back and finish; it's only meant to catch sessions that are,
+# realistically, abandoned for good.
+# ═══════════════════════════════════════════════════════════════
+STALE_SESSION_IDLE_SECONDS   = 6 * 3600  # 6 hours of no activity before a session is reclaimed
+STALE_SESSION_CHECK_INTERVAL = 3600      # check once an hour
+
+async def _cleanup_stale_sessions_job(context: ContextTypes.DEFAULT_TYPE):
+    now = time.time()
+    for sessions in (LECTURE_SESSIONS, DAILY_QUIZ_SESSIONS, MISTAKES_RETAKE_SESSIONS):
+        for user_id, session in list(sessions.items()):
+            if session.get("mode") == "batch":
+                # Several polls can be open at once with no single
+                # current_delivered_at — use the OLDEST of them (the
+                # longest-idle question) as this session's age, and
+                # close out every one of them, not just one.
+                pending = session.get("pending_polls", {})
+                if not pending:
+                    continue
+                timestamps = [t for (_, _, _, t) in pending.values() if t is not None]
+                delivered_at = min(timestamps) if timestamps else None
+                message_ids = [mid_ for (_, mid_, _, _) in pending.values()]
+            else:
+                delivered_at = session.get("current_delivered_at")
+                message_ids = [session["current_message_id"]] if session.get("current_message_id") else []
+
+            if delivered_at is None or now - delivered_at < STALE_SESSION_IDLE_SECONDS:
+                continue
+
+            sessions.pop(user_id, None)
+            for message_id in message_ids:
+                try:
+                    await context.bot.stop_poll(chat_id=user_id, message_id=message_id)
+                except Exception:
+                    pass  # already closed/deleted/blocked — any of these are fine, nothing to do
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text="⏳ الجلسة اتقفلت لعدم النشاط لفترة طويلة — ابدأ تاني لما تكون جاهز.",
+                )
+            except Exception:
+                pass  # blocked the bot, deactivated account, etc. — skip silently, same as broadcast_cmd
+
+async def _post_shutdown(app):
+    """Runs once on a clean shutdown (PTB's own stop-signal handling calls
+    this before the process exits) — flushes any analytics still sitting in
+    memory from the last (< ANALYTICS_FLUSH_INTERVAL)-second window, so a
+    normal restart/redeploy never loses data. Only a hard crash (killed
+    process, power loss) can still lose that window; a clean stop cannot."""
+    await _flush_analytics_if_dirty()
+    await _flush_settings_if_dirty()
+    await _flush_mistakes_bank_if_dirty()
+    await _flush_sessions_if_changed()
+
+# ── Backup reconciliation ────────────────────────────────────────
+# Every backup_*_to_channel() call above is reactive and fire-and-forget:
+# it fires once, right after a data change, and any failure in the
+# upload/pin/delete-old-pin sequence is only logged, never retried.
+# Almost always fine — but a dropped pin call or a delete that silently
+# fails (message already gone, a transient timeout, etc.) can leave the
+# channel's pinned message out of sync with what's actually on disk,
+# and nothing would notice until the NEXT change came along to trigger
+# another reactive backup.
+#
+# This job runs on a short timer instead of waiting for the next change:
+# every BACKUP_RECONCILE_INTERVAL seconds, for each backup system
+# (analytics, settings, lecture results, storage, and each configured
+# year's quiz index), it checks whether the channel's current pin still
+# matches the caption marker we expect. If the pin is missing, or belongs
+# to a different marker (e.g. our own backup got unpinned by someone, or a
+# delete-old-pin call left a stale one pinned instead), it just re-runs
+# that system's normal backup_*_to_channel() — which re-uploads,
+# re-pins, and cleans up the old message the same way it always does.
+# Cheap: one get_chat per system per tick, and the throttle inside each
+# backup_*_to_channel() call means this never spams uploads if
+# everything's already fine.
+BACKUP_RECONCILE_INTERVAL = 5  # seconds
+
+async def _reconcile_backups_job(context: ContextTypes.DEFAULT_TYPE):
+    checks = [
+        ("analytics",       ANALYTICS_GROUP_ID,       ANALYTICS_BACKUP_MARKER,       backup_analytics_to_channel),
+        ("settings",        SETTINGS_GROUP_ID,        SETTINGS_BACKUP_MARKER,        backup_settings_to_channel),
+        ("lecture_results", LECTURE_RESULTS_GROUP_ID, LECTURE_RESULTS_BACKUP_MARKER, backup_lecture_results_to_channel),
+        ("mistakes_bank",   MISTAKES_BANK_GROUP_ID,   MISTAKES_BANK_BACKUP_MARKER,   backup_mistakes_bank_to_channel),
+        ("storage",         STORAGE_GROUP_ID,         STORAGE_BACKUP_MARKER,         backup_storage_to_channel),
+        # force=True: the pin being out of sync is exactly why we're here —
+        # skip both backup_sessions_to_channel's throttle and its
+        # unchanged-content skip so the re-upload actually happens.
+        ("sessions",        SESSIONS_GROUP_ID,        SESSIONS_BACKUP_MARKER,
+         (lambda ctx: backup_sessions_to_channel(ctx, force=True))),
+    ]
+    # One quiz check per configured year, each hitting its own channel.
+    for y in configured_years():
+        checks.append((
+            f"quiz_{y}", year_channel_id(y), QUIZ_BACKUP_MARKER,
+            (lambda ctx, year=y: backup_quiz_to_channel(ctx, year)),
+        ))
+    for key, group_id, marker, backup_fn in checks:
+        if not group_id or not RESTORE_OK.get(key, True):
+            continue   # not configured, or restore already failed this session — leave it alone
+        try:
+            chat   = await context.bot.get_chat(group_id)
+            pinned = chat.pinned_message
+            in_sync = bool(pinned and pinned.document and (pinned.caption or "") == marker)
+        except Exception as e:
+            print(f"BACKUP RECONCILE — couldn't check {key}: {e}")
+            continue
+        if not in_sync:
+            print(f"BACKUP RECONCILE — {key} pin out of sync, re-backing up.")
+            try:
+                await backup_fn(context)
+            except Exception as e:
+                print(f"BACKUP RECONCILE — re-backup of {key} failed: {e}")
+
+# ═══════════════════════════════════════════════════════════════
+# PIN SERVICE-MESSAGE CLEANUP
+#
+# Every pin_chat_message() call in the backup system (and the pins made
+# when quiz-channel questions/lectures get pinned) causes Telegram to post
+# a "The Quizician pinned a file" service message in that chat.
+# disable_notification only silences the push notification, it doesn't
+# stop the message itself — so we delete it on sight in the bot's own
+# chats. Restricted to chats the bot actually pins in; if a human admin
+# pins something else in one of these, its service message gets deleted
+# too, since Telegram doesn't tell us who did the pinning.
+# ═══════════════════════════════════════════════════════════════
+BACKUP_CHAT_IDS = [c for c in (
+    STORAGE_GROUP_ID, *QUIZ_CHANNEL_IDS, ANALYTICS_GROUP_ID,
+    SETTINGS_GROUP_ID, LECTURE_RESULTS_GROUP_ID, SESSIONS_GROUP_ID,
+) if c]
+
+async def delete_pin_service_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.channel_post or update.message
+    if not msg:
+        return
+    try:
+        await context.bot.delete_message(chat_id=msg.chat_id, message_id=msg.message_id)
+    except Exception as e:
+        print(f"PIN SERVICE MESSAGE DELETE ERROR: {e}")
+
+# concurrent_updates(256): by default PTB processes updates one at a time,
+# globally — every poll answer/button tap/message from every user queues
+# behind whichever one is currently being handled. Fine at low volume, but
+# on a night with 500+ people answering quizzes at once it means everyone
+# queues behind everyone else, even though their updates touch completely
+# unrelated per-user state. 256 lets that many updates run concurrently
+# (each user's own updates are still serialized against each other — see
+# @_serialize_per_user below); Telegram's own rate limits are still
+# enforced by AIORateLimiter regardless of how many run at once locally.
+#
+# The thread-pool-size fix for asyncio.to_thread() (every save_*()
+# function's disk write) lives in _post_init, not here — it needs a
+# guaranteed-running event loop to attach to (asyncio.get_running_loop()),
+# and at this point in the file the loop PTB will actually run polling on
+# doesn't necessarily exist yet / isn't necessarily the one
+# asyncio.get_event_loop() would return this early. See _post_init.
+app = (
+    ApplicationBuilder()
+    .token(BOT_TOKEN)
+    .rate_limiter(AIORateLimiter())
+    .concurrent_updates(256)
+    .post_init(_post_init)
+    .post_shutdown(_post_shutdown)
+    .build()
+)
+
+# ═══════════════════════════════════════════════════════════════
+# GLOBAL ERROR HANDLER
+#
+# PTB already catches exceptions per-update internally so one bad update
+# can't take down the whole bot — but without this, the traceback just
+# goes to stderr and nobody finds out. This posts a compact report to
+# ERROR_LOG_GROUP_ID instead. Wrapped in its own try/except since the
+# last thing an error handler should do is raise another error.
+# ═══════════════════════════════════════════════════════════════
+def _describe_update(update: object) -> str:
+    """A short, human-readable line describing what was happening when
+    this update came in — who, and what they did (typed a command,
+    tapped a button, sent a poll answer, ...) — so the errors channel
+    reads like 'Kareem tapped button toggle_reactions' instead of making
+    a reader reconstruct that from the raw update JSON below it. Falls
+    back to a plain label if update isn't a normal Update (e.g. an error
+    raised from a job_queue task, which has no update at all)."""
+    if not isinstance(update, Update):
+        return "(no update — this came from a background job/task, not a live user update)"
+
+    who = "unknown user"
+    if update.effective_user:
+        u = update.effective_user
+        uname = f"@{u.username}" if u.username else (u.full_name or "no name")
+        who = f"{uname} (id {u.id})"
+
+    if update.callback_query:
+        action = f"tapped button: {update.callback_query.data!r}"
+    elif update.message and update.message.text:
+        action = f"sent message: {update.message.text[:120]!r}"
+    elif update.message and update.message.poll:
+        action = "sent a poll"
+    elif update.poll_answer:
+        action = f"answered poll {update.poll_answer.poll_id}"
+    elif update.message_reaction:
+        action = f"reacted to message {update.message_reaction.message_id}"
+    elif update.message:
+        action = "sent a non-text message (photo/document/etc.)"
+    else:
+        action = "sent an unrecognized update type"
+
+    chat_kind = f" in {update.effective_chat.type} chat {update.effective_chat.id}" if update.effective_chat else ""
+    return f"{who} {action}{chat_kind}"
+
+def _likely_cause(exc: BaseException) -> str | None:
+    """A short plain-English guess at what caused this, based on common
+    failure patterns in a python-telegram-bot app — matches on exception
+    type, and for a few Telegram-specific ones, on substrings Telegram's
+    API is known to send back. Purely heuristic: meant to save a first
+    read-through of the traceback, not to replace it, so it's fine (and
+    expected) for this to return None on anything it doesn't recognize —
+    the full traceback is always still attached below it."""
+    msg = str(exc).lower()
+
+    if isinstance(exc, Forbidden):
+        return "The bot tried to message someone who blocked it, left the chat, or kicked the bot — nothing to fix in the code, just an unreachable user."
+    if isinstance(exc, RetryAfter):
+        return f"Hit Telegram's flood/rate limit — sent too many requests too fast (retry after {getattr(exc, 'retry_after', '?')}s). Usually transient."
+    if isinstance(exc, BadRequest):
+        if "message is not modified" in msg:
+            return "Tried to edit a message with identical text/markup — Telegram rejects no-op edits. Usually harmless."
+        if "message to edit not found" in msg or "message can't be edited" in msg:
+            return "The message the bot tried to edit was deleted, too old, or never existed (e.g. a stale button left on an old message)."
+        if "query is too old" in msg or "query id is invalid" in msg or "response timeout expired" in msg:
+            return "A button was tapped after its callback query expired — usually a very old message, or the bot restarted since the button was shown."
+        if "chat not found" in msg:
+            return "Tried to message a chat/group ID the bot isn't actually a member of (or that ID is wrong)."
+        if "not enough rights" in msg or "have no rights" in msg:
+            return "The bot isn't an admin (or lacks a specific permission) in that group/channel."
+        return "Telegram rejected the request outright — check the exact parameters of the call against the message above."
+    # NOTE: BadRequest is (surprisingly) a subclass of NetworkError in
+    # python-telegram-bot, so this catch-all MUST come after the
+    # BadRequest check above, or every BadRequest gets misclassified as
+    # a transient network blip instead of getting its specific message.
+    if isinstance(exc, (TimedOut, NetworkError)):
+        return "Telegram's API was slow or briefly unreachable — usually transient, not a code bug."
+    if isinstance(exc, KeyError):
+        return f"Code expected key {exc} in a dict that didn't have it — often a data-shape mismatch (a settings/analytics/mistakes-bank entry missing a field) or a callback_data referencing something that no longer exists."
+    if isinstance(exc, IndexError):
+        return "Code indexed into a list/string shorter than expected — often an off-by-one, or content split into fewer parts than assumed."
+    if isinstance(exc, AttributeError) and "nonetype" in msg:
+        return "Code called a method/attribute on something that was None — usually a lookup (dict.get, a file/record read) that came back empty and wasn't checked before use."
+    if isinstance(exc, json.JSONDecodeError):
+        return "Malformed JSON was being parsed — check whichever file or channel backup was being loaded at the time."
+    if isinstance(exc, ValueError):
+        return "A conversion or parse step got a value it couldn't handle (e.g. int()/float() on non-numeric text, or unexpected formatting)."
+    if isinstance(exc, TypeError):
+        return "A function got an argument of the wrong type or count — often None sneaking in where a real value was expected."
+    return None
+
+async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    tb_string = "".join(traceback.format_exception(
+        None, context.error, context.error.__traceback__
+    ))
+    print("UNHANDLED ERROR:", tb_string)
+
+    if not ERROR_LOG_GROUP_ID:
+        return
+
+    who_what   = _describe_update(update)
+    cause      = _likely_cause(context.error)
+    cause_line = f"🕵️ <b>Likely cause:</b> {html.escape(cause)}\n\n" if cause else ""
+
+    update_str = update.to_dict() if isinstance(update, Update) else str(update)
+    # Telegram messages cap at 4096 chars — keep well under that even
+    # with the two new lines above (who/what + likely cause) added.
+    report = (
+        f"🚨 <b>Bot error</b>\n"
+        f"👤 <b>Who/what:</b> {html.escape(who_what)}\n"
+        f"<b>{type(context.error).__name__}:</b> {html.escape(str(context.error))}\n\n"
+        f"{cause_line}"
+        f"<b>Update:</b>\n<code>{html.escape(str(update_str))[:900]}</code>\n\n"
+        f"<b>Traceback:</b>\n<code>{html.escape(tb_string)[-1800:]}</code>"
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=ERROR_LOG_GROUP_ID, text=report, parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        print(f"ERROR LOG GROUP SEND FAILED: {e}")
+        return   # not counted below — it never actually reached the errors channel
+
+    # Only reaches here once the report has actually landed in the errors
+    # channel, so /health's "errors last 24h" always matches what's really
+    # sitting there — not what the handler merely attempted to send.
+    now = time.time()
+    _ERROR_LOG_TIMES.append(now)
+    cutoff = now - _ERROR_LOG_MAX_AGE_SECONDS
+    while _ERROR_LOG_TIMES and _ERROR_LOG_TIMES[0] < cutoff:
+        _ERROR_LOG_TIMES.pop(0)
+
+app.add_error_handler(global_error_handler)
+
+async def _ban_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Runs in an earlier handler group than everything else (see the
+    group=-1 registrations right below), so it sees every update first.
+    A currently-banned user (get_ban_info/is_banned) gets a short notice
+    with their remaining time + reason instead of whatever they tried to
+    do, and ApplicationHandlerStop keeps the update from ever reaching
+    the real handlers in group 0. A user whose ban has lifted (or who
+    was never banned) just falls through untouched."""
+    user = update.effective_user
+    if not user:
+        return
+    until, reason = get_ban_info(user.id)
+    if until is None:
+        return
+    hours_left = (until - time.time()) / 3600
+    text = (
+        f"🚫 انت متبنن من البوت لسه.\n"
+        f"⏰ هيترفع البان بعد {hours_left:.1f} ساعة.\n"
+        f"📝 السبب: {html.escape(reason or '—')}"
+    )
+    if update.callback_query:
+        await update.callback_query.answer(text, show_alert=True)
+    elif update.effective_message:
+        await update.effective_message.reply_text(
+            f"{quizzy_block(QUIZZY_ANGRY_ART, 'مبروك، اتبنيت 🚫')}\n\n{text}",
+            parse_mode=ParseMode.HTML,
+        )
+    raise ApplicationHandlerStop
+
+app.add_handler(MessageHandler(filters.ALL, _ban_gate), group=-1)
+app.add_handler(CallbackQueryHandler(_ban_gate), group=-1)
+
+async def _onboarding_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Same group=-1 pattern as _ban_gate, registered right after it, so
+    it also sees every update before the real handlers in group 0.
+    Nickname + year/class are now mandatory before ANYTHING else works.
+    Explicitly let through: /start itself (so onboarding is always
+    reachable), the nickname reply while AWAITING_NICKNAME is set (so
+    the text handler can actually save it), and the onboarding
+    year/class taps and the steps after (onboard_yc:*, onboard_bully:*,
+    onboard_how, onboard_where, onboard_go) — every
+    other update gets a nudge back to /start instead of its real
+    handler. Channel posts (no effective_user) are never gated, same as
+    _ban_gate."""
+    user = update.effective_user
+    if not user:
+        return
+    real_uid = user.id
+
+    if update.message and update.message.text and update.message.text.startswith("/start"):
+        return
+    if update.message and AWAITING_NICKNAME.get(real_uid):
+        return
+    if update.callback_query:
+        data = update.callback_query.data or ""
+        if data.startswith(("onboard_yc:", "onboard_bully:")) or data in ("onboard_how", "onboard_where", "onboard_go"):
+            return
+
+    if get_nickname(real_uid) is not None and get_year_class(real_uid) in YEAR_CLASS_NUMBER:
+        return
+
+    text = "⚠️ لازم تعمل /start الأول وتسجل اسمك وسنتك/فرقتك قبل أي حاجة تانية."
+    if update.callback_query:
+        await update.callback_query.answer(text, show_alert=True)
+    elif update.effective_message:
+        await update.effective_message.reply_text(text)
+    raise ApplicationHandlerStop
+
+app.add_handler(MessageHandler(filters.ALL, _onboarding_gate), group=-1)
+app.add_handler(CallbackQueryHandler(_onboarding_gate), group=-1)
+
+app.add_handler(MessageHandler(
+    filters.StatusUpdate.PINNED_MESSAGE & filters.Chat(BACKUP_CHAT_IDS),
+    delete_pin_service_message,
+))
+
+# Broadcast attachments (captioned "/broadcast ..." or sent while the
+# composer waits for its message) — must precede the media handlers below.
+app.add_handler(MessageHandler(_BroadcastAttachmentFilter(), broadcast_media_cmd))
+
+app.add_handler(CommandHandler("start",          start))
+app.add_handler(CommandHandler("c",              commands_cmd))
+app.add_handler(CommandHandler("cancel",         cancel_cmd))
+app.add_handler(CommandHandler("report_issue",   report_issue_cmd))
+app.add_handler(CommandHandler("feedback",       feedback_cmd))
+app.add_handler(CommandHandler("sleep",          sleep_cmd))
+app.add_handler(CommandHandler("dev_panel",      dev_panel_cmd))
+app.add_handler(CommandHandler("preview",        preview_cmd))
+app.add_handler(CommandHandler("previewtxt",     previewtxt_cmd))
+app.add_handler(CommandHandler("set_year",       set_year_cmd))
+app.add_handler(CommandHandler("tell",           tell_cmd))
+app.add_handler(CommandHandler("health",         health_cmd))
+app.add_handler(CommandHandler("restore",        restore_cmd))
+app.add_handler(CommandHandler("broadcast",      broadcast_cmd))
+app.add_handler(CommandHandler("ban",            ban_cmd))
+app.add_handler(CommandHandler("unban",          unban_cmd))
+app.add_handler(CommandHandler("mystats",           mystats_cmd))
+app.add_handler(CommandHandler("restore_analytics", restore_analytics_cmd))
+app.add_handler(CommandHandler("import_analytics",  import_analytics_cmd))
+app.add_handler(CommandHandler("reset_analytics",   reset_analytics_cmd))
+app.add_handler(CommandHandler("backup_now",     backup_now_cmd))
+# Quiz channel
+app.add_handler(CommandHandler("quiz",            quiz_lectures_cmd))
+app.add_handler(CommandHandler("daily_module",     daily_module_cmd))
+app.add_handler(CommandHandler("time",             time_cmd))
+app.add_handler(CommandHandler("quiz_list",       quiz_list_cmd))
+app.add_handler(CommandHandler("quiz_delete",     quiz_delete_cmd))
+app.add_handler(CommandHandler("edit_quiz",       edit_quiz_cmd))
+app.add_handler(CommandHandler("quiz_edit",       edit_quiz_cmd))
+app.add_handler(CommandHandler("add_lecture",     add_lecture_cmd))
+
+# Poll handler before text handler (forwarded OR own quiz polls) —
+# excludes the quiz channel, which has its own dedicated handler below.
+app.add_handler(MessageHandler(filters.POLL & ~filters.Chat(QUIZ_CHANNEL_IDS), handle_poll))
+
+# Quiz channel indexing — lecture titles, "-END", and quiz polls posted
+# there get filed by handle_quiz_channel_message, not treated as a user's
+# own quiz-building activity. Must be registered before the generic
+# text/poll handlers below.
+app.add_handler(MessageHandler(
+    filters.Chat(QUIZ_CHANNEL_IDS) & (filters.POLL | filters.TEXT | filters.PHOTO), handle_quiz_channel_message
+))
+
+# Storage group indexing — anything posted in the vault group gets filed by
+# its caption's password word. Must be checked before the generic photo
+# handler below so vault posts don't get mistaken for quiz images.
+STORAGE_MEDIA_FILTER = (
+    filters.PHOTO | filters.VIDEO | filters.Document.ALL
+    | filters.AUDIO | filters.VOICE | filters.ANIMATION | filters.Sticker.ALL
+)
+app.add_handler(MessageHandler(
+    filters.Chat(STORAGE_GROUP_ID) & STORAGE_MEDIA_FILTER, handle_storage_message
+))
+# Plain-text vault posts — only the reserved onboarding key is filed (see
+# handle_storage_text_message); everything else in that group is ignored.
+app.add_handler(MessageHandler(
+    filters.Chat(STORAGE_GROUP_ID) & filters.TEXT & ~filters.COMMAND, handle_storage_text_message
+))
+
+# Image handler (photos) — excludes the storage group and the quiz
+# channel (quiz-channel photos are claimed by handle_quiz_channel_message
+# above; this is a belt-and-suspenders exclusion, not just handler order)
+app.add_handler(MessageHandler(
+    filters.PHOTO & ~filters.Chat(STORAGE_GROUP_ID) & ~filters.Chat(QUIZ_CHANNEL_IDS), handle_image
+))
+
+# PDF handler — captioned PDFs in a private DM are parsed as manual MCQs;
+# excludes the storage group and quiz channel.
+app.add_handler(MessageHandler(
+    filters.Document.PDF & ~filters.Chat(STORAGE_GROUP_ID) & ~filters.Chat(QUIZ_CHANNEL_IDS), handle_document
+))
+
+# Inline buttons
+app.add_handler(CallbackQueryHandler(button_handler))
+app.add_handler(PollHandler(poll_update_handler))
+app.add_handler(PollAnswerHandler(handle_poll_answer))
+app.add_handler(MessageReactionHandler(handle_message_reaction))
+
+# Text handler last — excludes the storage group and the quiz channel
+app.add_handler(MessageHandler(
+    filters.TEXT & ~filters.COMMAND & ~filters.Chat(STORAGE_GROUP_ID) & ~filters.Chat(QUIZ_CHANNEL_IDS), handle
+))
+
+def _print_startup_banner():
+    """Cosmetic-only console banner on launch — pure stdout, no side
+    effects, runs once right before polling starts. Reveals the QUIZ! art
+    line by line, then decrypts each boot-check line from random
+    characters (adds well under a second total, doesn't meaningfully
+    delay startup). Note: the flicker relies on carriage-return overwrite,
+    which only collapses cleanly in a live/interactive terminal — on a
+    non-interactive log stream (e.g. Railway's log viewer) each frame may
+    render as its own line instead of overwriting in place."""
+    import time, sys
+    PURPLE, ORANGE, GREEN, DIM, BOLD, RESET = (
+        "\033[38;5;135m", "\033[38;5;208m", "\033[92m", "\033[90m", "\033[1m", "\033[0m"
+    )
+
+    cat_lines = [
+        "                         /\\_/\\",
+        "                        ( ⌒.⌒ )",
+    ]
+    quiz_lines = [
+        " ██████╗  ██╗   ██╗ ██╗ ███████╗ ██╗",
+        "██╔═══██╗ ██║   ██║ ██║ ╚══███╔╝ ██║",
+        "██║   ██║ ██║   ██║ ██║   ███╔╝  ██║",
+        "██║▄▄ ██║ ██║   ██║ ██║  ███╔╝   ╚═╝",
+        "╚██████╔╝ ╚██████╔╝ ██║ ███████╗ ██╗",
+        " ╚══▀▀═╝   ╚═════╝  ╚═╝ ╚══════╝ ╚═╝",
+    ]
+    boot_lines = [
+        "[ OK ] question bank engine loaded",
+        "[ OK ] quiz channel index mounted",
+        "[ OK ] XP + achievements module warmed up",
+        "[ OK ] analytics backup channel linked",
+        "[ OK ] handshake with Telegram Bot API...",
+    ]
+
+    def _decode_line(text: str, color: str) -> None:
+        """Call-of-Duty-style decrypt flicker: random characters settle
+        into the real text a few characters at a time, left to right."""
+        charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*"
+        n = len(text)
+        revealed = 0
+        while revealed < n:
+            frame = [
+                text[i] if (i < revealed or text[i] == " ") else random.choice(charset)
+                for i in range(n)
+            ]
+            sys.stdout.write("\r" + color + "".join(frame) + RESET)
+            sys.stdout.flush()
+            time.sleep(0.08)
+            revealed += 3
+        sys.stdout.write("\r" + color + text + RESET + "\n")
+        sys.stdout.flush()
+
+    print()
+    print(f"{DIM}{'─' * 42}{RESET}")
+    for line in cat_lines:
+        print(f"{ORANGE}{line}{RESET}")
+        time.sleep(0.12)
+    for line in quiz_lines:
+        print(f"{PURPLE}{line}{RESET}")
+        time.sleep(0.08)
+    print()
+
+    print(f"{DIM}{'─' * 42}{RESET}")
+    for line in boot_lines:
+        _decode_line(line, GREEN)
+    print(f"{DIM}{'─' * 42}{RESET}")
+    print(f"{BOLD}{GREEN}>> Quizzician v5.5 online — listening for updates{RESET}")
+    print(f"{DIM}{'─' * 42}{RESET}\n")
+
+_print_startup_banner()
+app.run_polling(allowed_updates=Update.ALL_TYPES)
