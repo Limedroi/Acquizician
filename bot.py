@@ -168,6 +168,12 @@ from zoneinfo import ZoneInfo
 #          sends it to ERROR_LOG_GROUP_ID once a day, as a flat-file
 #          backup on top of the per-system pinned-message backups.
 #
+# UNIVERSITY-SPLIT BACKUPS: analytics / settings / lecture results / mistakes
+#          bank each mirror to their own (shared MFM+MNU) channel as a .zip
+#          of <name>_mfm.json + <name>_mnu.json — grep "UNIVERSITY-SPLIT
+#          CHANNEL BACKUPS". Per-year quiz backups stay in each year's own
+#          channel_id (YEARS), so MNU years just need their channel_id set.
+#
 # NOTE ON save_*() FUNCTIONS: all 11 are async, writing via
 # asyncio.to_thread(_atomic_write_json, ...) — atomic (temp file + fsync +
 # os.replace, so a crash can't leave a half-written JSON file) AND
@@ -268,6 +274,7 @@ STORAGE_GROUP_ID = -1004447646576
 YEARS = {
     "y1": {
         "label": "Year 1",
+        "university": "mfm",
         "channel_id": -1004491934509,
         "modules": {
             "Foundation (1)": ["Anatomy", "Embryology", "Biochemistry", "Histology", "Physiology"],
@@ -278,6 +285,7 @@ YEARS = {
     },
     "y2": {
         "label": "Year 2",
+        "university": "mfm",
         "channel_id": -1004370807195,
         "modules": {
             "Respiratory":  ["Biochemistry", "Anatomy", "Physiology", "Histology", "Pharmacology", "Microbiology", "Pathology"],
@@ -289,6 +297,7 @@ YEARS = {
     },
     "y3": {
         "label": "Year 3",
+        "university": "mfm",
         # This is the existing channel, repurposed — starting fresh.
         "channel_id": -1004402622263,
         "modules": {
@@ -296,9 +305,61 @@ YEARS = {
             "Genitourinary":  ["Anatomy", "Physiology", "Histology", "Pathology", "Microbiology"],
         },
     },
+
+    # ── MNU (Menofia National University) ────────────────────────────
+    # Same three years, same kind of modules, but MNU runs them in a
+    # different order — so each MNU year is its own entry here, with its
+    # own channel, quiz index, poll status and backup (files are named
+    # quiz_index_n1.json etc.), completely separate from MFM's y1/y2/y3.
+    # Nothing MFM-side is touched.
+    #
+    # TODO before launch, per MNU year:
+    #   1. Create the channel, add this bot as ADMIN, get its ID from
+    #      @userinfobot, and paste it into "channel_id" (None = year is
+    #      hidden everywhere until it's filled in — see configured_years).
+    #   2. Re-order / rename the modules and subjects below to MNU's real
+    #      curriculum. The dict order IS the button order. The lists below
+    #      are just a copy of MFM's as a starting point.
+    "n1": {
+        "label": "MNU Year 1",
+        "university": "mnu",
+        "channel_id": None,
+        "modules": {
+            "Foundation (1)": ["Anatomy", "Embryology", "Biochemistry", "Histology", "Physiology"],
+            "Foundation (2)": ["Pathology", "Pharmacology", "Microbiology", "Parasitology", "Communication skills"],
+            "MSK":            ["Anatomy", "Biochemistry", "Histology", "Physiology", "Pathology"],
+            "CVS":            ["Physiology", "Anatomy", "Pharmacology", "Pathology", "Histology", "MP"],
+        },
+    },
+    "n2": {
+        "label": "MNU Year 2",
+        "university": "mnu",
+        "channel_id": None,
+        "modules": {
+            "Respiratory":  ["Biochemistry", "Anatomy", "Physiology", "Histology", "Pharmacology", "Microbiology", "Pathology"],
+            "Blood":        ["Microbiology", "Physiology", "Biochemistry", "Pharmacology", "Parasitology", "Histology", "Pathology", "Psychiatry"],
+            "GIT":          ["Anatomy", "Pharmacology", "Parasitology", "Histology", "Pathology", "Physiology", "Microbiology"],
+            "CNS 1":        ["Physiology", "Anatomy"],
+            "CNS 2":        ["Pharmacology", "Physiology", "Parasitology", "Histology", "Pathology"],
+        },
+    },
+    "n3": {
+        "label": "MNU Year 3",
+        "university": "mnu",
+        "channel_id": None,
+        "modules": {
+            "Endocrine":      ["Biochemistry", "Physiology", "Pathology", "Histology", "Pharmacology"],
+            "Genitourinary":  ["Anatomy", "Physiology", "Histology", "Pathology", "Microbiology"],
+        },
+    },
 }
-# Display order for the /quiz year picker.
-YEAR_ORDER = ["y1", "y2", "y3"]
+# Display order for the /quiz year picker (and every admin listing).
+YEAR_ORDER = ["y1", "y2", "y3", "n1", "n2", "n3"]
+
+# Universities a person can pick in onboarding ("Where are you from?").
+# Each YEARS entry above carries a "university" key pointing at one of these.
+UNIVERSITIES = {"mfm": "MFM", "mnu": "MNU"}
+UNIVERSITY_ORDER = ["mfm", "mnu"]
 
 # Cosmetic-only: emoji shown next to a subject's name on module/subject
 # selection buttons. Looked up by the plain subject string above — never
@@ -361,6 +422,14 @@ def year_credit_line(year: str) -> str:
 
 def year_modules(year: str) -> dict:
     return YEARS.get(year, {}).get("modules", {})
+
+def year_university(year: str) -> str:
+    """'mfm' / 'mnu' for a YEARS key (defaults to 'mfm')."""
+    return YEARS.get(year, {}).get("university", "mfm")
+
+def university_years(university: str) -> list:
+    """YEARS keys belonging to one university, in YEAR_ORDER."""
+    return [y for y in YEAR_ORDER if year_university(y) == university]
 
 def year_for_chat(chat_id: int):
     """Which year (if any) a given chat/channel ID belongs to."""
@@ -1626,6 +1695,94 @@ async def _notify_admin_sync_failure(app, what: str, error):
     except Exception as notify_err:
         print(f"ADMIN SYNC-FAILURE NOTIFY ERROR ({what}):", notify_err)
 
+# ═══════════════════════════════════════════════════════════════
+# UNIVERSITY-SPLIT CHANNEL BACKUPS (analytics / settings / lecture results /
+# mistakes bank)
+#
+# MFM and MNU share each of these four backup channels — the pinned
+# document is now a .zip holding TWO json files, <name>_mfm.json and
+# <name>_mnu.json, instead of one flat .json. Only the CHANNEL MIRROR is
+# split: the live in-memory dicts and the local files on disk
+# (analytics.json, settings.json, ...) stay single and unchanged, so
+# nothing else in the bot needed to know about universities. The split
+# happens at upload time and is merged back together at restore time.
+#
+# Who belongs to which file:
+#   analytics / settings  -> the user's university (get_university);
+#                            anyone who hasn't picked one yet -> MFM
+#                            (every pre-MNU user is MFM).
+#   lecture results       -> the university of the year in the
+#                            "<year>:<lecture_key>" key prefix.
+#   mistakes bank         -> the university of each entry's "year".
+#
+# Restore accepts BOTH the new zip and the old flat .json (whatever is
+# currently pinned), so the first boot after deploying this restores the
+# old backup fine and the next backup writes the new zip.
+#
+# The per-year QUIZ backups are NOT part of this — each year (y1/y2/y3 and
+# n1/n2/n3) already backs up into its own channel_id from YEARS.
+# ═══════════════════════════════════════════════════════════════
+def _uni_of_user(user_id) -> str:
+    try:
+        uid = int(user_id)
+    except (TypeError, ValueError):
+        return UNIVERSITY_ORDER[0]
+    return get_university(uid) or UNIVERSITY_ORDER[0]
+
+def _uni_of_year(year) -> str:
+    return year_university(year) if isinstance(year, str) else UNIVERSITY_ORDER[0]
+
+def _build_university_zip(base: str, parts: dict) -> bytes:
+    """parts = {"mfm": obj, "mnu": obj} -> zip bytes containing
+    <base>_mfm.json and <base>_mnu.json (both always present, even if
+    one is empty, so a restore can tell "no MNU data" from "broken zip")."""
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for uni in UNIVERSITY_ORDER:
+            zf.writestr(f"{base}_{uni}.json", json.dumps(parts[uni], indent=2))
+    return buf.getvalue()
+
+def _read_university_backup(raw: bytes, base: str) -> list:
+    """Parsed payload(s) of a pinned backup: one per university for the
+    zip format, or a single-item list for the legacy flat .json. The
+    caller validates + merges them. Anything unreadable raises
+    _RestoreInvalidArchitecture so nothing is partially applied."""
+    try:
+        if zipfile.is_zipfile(BytesIO(raw)):
+            out = []
+            with zipfile.ZipFile(BytesIO(raw)) as zf:
+                names = set(zf.namelist())
+                for uni in UNIVERSITY_ORDER:
+                    member = f"{base}_{uni}.json"
+                    if member not in names:
+                        raise _RestoreInvalidArchitecture(f"zip is missing {member}")
+                    out.append(json.loads(zf.read(member).decode("utf-8")))
+            return out
+        return [json.loads(raw.decode("utf-8"))]   # legacy single-file backup
+    except _RestoreInvalidArchitecture:
+        raise
+    except (zipfile.BadZipFile, UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise _RestoreInvalidArchitecture(f"backup file couldn't be read: {e}")
+
+def _split_user_dict_by_university(d: dict) -> dict:
+    parts = {u: {} for u in UNIVERSITY_ORDER}
+    for uid, entry in list(d.items()):
+        parts[_uni_of_user(uid)][uid] = entry
+    return parts
+
+def _split_lecture_results_by_university() -> dict:
+    parts = {u: {} for u in UNIVERSITY_ORDER}
+    for lr_key, val in list(LECTURE_RESULTS.items()):
+        year = lr_key.split(":", 1)[0] if isinstance(lr_key, str) else None
+        parts[_uni_of_year(year)][lr_key] = val
+    return parts
+
+def _split_mistakes_by_university() -> dict:
+    parts = {u: [] for u in UNIVERSITY_ORDER}
+    for m in list(MISTAKES_BANK):
+        parts[_uni_of_year(m.get("year") if isinstance(m, dict) else None)].append(m)
+    return parts
+
 async def backup_analytics_to_channel(context):
     global _analytics_backup_msg_id, _last_analytics_backup_at
     if not ANALYTICS_GROUP_ID:
@@ -1637,11 +1794,11 @@ async def backup_analytics_to_channel(context):
     if now - _last_analytics_backup_at < ANALYTICS_BACKUP_MIN_INTERVAL:
         return   # backed up recently enough — local save_analytics() already has the latest data
     _last_analytics_backup_at = now
-    data = json.dumps(ANALYTICS, indent=2).encode("utf-8")
+    data = _build_university_zip("analytics", _split_user_dict_by_university(ANALYTICS))
     try:
         sent = await context.bot.send_document(
             chat_id=ANALYTICS_GROUP_ID,
-            document=InputFile(BytesIO(data), filename=_backup_filename("analytics.json")),
+            document=InputFile(BytesIO(data), filename=_backup_filename("analytics.zip")),
             caption=ANALYTICS_BACKUP_MARKER,
         )
     except Exception as e:
@@ -1674,10 +1831,12 @@ async def restore_analytics_from_channel(app) -> str:
             raise _RestoreNoBackup()
         tg_file = await app.bot.get_file(pinned.document.file_id)
         raw     = await tg_file.download_as_bytearray()
-        restored = json.loads(bytes(raw).decode("utf-8"))
-        if not isinstance(restored, dict) or not all(isinstance(v, dict) for v in restored.values()):
-            raise _RestoreInvalidArchitecture('expected a JSON object mapping user_id -> stats dict')
-        ANALYTICS.update(_clean_analytics_dict(restored))
+        parts = _read_university_backup(bytes(raw), "analytics")
+        for part in parts:
+            if not isinstance(part, dict) or not all(isinstance(v, dict) for v in part.values()):
+                raise _RestoreInvalidArchitecture('expected a JSON object mapping user_id -> stats dict')
+        for part in parts:
+            ANALYTICS.update(_clean_analytics_dict(part))
         await save_analytics()
         _analytics_backup_msg_id = pinned.message_id
         print(f"Restored analytics: {len(ANALYTICS)} user(s).")
@@ -1723,6 +1882,11 @@ YEAR_CLASS_NUMBER = {
     "y1": 46,
     "y2": 45,
     "y3": 44,
+    # MNU has no class number yet (None = shown as just "MNU Year N").
+    # Put a number here later if they get cohort numbers like MFM.
+    "n1": None,
+    "n2": None,
+    "n3": None,
 }
 
 def _blank_settings_entry() -> dict:
@@ -1739,7 +1903,9 @@ def _blank_settings_entry() -> dict:
         "spaced_repetition": True,   # see get_spaced_repetition_enabled below
         "question_timer": 0,   # seconds a live quiz poll stays open before
                                 # auto-closing; 0 = off. Cycles 0 -> 60 -> 30 -> 0.
-        "year_class": None,    # "y1"/"y2"/"y3" — see YEAR_CLASS_NUMBER above
+        "year_class": None,    # "y1"/"y2"/"y3" (MFM) or "n1"/"n2"/"n3" (MNU) — see YEAR_CLASS_NUMBER above
+        "university": None,    # "mfm"/"mnu" — picked in onboarding; see get_university (falls back to the
+                                # year_class's university, so existing MFM users need no migration)
         "daily_quiz_last_date": None,   # "YYYY-MM-DD" (UTC) of the last completed Daily Quiz
         "daily_notifs": True,   # the 2pm 💥Daily Quiz💥 push — see get_daily_notifs_enabled
         "zikr_reminders": True,   # Zikr poll every N questions — see get_zikr_enabled / _maybe_send_zikr_poll.
@@ -1978,16 +2144,45 @@ def year_class_label(year_class: str | None) -> str:
     placeholder if the person hasn't set one yet."""
     if year_class not in YEAR_CLASS_NUMBER:
         return "لسه محدد"
-    return f"{year_label(year_class)} / Class {YEAR_CLASS_NUMBER[year_class]}"
+    number = YEAR_CLASS_NUMBER[year_class]
+    if number is None:   # MNU: no class numbers
+        return year_label(year_class)
+    return f"{year_label(year_class)} / Class {number}"
 
-def year_class_keyboard(callback_prefix: str) -> InlineKeyboardMarkup:
+def year_short_label(year_class: str) -> str:
+    """'1 (Class 46)' for MFM, '1 (MNU)' for MNU — used in /mystats."""
+    num = year_class[1:] if year_class[1:].isdigit() else year_class
+    number = YEAR_CLASS_NUMBER.get(year_class)
+    if number is None:
+        return f"{num} ({UNIVERSITIES.get(year_university(year_class), '')})"
+    return f"{num} (Class {number})"
+
+def get_university(user_id: int) -> str | None:
+    """'mfm' / 'mnu' for this person, or None if they haven't said yet.
+    A set year_class always wins (so every existing MFM user resolves to
+    'mfm' with no data migration); otherwise the stored onboarding pick."""
+    entry = SETTINGS.get(str(user_id), {})
+    yc = entry.get("year_class")
+    if yc in YEARS:
+        return year_university(yc)
+    uni = entry.get("university")
+    return uni if uni in UNIVERSITIES else None
+
+def onboarding_university_keyboard() -> InlineKeyboardMarkup:
+    """The 'Where are you from?' picker — MFM / MNU side by side."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(UNIVERSITIES[u], callback_data=f"onboard_uni:{u}")
+        for u in UNIVERSITY_ORDER
+    ]])
+
+def year_class_keyboard(callback_prefix: str, university: str | None = None) -> InlineKeyboardMarkup:
     """The Year 1/2/3 (Class 46/45/44) picker, reused for both onboarding
     and the Settings edit flow. callback_prefix distinguishes the two so
     the button_handler branch knows whether to continue into the welcome
     menu afterwards or just confirm and return to Settings."""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(year_class_label(yc), callback_data=f"{callback_prefix}:{yc}")]
-        for yc in YEAR_ORDER
+        for yc in (university_years(university) if university in UNIVERSITIES else YEAR_ORDER)
     ])
 
 async def backup_settings_to_channel(context):
@@ -2001,11 +2196,11 @@ async def backup_settings_to_channel(context):
     if now - _last_settings_backup_at < SETTINGS_BACKUP_MIN_INTERVAL:
         return   # backed up recently enough — local save_settings() already has the latest data
     _last_settings_backup_at = now
-    data = json.dumps(SETTINGS, indent=2).encode("utf-8")
+    data = _build_university_zip("settings", _split_user_dict_by_university(SETTINGS))
     try:
         sent = await context.bot.send_document(
             chat_id=SETTINGS_GROUP_ID,
-            document=InputFile(BytesIO(data), filename=_backup_filename("settings.json")),
+            document=InputFile(BytesIO(data), filename=_backup_filename("settings.zip")),
             caption=SETTINGS_BACKUP_MARKER,
         )
     except Exception as e:
@@ -2036,10 +2231,12 @@ async def restore_settings_from_channel(app) -> str:
             raise _RestoreNoBackup()
         tg_file = await app.bot.get_file(pinned.document.file_id)
         raw     = await tg_file.download_as_bytearray()
-        restored = json.loads(bytes(raw).decode("utf-8"))
-        if not isinstance(restored, dict) or not all(isinstance(v, dict) for v in restored.values()):
-            raise _RestoreInvalidArchitecture('expected a JSON object mapping user_id -> settings dict')
-        SETTINGS.update(restored)
+        parts = _read_university_backup(bytes(raw), "settings")
+        for part in parts:
+            if not isinstance(part, dict) or not all(isinstance(v, dict) for v in part.values()):
+                raise _RestoreInvalidArchitecture('expected a JSON object mapping user_id -> settings dict')
+        for part in parts:
+            SETTINGS.update(part)
         await save_settings()
         _settings_backup_msg_id = pinned.message_id
         print(f"Restored settings: {len(SETTINGS)} user(s).")
@@ -2150,11 +2347,11 @@ async def backup_lecture_results_to_channel(context):
     if now - _last_lecture_results_backup_at < LECTURE_RESULTS_BACKUP_MIN_INTERVAL:
         return   # backed up recently enough — local save_lecture_results() already has the latest data
     _last_lecture_results_backup_at = now
-    data = json.dumps(LECTURE_RESULTS, indent=2).encode("utf-8")
+    data = _build_university_zip("lecture_results", _split_lecture_results_by_university())
     try:
         sent = await context.bot.send_document(
             chat_id=LECTURE_RESULTS_GROUP_ID,
-            document=InputFile(BytesIO(data), filename=_backup_filename("lecture_results.json")),
+            document=InputFile(BytesIO(data), filename=_backup_filename("lecture_results.zip")),
             caption=LECTURE_RESULTS_BACKUP_MARKER,
         )
     except Exception as e:
@@ -2187,7 +2384,12 @@ async def restore_lecture_results_from_channel(app):
             return
         tg_file = await app.bot.get_file(pinned.document.file_id)
         raw     = await tg_file.download_as_bytearray()
-        LECTURE_RESULTS.update(json.loads(bytes(raw).decode("utf-8")))
+        parts = _read_university_backup(bytes(raw), "lecture_results")
+        for part in parts:
+            if not isinstance(part, dict):
+                raise _RestoreInvalidArchitecture('expected a JSON object mapping lecture_key -> results')
+        for part in parts:
+            LECTURE_RESULTS.update(part)
         await save_lecture_results()
         _lecture_results_backup_msg_id = pinned.message_id
         print(f"Restored lecture results: {len(LECTURE_RESULTS)} lecture(s).")
@@ -2390,11 +2592,11 @@ async def backup_mistakes_bank_to_channel(context):
     if now - _last_mistakes_bank_backup_at < MISTAKES_BANK_BACKUP_MIN_INTERVAL:
         return   # backed up recently enough — local save_mistakes_bank() already has the latest data
     _last_mistakes_bank_backup_at = now
-    data = json.dumps(MISTAKES_BANK, indent=2).encode("utf-8")
+    data = _build_university_zip("mistakes_bank", _split_mistakes_by_university())
     try:
         sent = await context.bot.send_document(
             chat_id=MISTAKES_BANK_GROUP_ID,
-            document=InputFile(BytesIO(data), filename=_backup_filename("mistakes_bank.json")),
+            document=InputFile(BytesIO(data), filename=_backup_filename("mistakes_bank.zip")),
             caption=MISTAKES_BANK_BACKUP_MARKER,
         )
     except Exception as e:
@@ -2425,9 +2627,10 @@ async def restore_mistakes_bank_from_channel(app) -> str:
             raise _RestoreNoBackup()
         tg_file = await app.bot.get_file(pinned.document.file_id)
         raw     = await tg_file.download_as_bytearray()
-        restored = json.loads(bytes(raw).decode("utf-8"))
-        if not isinstance(restored, list):
+        parts = _read_university_backup(bytes(raw), "mistakes_bank")
+        if not all(isinstance(part, list) for part in parts):
             raise _RestoreInvalidArchitecture('expected a JSON array of mistake entries')
+        restored = [m for part in parts for m in part]
         clean = [m for m in restored if _is_valid_mistake_entry(m)]
         if restored and not clean:
             raise _RestoreInvalidArchitecture('none of the entries matched the expected mistake-entry shape')
@@ -2581,6 +2784,10 @@ DAILY_QUIZ_ACTIVE_MODULE = {
     "y1": "Foundation (1)",
     "y2": "Respiratory",
     "y3": "Endocrine",
+    # MNU (n1/n2/n3): no default on purpose — with no entry here the Daily
+    # Quiz draws from ALL of that year's ready lectures. Add e.g.
+    # "n1": "<first MNU module>" once you know what they're studying, or
+    # use /daily_module to set it live.
 }
 
 # Rebuilding this pool means: for every (module, subject) pair, scanning
@@ -3273,7 +3480,7 @@ async def _prompt_daily_quiz_year_class(context: ContextTypes.DEFAULT_TYPE, user
     own "dqyc:" callback prefix routes back into show_daily_quiz_menu
     once they pick one instead of Settings or the onboarding welcome."""
     text = "📚 محتاج تحدد سنتك/فرقتك الأول، عشان نجيبلك الـ Daily Quiz بتاع سنتك:"
-    keyboard = year_class_keyboard("dqyc")
+    keyboard = year_class_keyboard("dqyc", get_university(user_id))
     if message:
         await message.edit_text(text, reply_markup=keyboard)
     else:
@@ -8280,9 +8487,9 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _flow_onboarding_message(
                 update, context, real_uid,
                 f"{quizzy_block(QUIZZY_HAPPY_ART, f'What a lovely name Dr.{nickname} 🥰')}\n\n"
-                "What Year/Class are you currently in?\n\n",
+                "Where are you from?\n\n",
                 parse_mode=ParseMode.HTML,
-                reply_markup=year_class_keyboard("onboard_yc"),
+                reply_markup=onboarding_university_keyboard(),
             )
         else:
             await update.message.reply_text(
@@ -8511,6 +8718,10 @@ ONBOARDING_YEAR_QUIPS = {
     "y1": "Year 1? You are a new-comer! Oh You will love it here.",
     "y2": "Year 2? Oh you are in for a trip! But don't worry it will be fun. 😉",
     "y3": "Year 3? Wouldn't that be... Oh! You are becoming a Semi-Senior soon!!",
+    # MNU years get the same quips as MFM's.
+    "n1": "Year 1? You are a new-comer! Oh You will love it here.",
+    "n2": "Year 2? Oh you are in for a trip! But don't worry it will be fun. 😉",
+    "n3": "Year 3? Wouldn't that be... Oh! You are becoming a Semi-Senior soon!!",
 }
 
 def _tap_toast(callback_data: str | None, user_id: int) -> str | None:
@@ -9774,8 +9985,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_admin(update):
             await query.answer(MSG_ADMIN_ONLY, show_alert=True)
             return
+        await query.edit_message_text(
+            f"{quizzy_block(QUIZZY_HAPPY_ART, 'What a lovely name Dr.<nickname> 🥰')}\n\n"
+            "Where are you from?\n\n"
+            "<i>🔍 Preview — the buttons above are just a mock-up here, they don't set anything.</i>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(UNIVERSITIES[u], callback_data="preview_noop") for u in UNIVERSITY_ORDER],
+                [InlineKeyboardButton("▶️ Next (Year/Class step)", callback_data="preview_step2b")],
+            ]),
+        )
+        return
+
+    if query.data == "preview_step2b":
+        if not is_admin(update):
+            await query.answer(MSG_ADMIN_ONLY, show_alert=True)
+            return
         preview_kb = InlineKeyboardMarkup(
-            [[InlineKeyboardButton(year_class_label(yc), callback_data="preview_noop")] for yc in YEAR_ORDER]
+            [[InlineKeyboardButton(year_class_label(yc), callback_data="preview_noop")] for yc in university_years("mfm")]
             + [[InlineKeyboardButton("▶️ Next (bully joke)", callback_data="preview_yc_done")]]
         )
         await query.edit_message_text(
@@ -11424,7 +11651,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # daily_quiz_last_date is per user, so nothing else needs migrating.
     if query.data == "settings_year":
         current = get_year_class(user_id)
-        rows = list(year_class_keyboard("setyc").inline_keyboard)
+        rows = list(year_class_keyboard("setyc", get_university(user_id)).inline_keyboard)
         rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="menu_settings")])
         await query.edit_message_text(
             f"📚 <b>غيّر سنتك/فرقتك</b>\n\n"
@@ -11456,6 +11683,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("🔙 رجوع", callback_data="menu_settings"),
             ]]),
+        )
+        return
+
+    # ── onboard_uni: — "Where are you from?" tap (MFM / MNU), right after
+    # the nickname. Stores the university, then edits the same message into
+    # the Year/Class question with ONLY that university's years.
+    if query.data.startswith("onboard_uni:"):
+        university = query.data.split(":", 1)[1]
+        if university not in UNIVERSITIES:
+            await query.edit_message_text("⚠️ الاختيار ده مش متاح.")
+            return
+        entry = _get_settings_entry(user_id)
+        entry["university"] = university
+        await save_settings()
+        await backup_settings_to_channel(context)
+        await query.edit_message_text(
+            quizzy_block(QUIZZY_HAPPY_ART, "What Year/Class are you currently in?"),
+            parse_mode=ParseMode.HTML,
+            reply_markup=year_class_keyboard("onboard_yc", university),
         )
         return
 
@@ -12230,14 +12476,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if get_year_class(real_uid) not in YEAR_CLASS_NUMBER:
-        # Nickname's set but they never finished picking a year/class
-        # (or got interrupted mid-onboarding) — send them back to this
-        # step instead of the main menu. Also mandatory, also permanent.
+        # Nickname's set but they never finished picking a university /
+        # year/class (or got interrupted mid-onboarding) — send them back
+        # to whichever step they're missing instead of the main menu.
+        # Also mandatory, also permanent.
+        resume_uni = get_university(real_uid)
+        if resume_uni is None:
+            resume_question = "Where are you from?"
+            resume_markup   = onboarding_university_keyboard()
+        else:
+            resume_question = "What Year/Class are you currently in?"
+            resume_markup   = year_class_keyboard("onboard_yc", resume_uni)
         await update.message.reply_text(
             f"{quizzy_block(QUIZZY_HAPPY_ART, 'What a lovely name Dr.' + nickname + ' 🥰')}\n\n"
-            "What Year/Class are you currently in?\n\n",
+            f"{resume_question}\n\n",
             parse_mode=ParseMode.HTML,
-            reply_markup=year_class_keyboard("onboard_yc"),
+            reply_markup=resume_markup,
         )
         return
 
@@ -12299,7 +12553,7 @@ async def preview_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ),
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("▶️ Next (Year/Class step)", callback_data="preview_step2"),
+            InlineKeyboardButton("▶️ Next (Where are you from? step)", callback_data="preview_step2"),
         ]]),
     )
 
@@ -12787,9 +13041,13 @@ _RESTORE_TARGETS = {
     "analytics":       ("Analytics",        lambda app: restore_analytics_from_channel(app)),
     "settings":        ("Settings",         lambda app: restore_settings_from_channel(app)),
     "storage":         ("Storage",          lambda app: restore_storage_from_channel(app)),
-    "quiz_y1":         ("Quiz Index — Y1",  lambda app: restore_quiz_from_channel(app, "y1")),
-    "quiz_y2":         ("Quiz Index — Y2",  lambda app: restore_quiz_from_channel(app, "y2")),
-    "quiz_y3":         ("Quiz Index — Y3",  lambda app: restore_quiz_from_channel(app, "y3")),
+    **{
+        f"quiz_{_y}": (
+            f"Quiz Index — {_y.upper() if year_university(_y) == 'mfm' else year_label(_y)}",
+            (lambda app, _y=_y: restore_quiz_from_channel(app, _y)),
+        )
+        for _y in YEAR_ORDER
+    },
     "mistakes_bank":   ("Mistakes Bank",    lambda app: restore_mistakes_bank_from_channel(app)),
     "report_threads":  ("Report Threads",   lambda app: restore_report_threads_from_channel(app)),
 }
@@ -12850,9 +13108,10 @@ _RESET_ACTIONS = {
     "analytics":       lambda context: _reset_analytics_system(context),
     "settings":        lambda context: _reset_settings_system(context),
     "storage":         lambda context: _reset_storage_system(context),
-    "quiz_y1":         lambda context: _reset_quiz_system(context, "y1"),
-    "quiz_y2":         lambda context: _reset_quiz_system(context, "y2"),
-    "quiz_y3":         lambda context: _reset_quiz_system(context, "y3"),
+    **{
+        f"quiz_{_y}": (lambda context, _y=_y: _reset_quiz_system(context, _y))
+        for _y in YEAR_ORDER
+    },
     "mistakes_bank":   lambda context: _reset_mistakes_bank_system(context),
     "report_threads":  lambda context: _reset_report_threads_system(context),
 }
@@ -12888,9 +13147,11 @@ BROADCAST_ACTIVE_WINDOW_DAYS = 7   # "Active users" = engaged with the bot at le
 BROADCAST_PROGRESS_EDIT_INTERVAL = 2.0   # seconds between progress-bar edits — Telegram's edit-rate limits are per-chat, so this only needs to be sane, not aggressive
 BROADCAST_SEND_DELAY             = 0.05  # seconds between sends — a light throttle against Telegram's global flood limits on a big broadcast
 
-BROADCAST_AUDIENCE_ORDER  = ["all", "y1", "y2", "y3", "active", "inactive"]
+BROADCAST_AUDIENCE_ORDER  = ["all", "mfm", "mnu", "y1", "y2", "y3", "n1", "n2", "n3", "active", "inactive"]
 BROADCAST_AUDIENCE_LABELS = {
-    "all": "All users", "y1": "Year 1", "y2": "Year 2", "y3": "Year 3",
+    "all": "All users", "mfm": "MFM (all)", "mnu": "MNU (all)",
+    "y1": "MFM Year 1", "y2": "MFM Year 2", "y3": "MFM Year 3",
+    "n1": "MNU Year 1", "n2": "MNU Year 2", "n3": "MNU Year 3",
     "active": "Active users", "inactive": "Inactive users",
 }
 
@@ -12905,7 +13166,9 @@ def _broadcast_audience_user_ids(audience: str) -> list:
     counts as inactive."""
     if audience == "all":
         return list(USERS)
-    if audience in ("y1", "y2", "y3"):
+    if audience in UNIVERSITIES:
+        return [uid for uid in USERS if get_university(uid) == audience]
+    if audience in YEAR_ORDER:
         return [uid for uid in USERS if get_year_class(uid) == audience]
     if audience in ("active", "inactive"):
         from datetime import timezone
@@ -13480,7 +13743,7 @@ async def _send_mystats(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_
     nickname = get_nickname(user_id) or "—"
     year_class = get_year_class(user_id)
     year_line = (
-        f"{year_class[1:]} (Class {YEAR_CLASS_NUMBER[year_class]})"
+        year_short_label(year_class)
         if year_class in YEAR_CLASS_NUMBER else "—"
     )
 
@@ -13730,9 +13993,11 @@ async def import_analytics_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         tg_file  = await context.bot.get_file(doc.file_id)
         raw      = await tg_file.download_as_bytearray()
-        imported = json.loads(bytes(raw).decode("utf-8"))
-        if not isinstance(imported, dict):
-            raise ValueError("File doesn't look like an analytics export (expected a JSON object).")
+        imported = {}
+        for part in _read_university_backup(bytes(raw), "analytics"):   # new .zip or old flat .json
+            if not isinstance(part, dict):
+                raise ValueError("File doesn't look like an analytics export (expected a JSON object).")
+            imported.update(part)
     except Exception as e:
         await update.message.reply_text(f"❌ Import failed: {e}")
         return
@@ -14300,7 +14565,7 @@ async def _onboarding_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if update.callback_query:
         data = update.callback_query.data or ""
-        if data.startswith(("onboard_yc:", "onboard_bully:")) or data in ("onboard_how", "onboard_where", "onboard_go"):
+        if data.startswith(("onboard_uni:", "onboard_yc:", "onboard_bully:")) or data in ("onboard_how", "onboard_where", "onboard_go"):
             return
 
     if get_nickname(real_uid) is not None and get_year_class(real_uid) in YEAR_CLASS_NUMBER:
