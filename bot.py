@@ -5693,6 +5693,38 @@ async def _send_case_study(context, chat_id: int, content: str, entities=None) -
             print(f"Couldn't send case study with saved formatting (falling back to plain): {e}")
     await context.bot.send_message(chat_id=chat_id, text=html.escape(content), parse_mode=ParseMode.HTML)
 
+def _u16(s_: str) -> int:
+    return len(s_.encode("utf-16-le")) // 2
+
+def _spoiler_markers_to_entities(text: str, ent_dicts: list):
+    """Fallback for text that was pasted with ||answer|| markers instead of
+    real Telegram spoiler formatting (pasting from another app / an AI chat
+    does this — Telegram doesn't convert the bars). Returns (new_text,
+    new_entity_dicts) with the bars removed and real "spoiler" entities in
+    their place, other entities shifted to match; None if no ||..|| pair."""
+    pairs = [(m.start(), m.end()) for m in re.finditer(r"\|\|(.+?)\|\|", text, flags=re.DOTALL)]
+    if not pairs:
+        return None
+    new_text, cuts, spoilers, pos = [], [], [], 0   # cuts: (utf16 pos in OLD text, units removed)
+    for a, b in pairs:
+        new_text.append(text[pos:a])
+        inner = text[a + 2:b - 2]
+        start_new = _u16("".join(new_text))
+        new_text.append(inner)
+        spoilers.append({"type": "spoiler", "offset": start_new, "length": _u16(inner)})
+        cuts.append((_u16(text[:a]), 2))
+        cuts.append((_u16(text[:b - 2]), 2))
+        pos = b
+    new_text.append(text[pos:])
+    def shift(o):
+        return o - sum(n for at, n in cuts if at < o)
+    out = []
+    for d in ent_dicts:
+        o, e = shift(d["offset"]), shift(d["offset"] + d["length"])
+        if e > o:
+            out.append({**d, "offset": o, "length": e - o})
+    return "".join(new_text), out + spoilers
+
 def extract_spoiler_message_raw(message, caption: bool = False) -> dict | None:
     """/add_lecture's "spoiler = written" rule. If the message (or photo
     caption) contains ANY spoiler entity — one or many, anywhere in the
@@ -5710,18 +5742,21 @@ def extract_spoiler_message_raw(message, caption: bool = False) -> dict | None:
     entities = (message.caption_entities if caption else message.entities) or ()
     if not text.strip():
         return None
-    spoilers = [e for e in entities if getattr(e, "type", None) == "spoiler"]
-    if not spoilers:
-        return None
     try:
         raw_entities = [e.to_dict() for e in entities]
     except Exception:
         return None
+    if not any(d.get("type") == "spoiler" for d in raw_entities):
+        fb = _spoiler_markers_to_entities(text, raw_entities)   # ||answer|| pasted as plain text
+        if not fb:
+            return None
+        text, raw_entities = fb
+    spoilers = sorted((d for d in raw_entities if d.get("type") == "spoiler"), key=lambda d: d["offset"])
     spans = []
-    for e in sorted(spoilers, key=lambda x: x.offset):
+    for e in spoilers:
         try:
-            a = _utf16_offset_to_py_index(text, e.offset)
-            b = _utf16_offset_to_py_index(text, e.offset + e.length)
+            a = _utf16_offset_to_py_index(text, e["offset"])
+            b = _utf16_offset_to_py_index(text, e["offset"] + e["length"])
         except Exception:
             continue
         spans.append((a, b))
@@ -6591,6 +6626,7 @@ async def _deliver_written_item(context: ContextTypes.DEFAULT_TYPE, user_id: int
             _remember_bookmarkable_question(
                 user_id, sent.message_id, question_key=f"written:{w.get('id', 0)}", metadata=written_meta,
             )
+            await _maybe_send_zikr_poll(context, user_id)   # writtens count towards the Zikr interval too
             return sent
     # title/content are raw lecturer-authored text and almost always contain
     # MarkdownV2 special chars (. - ( ) : etc.) — must be escaped or Telegram
@@ -6641,6 +6677,7 @@ async def _deliver_written_item(context: ContextTypes.DEFAULT_TYPE, user_id: int
         _remember_bookmarkable_question(
             user_id, sent.message_id, question_key=written_key, metadata=written_meta,
         )
+        await _maybe_send_zikr_poll(context, user_id)   # writtens count towards the Zikr interval too
     return sent
 
 async def _deliver_next_lecture_question(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict) -> bool:
@@ -8994,7 +9031,7 @@ async def event_start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     AWAITING_EVENT_DESC.pop(uid, None)
     AWAITING_EVENT_NAME[uid] = True
     await update.message.reply_text(
-        "🎉 <b>Event Start</b>\n\n"
+        "<b>Event Start</b>\n\n"
         f"ابعت اسم الـ Event (لحد {EVENT_NAME_MAX_LEN} حرف) — هيظهر كزرار أخضر في أول القايمة الرئيسية.",
         parse_mode=ParseMode.HTML,
     )
@@ -9048,7 +9085,7 @@ async def _event_begin(context, uid: int, year: str, send) -> None:
     uni_name = UNIVERSITIES.get(year_university(year), "")
     resume_note = f"\n♻️ فيه {len(ev['questions'])} سؤال محفوظين من قبل — هيتضافوا عليهم." if resumed else ""
     await send(
-        f"🎉 <b>{html.escape(name)}</b> — {uni_name} {year_label(year)}{resume_note}\n\n"
+        f"<b>{html.escape(name)}</b> — {uni_name} {year_label(year)}{resume_note}\n\n"
         "دلوقتي فوروارد الأسئلة (Quiz polls) واحد واحد بعد ما تشيل اسم المرسل (Hide Sender's Name).\n"
         "لو عايز صورة أو Case study (نص) لسؤال، ابعتها الأول وبعدين فوروارد السؤال.\n"
         "أي رسالة فيها Spoiler بتتسجل كسؤال مكتوب زي ما هي، والباقي (من غير Spoiler) بيتسجل Case study.\n"
@@ -9076,7 +9113,7 @@ async def _event_refresh_status(context, uid: int, au: dict) -> None:
                 pass
         sent = await context.bot.send_message(
             chat_id=uid,
-            text=f"🎉 <b>{html.escape(ev['name'])}</b>\n✅ {len(ev['questions'])} سؤال اتسجل لحد دلوقتي.",
+            text=f"<b>{html.escape(ev['name'])}</b>\n✅ {len(ev['questions'])} سؤال اتسجل لحد دلوقتي.",
             parse_mode=ParseMode.HTML, reply_markup=_event_status_markup(au),
         )
         au["status_message_id"] = sent.message_id
@@ -9182,7 +9219,7 @@ async def _event_publish(context, uid: int, au: dict):
     EVENT_AUTHORING.pop(uid, None)
     await _flush_sessions_if_changed()
     await backup_sessions_to_channel(context, force=True)
-    await admin_log(context, "🚀 Event published", f"🎉 {html.escape(ev['name'])} — {UNIVERSITIES.get(year_university(au['year']), '')} {year_label(au['year'])} · {len(ev['questions'])} سؤال", uid)
+    await admin_log(context, "🚀 Event published", f"{html.escape(ev['name'])} — {UNIVERSITIES.get(year_university(au['year']), '')} {year_label(au['year'])} · {len(ev['questions'])} سؤال", uid)
     return (
         f"🚀 <b>{html.escape(ev['name'])}</b> اتنشر — {len(ev['questions'])} سؤال.\n"
         f"زرار أخضر ظهر في أول القايمة الرئيسية لكل يوزرز {UNIVERSITIES.get(year_university(au['year']), '')} {year_label(au['year'])}.\n"
@@ -9305,7 +9342,7 @@ async def _event_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
                 EVENT_AUTHORING.pop(aid, None)
         await _flush_sessions_if_changed()
         await backup_sessions_to_channel(context, force=True)
-        await admin_log(context, "🏁 Event ended", f"🎉 {html.escape(ev['name'])} — {year_label(year)}\n{_event_results_summary(ev)}", uid)
+        await admin_log(context, "🏁 Event ended", f"{html.escape(ev['name'])} — {year_label(year)}\n{_event_results_summary(ev)}", uid)
         await send(f"🏁 اتقفل <b>{html.escape(ev['name'])}</b>.\n\n{_event_results_summary(ev)}")
         return
 
@@ -9432,7 +9469,7 @@ async def _event_finish(context, user_id: int, s: dict, ev: dict) -> None:
         await context.bot.send_message(
             chat_id=user_id, parse_mode=ParseMode.HTML,
             text=(
-                f"🎉 <b>خلصت {html.escape(ev['name'])}!</b>\n\n"
+                f"<b>خلصت {html.escape(ev['name'])}!</b>\n\n"
                 f"✅ صح: {correct}\n❌ غلط: {s['answered'] - correct}\n"
                 f"📊 نسبة: {pct}%\n📝 عدد الأسئلة: {s['answered']}/{total}"
             ),
@@ -9466,7 +9503,7 @@ def _event_preview_view(year: str, user_id: int, uid: str | None = None):
     lines = [
         quizzy_block(QUIZZY_READY_ART, "CHALLENGE YOURSELF!"),
         "",
-        f"🎉 <b>{html.escape(ev['name'])}</b>",
+        f"<b>{html.escape(ev['name'])}</b>",
     ]
     if ev.get("description"):
         lines += ["", ev["description"]]   # stored as Telegram-HTML (formatting kept)
@@ -9538,7 +9575,7 @@ async def _event_user_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     }
     EVENT_SESSIONS[uid] = s
     await query.edit_message_text(
-        f"🎉 <b>{html.escape(ev['name'])}</b> — {n_polls} سؤال، هيتبعتولك واحد واحد 👇",
+        f"<b>{html.escape(ev['name'])}</b> — {n_polls} سؤال، هيتبعتولك واحد واحد 👇",
         parse_mode=ParseMode.HTML,
     )
     if not await _event_send_next(context, uid, s):
@@ -9638,7 +9675,7 @@ def _event_menu_view(year: str, ev: dict):
         rows.append([InlineKeyboardButton("🚀 Publish", callback_data=f"evta_pubd:{year}")])
     rows.append([InlineKeyboardButton("🔙 رجوع للـ Events", callback_data="evta_el")])
     text = (
-        f"🎉 <b>{html.escape(ev['name'])}</b>\n"
+        f"<b>{html.escape(ev['name'])}</b>\n"
         f"{UNIVERSITIES.get(year_university(year), '')} {year_label(year)} · {state}\n"
         f"📝 {n} سؤال · 👥 {taken} حلّوه"
     )
@@ -9883,7 +9920,7 @@ async def _event_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         ev["live"], ev["published_at"] = True, time.time()
         await _flush_sessions_if_changed()
         await backup_sessions_to_channel(context, force=True)
-        await admin_log(context, "🚀 Event published", f"🎉 {html.escape(ev['name'])} — {year_label(year)} · {len(ev['questions'])} سؤال", uid)
+        await admin_log(context, "🚀 Event published", f"{html.escape(ev['name'])} — {year_label(year)} · {len(ev['questions'])} سؤال", uid)
         text, markup = _event_menu_view(year, ev)
         await send("🚀 اتنشر!\n\n" + text, markup)
         return True
@@ -10115,7 +10152,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _add_lecture_enqueue(real_uid, ev_au, update.message.message_id, _stage_event_case)
             return
         await update.message.reply_text(
-            "🎉 لسه في Event مفتوح للإضافة — فوروارد سؤال (Quiz)، أو ابعت صورة/Case study هيترتبط بالسؤال الجاي، "
+            "لسه في Event مفتوح للإضافة — فوروارد سؤال (Quiz)، أو ابعت صورة/Case study هيترتبط بالسؤال الجاي، "
             "أو استخدم زراير Publish/Cancel تحت آخر رسالة (أو ابعت -END)."
         )
         return
@@ -15215,18 +15252,54 @@ async def tell_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     ref = args[0]
-    message_text = " ".join(args[1:])
+    # Take the body from the RAW message text (not context.args, which has
+    # lost the formatting) so bold / italic / links / spoilers / quotes /
+    # custom emoji all reach the user exactly as typed.
+    raw = update.message.text or ""
+    m_cmd = re.match(r"^\s*/\S+\s+\S+\s+", raw)
+    body_start = m_cmd.end() if m_cmd else None
+    if body_start is not None:
+        body = raw[body_start:]
+        body_stripped = body.rstrip()
+        body_ents = []
+        shift = _u16(raw[:body_start])
+        body_len = _u16(body_stripped)
+        for e in (update.message.entities or ()):
+            try:
+                d = e.to_dict()
+            except Exception:
+                continue
+            if d.get("type") in ("bot_command", "mention", "text_mention"):
+                if d["offset"] < shift:
+                    continue
+            o, end = d["offset"] - shift, d["offset"] + d["length"] - shift
+            o, end = max(o, 0), min(end, body_len)
+            if end > o:
+                body_ents.append({**d, "offset": o, "length": end - o})
+        message_text = body_stripped
+    else:
+        message_text = " ".join(args[1:])
+        body_ents = []
     target_id = _resolve_user_ref(ref)
     if target_id is None:
         await update.message.reply_text(f"⚠️ مش لاقي حد بالاسم/الـ ID ده: {html.escape(ref)}")
         return
 
     try:
-        await context.bot.send_message(
-            chat_id=target_id,
-            text=f"📩 <b>Quizician:</b>\n{html.escape(message_text)}",
-            parse_mode=ParseMode.HTML,
-        )
+        prefix = "📩 Quizician:\n"
+        pre_len = _u16(prefix)
+        all_ents = [{"type": "bold", "offset": 0, "length": _u16("📩 Quizician:")}]
+        all_ents += [{**d, "offset": d["offset"] + pre_len} for d in body_ents]
+        try:
+            await context.bot.send_message(
+                chat_id=target_id, text=prefix + message_text,
+                entities=_entities_from_dicts(all_ents),
+            )
+        except Exception as fmt_err:
+            # Bad / unsupported entity (or text_mention) — never lose the
+            # message itself: resend as plain text.
+            print("TELL formatted send failed, retrying plain:", fmt_err)
+            await context.bot.send_message(chat_id=target_id, text=prefix + message_text)
     except Exception as e:
         print("TELL SEND FAILED:", e)
         await update.message.reply_text("⚠️ مقدرتش أبعت الرسالة — ممكن يكون حاظر البوت أو ملهوش شات معاه.")
