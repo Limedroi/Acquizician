@@ -1247,11 +1247,11 @@ def _parse_subject_stat(value) -> tuple[int, int]:
         pass
     return 0, 0
 
-def _current_module_for_stats(entry: dict) -> str | None:
+def _current_module_for_stats(entry: dict, year: str | None = None) -> str | None:
     """The module /mystats reports on: the admin-set /daily_module scope
     when there is one (that's the module currently being taught), else the
     module of the user's own most recent answer, else None."""
-    scope = get_daily_quiz_scope()
+    scope = get_daily_quiz_scope(year)
     if scope and scope.get("module"):
         return scope["module"]
     return entry.get("last_module")
@@ -1775,6 +1775,8 @@ async def _notify_admin_sync_failure(app, what: str, error):
 # The per-year QUIZ backups are NOT part of this — each year (y1/y2/y3 and
 # n1/n2/n3) already backs up into its own channel_id from YEARS.
 # ═══════════════════════════════════════════════════════════════
+DQ_SCOPE_KEY_PREFIX = "_dq_scope_"   # SETTINGS key per year: "_dq_scope_y1", "_dq_scope_n2", ...
+
 def _uni_of_user(user_id) -> str:
     try:
         uid = int(user_id)
@@ -1820,7 +1822,12 @@ def _read_university_backup(raw: bytes, base: str) -> list:
 def _split_user_dict_by_university(d: dict) -> dict:
     parts = {u: {} for u in UNIVERSITY_ORDER}
     for uid, entry in list(d.items()):
-        parts[_uni_of_user(uid)][uid] = entry
+        if isinstance(uid, str) and uid.startswith(DQ_SCOPE_KEY_PREFIX):
+            # per-year Daily Quiz scope (see get_daily_quiz_scope) — filed under
+            # the university that owns that year, not the "non-numeric -> first uni" default
+            parts[_uni_of_year(uid[len(DQ_SCOPE_KEY_PREFIX):])][uid] = entry
+        else:
+            parts[_uni_of_user(uid)][uid] = entry
     return parts
 
 def _split_lecture_results_by_university() -> dict:
@@ -1907,7 +1914,8 @@ async def restore_analytics_from_channel(app) -> str:
 #   "reactions":  bool,  # emoji reactions on submitted quiz questions
 #   "auto_next":  bool,  # sends lecture questions one by one, waiting for
 #                        # each answer, instead of all at once
-#   "randomize":  bool,  # shuffles question order within a lecture
+#   "randomize":  bool,  # shuffles the order of each question's CHOICES (question order
+#                        # is always the original posting order; Review re-asks always shuffle)
 #   "achievement_notifs": bool,  # DMs a message when an achievement unlocks
 #                                # (level-up messages are separate and always sent)
 #   "year_class": str | None,  # one of YEAR_CLASS_NUMBER's keys ("y1"/"y2"/"y3") —
@@ -1949,7 +1957,7 @@ def _blank_settings_entry() -> dict:
         "auto_next": True,
         "randomize": True,
         "mix_written": False,   # False (default): written entries always trail at the
-                                 # end of the lecture, even with randomize on. True:
+                                 # end of the lecture. True:
                                  # written entries are shuffled in among the poll
                                  # questions instead — see get_mix_written_enabled.
         "achievement_notifs": True,
@@ -2860,38 +2868,48 @@ def _daily_quiz_subject_pool(year: str) -> dict:
     questions from (any subject can contribute more than one; this is
     just how the mids are organized so a scope filter can narrow it
     before picking). Restricted to that year's DAILY_QUIZ_ACTIVE_MODULE by
-    default; if the admin has set a /daily_module scope for this same
-    year, that overrides the default instead. Cached briefly per year —
-    see _DAILY_QUIZ_POOL_CACHE_TTL_SECONDS."""
-    scope = get_daily_quiz_scope()
-    if scope and scope["year"] == year:
-        scoped_module = scope["module"]
-    else:
-        scoped_module = DAILY_QUIZ_ACTIVE_MODULE.get(year)
+    default; if the admin has set a /daily_module scope for this year,
+    that overrides the default instead — and when the scope also lists
+    specific lectures, only those lectures (inside that module) feed the
+    pool. Cached briefly per year — see _DAILY_QUIZ_POOL_CACHE_TTL_SECONDS."""
+    scope = get_daily_quiz_scope(year)
+    scoped_module = scope["module"] if scope else DAILY_QUIZ_ACTIVE_MODULE.get(year)
+    lecture_uids = frozenset(scope.get("lectures") or ()) if scope else frozenset()
+    scope_key = (scoped_module, tuple(sorted(lecture_uids)))
 
     now = time.monotonic()
     cache = _DAILY_QUIZ_POOL_CACHE.setdefault(year, {"pool": None, "built_at": 0.0, "scope_key": None})
     if (cache["pool"] is not None
-            and cache["scope_key"] == scoped_module
+            and cache["scope_key"] == scope_key
             and now - cache["built_at"] < _DAILY_QUIZ_POOL_CACHE_TTL_SECONDS):
         return cache["pool"]
 
-    pool = {}   # (module, subject) -> [mid, ...]
-    if year in configured_years():
-        closed_message_ids = {v["message_id"] for v in QUIZ_POLL_STATUS[year].values() if v["closed"]}
-        modules = [scoped_module] if scoped_module else ready_modules(year)
-        for module in modules:
-            for subject in ready_subjects(year, module):
-                mids = []
-                for lecture_key in ready_lecture_keys(year, module, subject):
-                    ids = QUIZ_INDEX[year][lecture_key]["ids"]
-                    mids.extend(mid for mid in ids if mid in closed_message_ids)
-                if mids:
-                    pool[(module, subject)] = mids
+    def _collect(only_uids: frozenset) -> dict:
+        pool = {}   # (module, subject) -> [mid, ...]
+        if year in configured_years():
+            closed_message_ids = {v["message_id"] for v in QUIZ_POLL_STATUS[year].values() if v["closed"]}
+            modules = [scoped_module] if scoped_module else ready_modules(year)
+            for module in modules:
+                for subject in ready_subjects(year, module):
+                    mids = []
+                    for lecture_key in ready_lecture_keys(year, module, subject):
+                        entry = QUIZ_INDEX[year][lecture_key]
+                        if only_uids and entry.get("uid") not in only_uids:
+                            continue
+                        mids.extend(mid for mid in entry["ids"] if mid in closed_message_ids)
+                    if mids:
+                        pool[(module, subject)] = mids
+        return pool
+
+    pool = _collect(lecture_uids)
+    if not pool and lecture_uids:
+        # every picked lecture was deleted / isn't ready any more — fall back to
+        # the whole module instead of leaving the day's quiz empty
+        pool = _collect(frozenset())
 
     cache["pool"] = pool
     cache["built_at"] = now
-    cache["scope_key"] = scoped_module
+    cache["scope_key"] = scope_key
     return pool
 
 POLL_DESCRIPTION_LIMIT = 1024   # Telegram's cap on a native poll description
@@ -2978,6 +2996,10 @@ async def _snapshot_from_mid(context: ContextTypes.DEFAULT_TYPE, year: str, mid:
         cs = next((c for c in (lecture_entry.get("poll_case_studies") or []) if c.get("mid") == mid), None)
         if cs and cs.get("content"):
             snap["case_study"] = cs["content"]
+            if cs.get("entities"):
+                snap["case_study_entities"] = cs["entities"]
+            if cs.get("group") is not None:
+                snap["case_group"] = cs["group"]
     return snap
 
 def _attachment_index(year: str) -> dict:
@@ -2995,12 +3017,14 @@ def _attachment_index(year: str) -> dict:
         for cs in (entry.get("poll_case_studies") or []):
             if cs.get("mid") is not None and cs.get("content"):
                 out.setdefault(cs["mid"], {})["case_study"] = cs["content"]
+                if cs.get("entities"):
+                    out[cs["mid"]]["case_study_entities"] = cs["entities"]
     return out
 
 def _scoped_mistakes_bank(user_id: int) -> list:
     """Returns only this user's type="mistake" records. Bookmark records
     live in the same bank but are never fed into Mistakes Bank retakes."""
-    scope = get_daily_quiz_scope()
+    scope = get_daily_quiz_scope(get_year_class(user_id))
     user_entries = [
         m for m in _MISTAKES_BY_USER.get(user_id, [])
         if _entry_type(m) == MISTAKE_ENTRY_TYPE
@@ -3310,15 +3334,32 @@ async def get_daily_quiz_questions(context: ContextTypes.DEFAULT_TYPE, year: str
                 await backup_sessions_to_channel(context)
     return _DAILY_QUIZ_QUESTIONS[year]
 
+def _shuffle_poll_options(options: list, correct_option_id: int, avoid_order: list | None = None) -> tuple:
+    """Returns (shuffled_options, new_correct_option_id, order) where
+    order[i] is the ORIGINAL index of the choice now shown at position i.
+    If avoid_order is given and the shuffle lands on exactly that order,
+    it's rotated by one so the result is guaranteed to differ (used by the
+    spaced-repetition re-ask, which must never look like the first time).
+    Falls back to the untouched order for anything that can't be shuffled
+    safely (fewer than 2 options, or a correct id outside the options)."""
+    n = len(options)
+    identity = list(range(n))
+    if n < 2 or not isinstance(correct_option_id, int) or not (0 <= correct_option_id < n):
+        return list(options), correct_option_id, identity
+    order = list(identity)
+    random.shuffle(order)
+    if avoid_order is not None and order == list(avoid_order):
+        order = order[1:] + order[:1]
+    return [options[i] for i in order], order.index(correct_option_id), order
+
 def _shuffled_options(options: list, correct_option_id: int) -> tuple:
     """Returns a shuffled copy of options plus the new index of the
     correct one. Used per-delivery (not baked into the cached/shared
     daily question dict) so every user gets their own independent choice
     order for the same question, rather than everyone seeing option B
     correct and being able to just compare letters."""
-    order = list(range(len(options)))
-    random.shuffle(order)
-    return [options[i] for i in order], order.index(correct_option_id)
+    shuffled, new_correct, _ = _shuffle_poll_options(options, correct_option_id)
+    return shuffled, new_correct
 
 def _question_content_key(question: str, options: list, prefix: str = "quiz") -> str:
     """Stable content-based key for a question, used to recognize 'the same
@@ -3346,11 +3387,12 @@ async def _deliver_next_daily_question(context: ContextTypes.DEFAULT_TYPE, user_
     session["delivered_count"] = session.get("delivered_count", 0) + 1
     timer_seconds = get_question_timer_seconds(user_id)
     options, correct_option_id = _shuffled_options(q["options"], q["correct_option_id"])
-    if q.get("case_study"):
+    _cg = _case_dedupe_key(q.get("case_group"), q.get("case_study"))
+    _case_already_shown = _cg is not None and session.get("last_case_group") == _cg
+    session["last_case_group"] = _cg
+    if q.get("case_study") and not _case_already_shown:
         try:
-            await context.bot.send_message(
-                chat_id=user_id, text=html.escape(q["case_study"]), parse_mode=ParseMode.HTML,
-            )
+            await _send_case_study(context, user_id, q["case_study"], q.get("case_study_entities"))
         except Exception as e:
             print(f"Couldn't send case study for daily quiz question: {e}")
     poll_kwargs = dict(
@@ -3533,16 +3575,37 @@ def get_daily_quiz_last_date(user_id: int) -> str | None:
 # Stored under a reserved key in SETTINGS (not a per-user key — this is a
 # single global switch) so it rides on the exact same backup/restore path
 # as everything else there, with no new infrastructure needed.
-def get_daily_quiz_scope() -> dict | None:
-    """{"year": ..., "module": ...} to restrict the subject pool to one
-    module, or None for the default (every configured year/module)."""
-    return SETTINGS.get("_daily_quiz_scope")
+def _migrate_legacy_daily_scope() -> None:
+    """The first version kept ONE global scope under "_daily_quiz_scope"
+    ({"year","module"}). Fold it into the per-year key the first time it's seen."""
+    legacy = SETTINGS.pop("_daily_quiz_scope", None)
+    if isinstance(legacy, dict) and legacy.get("year") and legacy.get("module"):
+        SETTINGS.setdefault(
+            f"{DQ_SCOPE_KEY_PREFIX}{legacy['year']}",
+            {"year": legacy["year"], "module": legacy["module"], "lectures": None},
+        )
 
-async def set_daily_quiz_scope(year: str | None, module: str | None) -> None:
-    if year and module:
-        SETTINGS["_daily_quiz_scope"] = {"year": year, "module": module}
+def get_daily_quiz_scope(year: str | None) -> dict | None:
+    """This year's admin-set Daily Quiz scope — {"year", "module",
+    "lectures": [lecture uid, ...] | None} — or None for the default. Every
+    year/uni has its own scope; lectures=None means the whole module."""
+    if not year:
+        return None
+    _migrate_legacy_daily_scope()
+    scope = SETTINGS.get(f"{DQ_SCOPE_KEY_PREFIX}{year}")
+    return scope if isinstance(scope, dict) and scope.get("module") else None
+
+async def set_daily_quiz_scope(year: str, module: str | None, lectures: list | None = None) -> None:
+    """Sets (module given) or clears (module None) ONE year's scope. `lectures`
+    is a list of permanent lecture uids (see _lecture_uid) to draw from inside
+    that module, or None/[] for every lecture of the module. Saved in SETTINGS,
+    so it rides the normal settings backup/restore."""
+    _migrate_legacy_daily_scope()
+    key = f"{DQ_SCOPE_KEY_PREFIX}{year}"
+    if module:
+        SETTINGS[key] = {"year": year, "module": module, "lectures": list(lectures) if lectures else None}
     else:
-        SETTINGS.pop("_daily_quiz_scope", None)
+        SETTINGS.pop(key, None)
     await save_settings()
 
 async def _prompt_daily_quiz_year_class(context: ContextTypes.DEFAULT_TYPE, user_id: int, message=None) -> None:
@@ -4815,6 +4878,53 @@ QUIZ_INSERT_AFTER: dict = {y: {} for y in YEARS}
 # QUIZ_INSERT_AFTER above).
 QUIZ_PENDING_POLL_IMAGE: dict = {y: {} for y in YEARS}
 
+# ── "." follow-up grouping ─────────────────────────────────────────
+# Case study / image, poll 1, poll 2, poll 3, then a lone "." message:
+# the "." says "every poll since that attachment shares it". Until the "."
+# arrives, the group just collects the mids that followed the claiming
+# poll (RAM only, like QUIZ_PENDING_POLL_IMAGE). QUIZ_OPEN_ATTACH_GROUP is
+# the channel-authoring copy: year -> lecture_key -> {"first", "mids"}.
+# (/add_lecture keeps its own in ADD_LECTURE_STATE["open_group"].)
+QUIZ_OPEN_ATTACH_GROUP: dict = {y: {} for y in YEARS}
+
+def _case_dedupe_key(group, content) -> str | None:
+    """Key for "was this exact case already shown right before?". Includes a
+    hash of the text, so if an admin later edits one question's copy of the
+    case, that question shows its own version instead of being skipped.
+    crc32 (not hash()) so it stays stable across restarts / sessions.json."""
+    if group is None or not content:
+        return None
+    import zlib
+    return f"{group}:{zlib.crc32(str(content).encode('utf-8'))}"
+
+def _link_group_attachments(lecture_entry: dict | None, group: dict | None) -> int:
+    """Copies the first poll's image / case study onto every later poll in
+    `group` (poll_images / poll_case_studies are keyed by poll mid, so each
+    follow-up needs its own entry — that's what lets Daily Quiz, Mistakes
+    etc. show the case no matter which question gets picked). Every copy,
+    and the original, is tagged with "group" = first mid so sequential
+    lecture delivery can show the case once instead of 3 times. Returns how
+    many follow-up polls were linked."""
+    mids = list((group or {}).get("mids") or [])
+    if len(mids) < 2 or not lecture_entry:
+        return 0
+    first = mids[0]
+    linked = set()
+    for key in ("poll_images", "poll_case_studies"):
+        items = lecture_entry.get(key) or []
+        src = next((i for i in items if i.get("mid") == first), None)
+        if not src:
+            continue
+        src["group"] = first
+        have = {i.get("mid") for i in items}
+        for m in mids[1:]:
+            if m in have:
+                continue
+            items.append({**src, "mid": m})
+            linked.add(m)
+        lecture_entry[key] = items
+    return len(linked)
+
 # ── /report_issue support ────────────────────────────────────────
 # REPORT_THREADS mirrors the MISTAKES_BANK persistence pattern exactly:
 # local JSON file, plus a pinned backup in REPORT_ISSUE_GROUP_ID that gets
@@ -5539,6 +5649,95 @@ def _parse_spoiler_written_parts(text: str, entity_map: dict | None):
         return None
     return question, answer
 
+def _msg_rich(message, caption: bool = False) -> dict:
+    """{"text", "entities"} exactly as sent/forwarded: text is the RAW message
+    text (not stripped — entity offsets are relative to it) and entities are
+    JSON-safe dicts of every formatting entity. entities is [] when the
+    message has no formatting."""
+    text     = ((message.caption if caption else message.text) or "") if message else ""
+    entities = ((message.caption_entities if caption else message.entities) or ()) if message else ()
+    out = []
+    for e in entities:
+        try:
+            out.append(e.to_dict())
+        except Exception:
+            pass
+    return {"text": text, "entities": out}
+
+def _entities_from_dicts(dicts) -> list | None:
+    """Rebuild MessageEntity objects from stored dicts (see _msg_rich)."""
+    ents = []
+    for d in (dicts or []):
+        try:
+            if d.get("type") == "text_mention":
+                continue   # needs a live User object — fall back to plain text for that span
+            ents.append(MessageEntity(
+                type=d["type"], offset=d["offset"], length=d["length"],
+                url=d.get("url"), language=d.get("language"),
+                custom_emoji_id=d.get("custom_emoji_id"),
+            ))
+        except Exception:
+            continue
+    return ents or None
+
+async def _send_case_study(context, chat_id: int, content: str, entities=None) -> None:
+    """Send a case study. With stored entities it goes out exactly as the admin
+    sent it (formatting kept); old case studies without them keep the previous
+    plain-text behaviour."""
+    ents = _entities_from_dicts(entities)
+    if ents:
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=content, entities=ents)
+            return
+        except Exception as e:
+            print(f"Couldn't send case study with saved formatting (falling back to plain): {e}")
+    await context.bot.send_message(chat_id=chat_id, text=html.escape(content), parse_mode=ParseMode.HTML)
+
+def extract_spoiler_message_raw(message, caption: bool = False) -> dict | None:
+    """/add_lecture's "spoiler = written" rule. If the message (or photo
+    caption) contains ANY spoiler entity — one or many, anywhere in the
+    text — returns {"text", "entities", "title", "content"}; otherwise None
+    (-> treated as a case study by the caller).
+
+    "text" + "entities" are the message exactly as the admin sent/forwarded
+    it (bold, italic, links, the spoilers themselves, ...), entities as
+    JSON-safe dicts, so delivery can re-send it as is. "title"/"content" are
+    only a plain-text summary (everything outside the spoilers / the
+    spoilered text) used by the /edit_quiz listing and bookmarks."""
+    if not message:
+        return None
+    text     = (message.caption if caption else message.text) or ""
+    entities = (message.caption_entities if caption else message.entities) or ()
+    if not text.strip():
+        return None
+    spoilers = [e for e in entities if getattr(e, "type", None) == "spoiler"]
+    if not spoilers:
+        return None
+    try:
+        raw_entities = [e.to_dict() for e in entities]
+    except Exception:
+        return None
+    spans = []
+    for e in sorted(spoilers, key=lambda x: x.offset):
+        try:
+            a = _utf16_offset_to_py_index(text, e.offset)
+            b = _utf16_offset_to_py_index(text, e.offset + e.length)
+        except Exception:
+            continue
+        spans.append((a, b))
+    outside, hidden, pos = [], [], 0
+    for a, b in spans:
+        if a >= pos:
+            outside.append(text[pos:a])
+            pos = b
+        hidden.append(text[a:b])
+    outside.append(text[pos:])
+    title   = re.sub(r"^w\s*:\s*", "", "".join(outside).strip(), count=1, flags=re.IGNORECASE).strip()
+    content = "\n".join(h.strip() for h in hidden if h.strip())
+    if not title:
+        title = (text.strip().splitlines() or [""])[0][:80]   # whole message was spoilered
+    return {"text": text, "entities": raw_entities, "title": title, "content": content}
+
 def parse_spoiler_written_message(message) -> tuple[str, str] | None:
     if not message or not message.text:
         return None
@@ -6052,6 +6251,28 @@ async def handle_message_reaction(update: Update, context: ContextTypes.DEFAULT_
     if chat_id != user_id:
         return
 
+    # ❤️ on the written question an Auto-Next lecture is waiting on = "send the
+    # next one". Checked before the meta lookup below (in-memory only) so it
+    # still works if the bot restarted mid-lecture; consumes the heart, so it
+    # does NOT also bookmark the question.
+    lec_session = LECTURE_SESSIONS.get(user_id)
+    if lec_session and lec_session.get("written_pending_msg") == reaction.message_id:
+        _new = {getattr(r, "emoji", None) for r in (reaction.new_reaction or ())}
+        _old = {getattr(r, "emoji", None) for r in (reaction.old_reaction or ())}
+        if ({"❤️", "❤"} & _new) and not ({"❤️", "❤"} & _old):
+            lec_session["written_pending_msg"] = None   # claimed before any await — a double tap can't send two
+            await _proceed_after_written(context, user_id, lec_session)
+        return
+
+    ev_session = EVENT_SESSIONS.get(user_id)
+    if ev_session and ev_session.get("written_pending_msg") == reaction.message_id:
+        _new = {getattr(r, "emoji", None) for r in (reaction.new_reaction or ())}
+        _old = {getattr(r, "emoji", None) for r in (reaction.old_reaction or ())}
+        if ({"❤️", "❤"} & _new) and not ({"❤️", "❤"} & _old):
+            ev_session["written_pending_msg"] = None
+            await _event_proceed_after_written(context, user_id, ev_session)
+        return
+
     meta = _question_message_meta(user_id, reaction.message_id)
     if meta is None:
         return
@@ -6122,7 +6343,8 @@ async def handle_message_reaction(update: Update, context: ContextTypes.DEFAULT_
                 await backup_mistakes_bank_to_channel(context)
             except Exception as e:
                 print(f"BOOKMARK REMOVE SAVE ERROR for user {user_id}, message {reaction.message_id}: {e}")
-        await _reaction_toast(context, user_id, "Bookmark removed! ^-^" if removed else "Bookmark not found.")
+        if removed or not meta.get("written_gate"):
+            await _reaction_toast(context, user_id, "Bookmark removed! ^-^" if removed else "Bookmark not found.")
 
 async def react_random(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id if update.effective_user else update.effective_chat.id
@@ -6327,7 +6549,9 @@ XP_LECTURE_CORRECT        = 15   # per question answered correctly
 XP_LECTURE_INCORRECT      = 5    # per question answered incorrectly
 XP_LECTURE_COMPLETE_BONUS = 25   # extra, on top of the above, for the lecture's last question
 
-async def _deliver_written_item(context: ContextTypes.DEFAULT_TYPE, user_id: int, w: dict):
+WRITTEN_HEADER_TEXT = "<b>WRITTEN ✍️</b>\nأعمل رياكت ❤️علشان يتبعت السؤال اللي بعده"
+
+async def _deliver_written_item(context: ContextTypes.DEFAULT_TYPE, user_id: int, w: dict, gated: bool = False):
     """Sends one written-question entry (see parse_written_channel_block /
     QUIZ_INDEX[year][lecture]['written']): a title with its content hidden
     behind a Telegram spoiler, same '||text||' MarkdownV2 convention as the
@@ -6335,6 +6559,39 @@ async def _deliver_written_item(context: ContextTypes.DEFAULT_TYPE, user_id: int
     touches session['answered']/['correct'], XP, or the mistakes bank."""
     title   = w.get("title", "")
     content = w.get("content", "")
+    sent = None
+    raw_text = w.get("text")
+    if raw_text and w.get("entities") is not None:
+        # Saved as sent (see extract_spoiler_message_raw): text + its original
+        # entities, so bold/italic/links/spoilers all come back exactly as the
+        # admin had them.
+        try:
+            ents = _entities_from_dicts(w["entities"])
+            image = w.get("image")
+            if image and image.get("file_id"):
+                sent = await context.bot.send_photo(
+                    chat_id=user_id, photo=image["file_id"],
+                    caption=raw_text, caption_entities=ents,
+                    has_spoiler=bool(image.get("spoiler")),
+                )
+            else:
+                sent = await context.bot.send_message(chat_id=user_id, text=raw_text, entities=ents)
+        except Exception as e:
+            print(f"Couldn't send written question '{title}' with saved formatting (falling back): {e}")
+            sent = None
+        if sent is not None:
+            written_meta = {
+                "question": title, "options": [],
+                "lecture": w.get("lecture"), "module": w.get("module"),
+                "subject": w.get("subject"), "year": w.get("year"),
+                "source_mid": w.get("id"), "written_answer": content,
+            }
+            if gated:
+                written_meta["written_gate"] = True
+            _remember_bookmarkable_question(
+                user_id, sent.message_id, question_key=f"written:{w.get('id', 0)}", metadata=written_meta,
+            )
+            return sent
     # title/content are raw lecturer-authored text and almost always contain
     # MarkdownV2 special chars (. - ( ) : etc.) — must be escaped or Telegram
     # rejects the whole send with "can't parse entities", silently dropping
@@ -6344,7 +6601,6 @@ async def _deliver_written_item(context: ContextTypes.DEFAULT_TYPE, user_id: int
     if content:
         caption += f"\n||{escape_markdown(content, version=2)}||"
     image = w.get("image")
-    sent = None
     try:
         if image and image.get("file_id"):
             sent = await context.bot.send_photo(
@@ -6380,9 +6636,12 @@ async def _deliver_written_item(context: ContextTypes.DEFAULT_TYPE, user_id: int
             "source_mid": w.get("id"),
             "written_answer": content,
         }
+        if gated:
+            written_meta["written_gate"] = True   # a ❤️ here means "send the next one" — see handle_message_reaction
         _remember_bookmarkable_question(
             user_id, sent.message_id, question_key=written_key, metadata=written_meta,
         )
+    return sent
 
 async def _deliver_next_lecture_question(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict) -> bool:
     """Pops message ids off session['queue'] and sends them to the user one
@@ -6434,7 +6693,7 @@ async def _deliver_next_lecture_question(context: ContextTypes.DEFAULT_TYPE, use
     # _capture_add_lecture_poll, which does the binding). Sent as its own
     # message right before the poll below.
     poll_case_studies_by_mid = {
-        cs["mid"]: cs["content"] for cs in ((entry.get("poll_case_studies") or []) if entry else [])
+        cs["mid"]: cs for cs in ((entry.get("poll_case_studies") or []) if entry else [])
     }
 
     async def _drop_dead(mid: int):
@@ -6459,12 +6718,34 @@ async def _deliver_next_lecture_question(context: ContextTypes.DEFAULT_TYPE, use
     while session["queue"]:
         item = session["queue"].pop(0)
 
-        # A written (unscored) entry — no poll, nothing to answer, so just
-        # send it and move straight on to the next real item in the same
-        # pass instead of returning (there's no answer to wait for).
+        # A written (unscored) entry — no poll, nothing to answer.
         if isinstance(item, dict) and item.get("type") == "written":
-            await _deliver_written_item(context, user_id, item["data"])
-            continue
+            if session.get("mode") == "batch":
+                # Everything is sent up front in batch mode, so there's no
+                # "next" to wait for — send it and keep going.
+                await _deliver_written_item(context, user_id, item["data"])
+                continue
+            # Auto-Next: before the first written question of a run, send the
+            # "WRITTEN" header (with the ❤️ instruction), then send ONE written
+            # question and stop. The user's ❤️ reaction on it brings the next
+            # item (see _proceed_after_written / handle_message_reaction).
+            if not session.get("written_header_sent"):
+                try:
+                    await context.bot.send_message(chat_id=user_id, text=WRITTEN_HEADER_TEXT, parse_mode=ParseMode.HTML)
+                except Exception as e:
+                    print(f"Couldn't send WRITTEN header to {user_id}: {e}")
+                session["written_header_sent"] = True
+            sent_w = await _deliver_written_item(context, user_id, item["data"], gated=True)
+            if sent_w is None:
+                continue   # couldn't be sent at all — skip it rather than stall on a message nobody can react to
+            session["written_pending_msg"]   = sent_w.message_id
+            session["current_poll_id"]       = None
+            session["current_correct_id"]    = None
+            session["current_option_count"]  = None
+            session["current_message_id"]    = None
+            session["current_mid"]           = None
+            session["current_delivered_at"]  = None
+            return True
 
         mid = item
         status = poll_status_by_mid.get(mid)
@@ -6534,18 +6815,33 @@ async def _deliver_next_lecture_question(context: ContextTypes.DEFAULT_TYPE, use
         timer_seconds = get_question_timer_seconds(user_id)
         session["delivered_count"] = session.get("delivered_count", 0) + 1
 
+        # Randomize (Settings) shuffles the CHOICES of each question —
+        # never the order of the questions themselves (that's always the
+        # order they were first added in). Only the poll that's actually
+        # sent uses the shuffled copy; `options`/`correct_id` stay in their
+        # original order because everything downstream (bookmarks, reports,
+        # the mistakes bank, spaced repetition) resolves a question back
+        # through QUIZ_POLL_STATUS's original order. shown_orders keeps what
+        # this user saw so a Review re-ask can avoid repeating it (string
+        # keys so it survives the sessions.json round-trip untouched).
+        poll_options, poll_correct_id, shown_order = list(options), correct_id, list(range(len(options)))
+        if get_randomize_enabled(user_id):
+            poll_options, poll_correct_id, shown_order = _shuffle_poll_options(options, correct_id)
+        session.setdefault("shown_orders", {})[str(mid)] = shown_order
+
         case_study = poll_case_studies_by_mid.get(mid)
-        if case_study:
+        cs_key = _case_dedupe_key(case_study.get("group"), case_study.get("content")) if case_study else None
+        already_shown = cs_key is not None and session.get("last_case_group") == cs_key
+        session["last_case_group"] = cs_key
+        if case_study and not already_shown:
             try:
-                await context.bot.send_message(
-                    chat_id=user_id, text=html.escape(case_study), parse_mode=ParseMode.HTML,
-                )
+                await _send_case_study(context, user_id, case_study["content"], case_study.get("entities"))
             except Exception as e:
                 print(f"Couldn't send case study for lecture question {mid}: {e}")
 
         poll_kwargs = dict(
-            chat_id=user_id, question=_numbered_question(question, session["delivered_count"]), options=options,
-            type="quiz", correct_option_id=correct_id, is_anonymous=False,
+            chat_id=user_id, question=_numbered_question(question, session["delivered_count"]), options=poll_options,
+            type="quiz", correct_option_id=poll_correct_id, is_anonymous=False,
             explanation=(explanation or None),
             open_period=(timer_seconds or None),
         )
@@ -6585,8 +6881,9 @@ async def _deliver_next_lecture_question(context: ContextTypes.DEFAULT_TYPE, use
         _remember_bookmarkable_question(
             user_id, msg.message_id, question_key=lecture_qkey, metadata=lecture_meta,
         )
+        session["written_header_sent"] = False   # a poll ended any written run — the next run gets a fresh header
         session["current_poll_id"]    = msg.poll.id
-        session["current_correct_id"] = correct_id
+        session["current_correct_id"] = poll_correct_id   # position in what the user was actually shown
         session["current_option_count"] = len(options)
         session["current_message_id"] = msg.message_id
         session["current_mid"]        = mid
@@ -6857,10 +7154,17 @@ async def _maybe_deliver_spaced_repetition(context: ContextTypes.DEFAULT_TYPE, u
     if not (status and status.get("question") and status.get("options") and status.get("correct_option_id") is not None):
         return False   # content not resolvable (shouldn't normally happen — it was just answered) — skip quietly
 
+    # A Review re-ask ALWAYS gets its choices shuffled, whatever the Randomize
+    # setting says, and never in the same order this user saw the first
+    # time (so they can't just answer by position).
+    sr_options, sr_correct_id, _ = _shuffle_poll_options(
+        status["options"], status["correct_option_id"],
+        avoid_order=(session.get("shown_orders") or {}).get(str(wrong_mid)),
+    )
     try:
         msg = await context.bot.send_poll(**_with_poll_description(dict(
-            chat_id=user_id, question=_prefixed_question(status["question"], "🔁 Review: "), options=status["options"],
-            type="quiz", correct_option_id=status["correct_option_id"], is_anonymous=False,
+            chat_id=user_id, question=_prefixed_question(status["question"], "🔁 Review: "), options=sr_options,
+            type="quiz", correct_option_id=sr_correct_id, is_anonymous=False,
             explanation=(status.get("explanation") or None),
         ), status.get("description")))
     except Exception as e:
@@ -6890,11 +7194,24 @@ async def _maybe_deliver_spaced_repetition(context: ContextTypes.DEFAULT_TYPE, u
 
     session["sr_pending"]            = wrong_mid
     session["sr_pending_poll_id"]    = msg.poll.id
-    session["sr_pending_correct_id"] = status["correct_option_id"]
+    session["sr_pending_correct_id"] = sr_correct_id
     session["sr_pending_message_id"] = msg.message_id
     return True
 
-async def _finish_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict) -> None:
+def _lecture_polls_left(session: dict) -> bool:
+    """True if any real poll question (not a written entry) is still queued."""
+    return any(not (isinstance(x, dict) and x.get("type") == "written") for x in session.get("queue", []))
+
+async def _proceed_after_written(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict) -> None:
+    """The user hearted the written question the session was waiting on: send
+    whatever comes next (another written question, or the next poll), or wrap
+    the lecture up if that was the end of the queue."""
+    session["written_pending_msg"] = None
+    sent_next = await _deliver_next_lecture_question(context, user_id, session)
+    if not sent_next and LECTURE_SESSIONS.get(user_id) is session:
+        await _finish_lecture_session(context, user_id, session)
+
+async def _finish_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict, defer: bool = False) -> None:
     """The lecture-complete summary message + retake-staging + leaderboard
     write. Split out of _advance_lecture_session so the spaced-repetition
     re-ask path (see handle_poll_answer) can reach the same completion
@@ -6913,7 +7230,8 @@ async def _finish_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: i
     lecture_name = QUIZ_INDEX[year].get(session["lecture_key"], {}).get("name", session["lecture_key"])
     is_retake = session.get("is_retake", False)
     extra_events = []
-    if not is_retake:
+    if not is_retake and not session.get("scored_done"):
+        session["scored_done"] = True   # the scoring block runs once, even if the summary is sent later
         # Retakes are practice, not a new attempt at the lecture proper —
         # they never touch the leaderboard or best-score file, and don't
         # count toward lectures_completed or its Extras either.
@@ -6945,6 +7263,8 @@ async def _finish_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: i
         _mark_analytics_dirty()
         await _announce_events(context, user_id, {"achievements": extra_events, "level_up": level_up})
         await backup_analytics_to_channel(context)
+    if defer:
+        return   # written questions still pending: results are saved, the summary goes out after the last one
     title = "خلصت مراجعة الأسئلة الغلط!" if is_retake else f"خلصت محاضرة {session['module']} - {session['subject']}: {lecture_name}!"
     summary = (
         f"🎓 <b>{title}</b>\n\n"
@@ -7039,7 +7359,13 @@ async def _advance_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: 
             is_last = False   # a re-ask went out — lecture isn't over, and no fresh question was pulled this round
         else:
             sent_next = await _deliver_next_lecture_question(context, user_id, session)
-            is_last   = not sent_next   # queue ran dry (or every remaining id was dead) — lecture's done
+            if session.get("written_pending_msg") is not None:
+                # A written question went out and is waiting on a ❤️. The scored
+                # part is over only if no polls are left behind it; the summary
+                # itself waits until the written ones are done (see below).
+                is_last = not _lecture_polls_left(session)
+            else:
+                is_last = not sent_next   # queue ran dry (or every remaining id was dead) — lecture's done
 
     per_question_xp = XP_LECTURE_CORRECT if is_correct else XP_LECTURE_INCORRECT
     xp_delta         = per_question_xp + (XP_LECTURE_COMPLETE_BONUS if is_last else 0)
@@ -7088,7 +7414,7 @@ async def _advance_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: 
     await backup_analytics_to_channel(context)
 
     if is_last:
-        await _finish_lecture_session(context, user_id, session)
+        await _finish_lecture_session(context, user_id, session, defer=session.get("written_pending_msg") is not None)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -7155,6 +7481,91 @@ ADD_LECTURE_INTAKE_DELAY = 2.0   # seconds of quiet after the last arrival befor
 _add_lecture_intake: dict[int, dict] = {}          # user_id -> {"items": [(message_id, job)], "gen": int}
 _add_lecture_intake_locks: dict[int, asyncio.Lock] = {}
 
+# ── Speed: deferred disk writes + background channel archiving ───────
+# Per question the old code did 2-4 full-file writes (quiz index + poll status,
+# each a deepcopy + JSON dump of the whole year) and, for an image question,
+# TWO awaited channel posts (photo + archival poll copy) — and the channel is
+# rate-limited by Telegram to ~20 messages/min, so a 50-question batch crawled
+# for minutes. Now the ordered capture phase is memory-only; the disk is written
+# once per batch, and the durable channel copy of an attachment is made by ONE
+# background worker per session, strictly in forward order (so the channel
+# archive keeps the same order). The question + attachment are already bound
+# (using the admin's own file_id) the moment the poll is captured; the worker
+# upgrades the stored file_id to the channel copy when it lands, and /end,
+# End Lecture and the closing backup wait for it.
+ADD_LECTURE_ARCHIVE_POLL_COPY = True   # also post the archival poll copy beside the photo (halves the channel traffic if False)
+_bg_tasks: set = set()                 # strong refs so fire-and-forget tasks aren't garbage-collected
+
+def _spawn_bg(coro) -> "asyncio.Task":
+    t = asyncio.get_running_loop().create_task(coro)
+    _bg_tasks.add(t)
+    t.add_done_callback(_bg_tasks.discard)
+    return t
+
+def _al_mark_dirty(al_state: dict, *, index: bool = False, status: bool = False) -> None:
+    d = al_state.setdefault("dirty", set())
+    if index:
+        d.add("index")
+    if status:
+        d.add("status")
+
+async def _flush_add_lecture_saves(al_state: dict) -> None:
+    dirty = al_state.get("dirty")
+    if not dirty:
+        return
+    al_state["dirty"] = set()
+    year = al_state["year"]
+    if "index" in dirty:
+        await save_quiz_index(year)
+    if "status" in dirty:
+        await save_quiz_poll_status(year)
+
+async def _archive_add_lecture_image(context, al_state: dict, img_entry: dict, pending_img: dict, poll) -> None:
+    """Background: make the durable channel copy of one bound image (and the
+    archival poll copy), one at a time per session so the channel order matches
+    the forward order. On success the already-stored entry is upgraded in place
+    to the channel copy's file_id; on any failure it simply keeps the admin's
+    own file_id (same fallback as before)."""
+    year, current = al_state["year"], al_state["lecture_key"]
+    channel_id = year_channel_id(year)
+    if not channel_id:
+        return
+    prev = al_state.get("archive_prev")          # chain: wait for the previous image's turn
+    done = asyncio.get_running_loop().create_future()
+    al_state["archive_prev"] = done
+    try:
+        if prev is not None:
+            await prev
+        if al_state.get("cancelled"):
+            return
+        sent_photo = await context.bot.send_photo(
+            chat_id=channel_id, photo=pending_img["file_id"],
+            has_spoiler=pending_img.get("spoiler", False),
+        )
+        channel_photo = sent_photo.photo[-1]
+        img_entry["file_id"]        = channel_photo.file_id
+        img_entry["file_unique_id"] = channel_photo.file_unique_id
+        _al_mark_dirty(al_state, index=True)
+        if ADD_LECTURE_ARCHIVE_POLL_COPY:
+            await context.bot.send_poll(**_with_poll_description(dict(
+                chat_id=channel_id, question=poll["question"],
+                options=poll["options"], type="quiz",
+                correct_option_id=poll["correct"],
+                explanation=poll["explanation"], is_anonymous=True,
+            ), poll["description"]))
+    except Exception as e:
+        print(f"ADD_LECTURE channel backup post failed for lecture '{current}' ({year}): {e}")
+    finally:
+        if not done.done():
+            done.set_result(None)
+
+async def _wait_add_lecture_archives(al_state: dict) -> None:
+    tasks = [t for t in al_state.get("archive_tasks", []) if not t.done()]
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    al_state["archive_tasks"] = []
+    await _flush_add_lecture_saves(al_state)
+
 async def _drain_add_lecture_intake(user_id: int, al_state: dict) -> None:
     """Run everything queued for this admin, sorted by message_id, one job at
     a time. Safe to call from several places at once (serialized by a lock);
@@ -7173,6 +7584,9 @@ async def _drain_add_lecture_intake(user_id: int, al_state: dict) -> None:
                 await job()
             except Exception as e:
                 print(f"ADD_LECTURE intake job failed (message {_mid}): {e}")
+        # The jobs above only touched memory (see _al_mark_dirty) — write the
+        # whole batch to disk ONCE instead of 2-4 full-file writes per question.
+        await _flush_add_lecture_saves(al_state)
 
 async def _add_lecture_enqueue(user_id: int, al_state: dict, message_id: int, job) -> None:
     box = _add_lecture_intake.setdefault(user_id, {"items": [], "gen": 0})
@@ -7190,20 +7604,26 @@ async def _settle_and_drain_add_lecture_intake(user_id: int, al_state: dict) -> 
     instead of waiting out the normal quiet period."""
     await asyncio.sleep(1.0)
     await _drain_add_lecture_intake(user_id, al_state)
+    await _wait_add_lecture_archives(al_state)   # durable channel copies must exist before the lecture closes/backs up
 
-async def _capture_add_lecture_written(context: ContextTypes.DEFAULT_TYPE, user_id: int, al_state: dict, title: str, content: str, message_id: int):
-    """Capture an auto-detected spoiler written question during /add_lecture."""
+async def _capture_add_lecture_written(context: ContextTypes.DEFAULT_TYPE, user_id: int, al_state: dict, title: str, content: str, message_id: int, raw: dict | None = None, image: dict | None = None):
+    """Capture an auto-detected spoiler written question during /add_lecture.
+    `raw` ({"text","entities"}, see extract_spoiler_message_raw) keeps the
+    message exactly as sent so it can be re-sent with its formatting intact;
+    `image` is set when it came in as a photo with a spoiler caption."""
     year = al_state["year"]
     current = al_state["lecture_key"]
     entry = QUIZ_INDEX[year].get(current)
     if not entry or entry.get("closed"):
         ADD_LECTURE_STATE.pop(user_id, None)
         return
-    entry.setdefault("written", []).append({
-        "id": message_id, "title": title, "content": content, "image": None,
-    })
+    w_entry = {"id": message_id, "title": title, "content": content, "image": image}
+    if raw:
+        w_entry["text"]     = raw["text"]
+        w_entry["entities"] = raw["entities"]
+    entry.setdefault("written", []).append(w_entry)
     al_state.setdefault("session_written_ids", []).append(message_id)
-    await save_quiz_index(year)
+    _al_mark_dirty(al_state, index=True)
 
     await _refresh_add_lecture_status(context, user_id, al_state)
 
@@ -7211,6 +7631,7 @@ async def _close_add_lecture(context: ContextTypes.DEFAULT_TYPE, real_uid: int, 
     """Shared close logic for the End Lecture button and typed -END/-FIN.
     Returns (summary_text, None) on success or (None, error_text)."""
     year, current = al_state["year"], al_state["lecture_key"]
+    await _wait_add_lecture_archives(al_state)
     if current not in QUIZ_INDEX[year]:
         ADD_LECTURE_STATE.pop(real_uid, None)
         return None, "⚠️ المحاضرة دي اتشالت من حتة تانية."
@@ -7226,6 +7647,10 @@ async def _close_add_lecture(context: ContextTypes.DEFAULT_TYPE, real_uid: int, 
     # same "batched at close, not per-question" convention the
     # channel-authoring -END uses.
     await backup_quiz_to_channel(context, year)
+    _ent = QUIZ_INDEX[year].get(current, {})
+    await admin_log(context, "📚 Lecture added",
+                    f"{year_label(year)} — {html.escape(str(_ent.get('module', '')))} - {html.escape(str(_ent.get('subject', '')))}: {html.escape(str(current))}\n📝 {count} سؤال",
+                    real_uid)
     return (
         f"✅ اتقفلت محاضرة <b>{current}</b> — {count} سؤال، وكلهم جاهزين للإرسال على طول "
         "(مفيش انتظار لإقفال بولات — الإجابات كانت معروفة من ساعة ما اتفورورد).",
@@ -7239,6 +7664,10 @@ async def _cancel_add_lecture(al_state: dict) -> int:
     however it looked before (if this was a resumed lecture). Returns
     how many questions were dropped."""
     year, current = al_state["year"], al_state["lecture_key"]
+    al_state["cancelled"] = True                 # background archive worker stops posting to the channel
+    for _t in al_state.get("archive_tasks", []):
+        _t.cancel()
+    al_state["dirty"] = set()
     session_ids = al_state.get("session_ids", [])
     session_written_ids = set(al_state.get("session_written_ids", []))
     removed_count = len(session_ids) + len(session_written_ids)
@@ -7331,7 +7760,7 @@ async def _capture_add_lecture_poll(update: Update, context: ContextTypes.DEFAUL
     else:
         ids.append(msg.message_id)
     al_state.setdefault("session_ids", []).append(msg.message_id)
-    await save_quiz_index(year)
+    _al_mark_dirty(al_state, index=True)
 
     QUIZ_POLL_STATUS[year][poll.id] = {
         "lecture":           current,
@@ -7345,7 +7774,7 @@ async def _capture_add_lecture_poll(update: Update, context: ContextTypes.DEFAUL
         # (the block above the question) — keep it so delivery re-sends it.
         "description":       _poll_description(poll),
     }
-    await save_quiz_poll_status(year)
+    _al_mark_dirty(al_state, status=True)
 
     # ── Claim any pending image / case study sent since the last poll ──
     # (see ADD_LECTURE_STATE's "pending_image"/"pending_case_study"
@@ -7380,39 +7809,49 @@ async def _capture_add_lecture_poll(update: Update, context: ContextTypes.DEFAUL
     # than losing the image outright — best-effort, since the question
     # itself is already safely captured either way.
     if pending_img:
-        channel_id = year_channel_id(year)
-        stored_img = pending_img
-        if channel_id:
-            try:
-                sent_photo = await context.bot.send_photo(
-                    chat_id=channel_id, photo=pending_img["file_id"],
-                    has_spoiler=pending_img.get("spoiler", False),
-                )
-                channel_photo = sent_photo.photo[-1]
-                stored_img = {
-                    "file_id":        channel_photo.file_id,
-                    "file_unique_id": channel_photo.file_unique_id,
-                    "spoiler":        pending_img.get("spoiler", False),
-                }
-                await context.bot.send_poll(**_with_poll_description(dict(
-                    chat_id=channel_id, question=poll.question,
-                    options=[o.text for o in poll.options], type="quiz",
-                    correct_option_id=poll.correct_option_ids[0],
-                    explanation=poll.explanation, is_anonymous=True,
-                ), _poll_description(poll)))
-            except Exception as e:
-                print(f"ADD_LECTURE channel backup post failed for lecture '{current}' ({year}): {e}")
-        QUIZ_INDEX[year][current].setdefault("poll_images", []).append({
-            "mid": msg.message_id, **stored_img,
-        })
-        await save_quiz_index(year)
+        # Bound RIGHT NOW with the admin's own file_id (so the attachment is
+        # attached to this exact poll immediately, in order); the background
+        # worker swaps in the durable channel copy's file_id when it's posted.
+        img_entry = {"mid": msg.message_id, **pending_img}
+        QUIZ_INDEX[year][current].setdefault("poll_images", []).append(img_entry)
+        _al_mark_dirty(al_state, index=True)
+        if year_channel_id(year):
+            poll_snapshot = {
+                "question": poll.question, "options": [o.text for o in poll.options],
+                "correct": poll.correct_option_ids[0], "explanation": poll.explanation,
+                "description": _poll_description(poll),
+            }
+            al_state.setdefault("archive_tasks", []).append(
+                _spawn_bg(_archive_add_lecture_image(context, al_state, img_entry, pending_img, poll_snapshot))
+            )
     if pending_case:
         QUIZ_INDEX[year][current].setdefault("poll_case_studies", []).append({
             "mid": msg.message_id, "content": pending_case["content"],
+            **({"entities": pending_case["entities"]} if pending_case.get("entities") else {}),
         })
-        await save_quiz_index(year)
+        _al_mark_dirty(al_state, index=True)
+
+    # "." grouping: a poll that claimed an image/case opens a group; the
+    # polls forwarded after it (with no attachment of their own) join it
+    # until a "." message links them all (see _dot_link_add_lecture).
+    if pending_img or pending_case:
+        al_state["open_group"] = {"first": msg.message_id, "mids": [msg.message_id]}
+    elif al_state.get("open_group"):
+        al_state["open_group"]["mids"].append(msg.message_id)
 
     await _refresh_add_lecture_status(context, user_id, al_state)
+
+async def _dot_link_add_lecture(update: Update, al_state: dict) -> None:
+    """A lone "." in an /add_lecture session: share the last case / image
+    with every poll forwarded since it."""
+    group = al_state.pop("open_group", None)
+    entry = QUIZ_INDEX[al_state["year"]].get(al_state["lecture_key"])
+    n = _link_group_attachments(entry, group)
+    if n:
+        _al_mark_dirty(al_state, index=True)
+        await update.message.reply_text(f"🔗 اتربط الـ Case/الصورة بـ {n + 1} أسئلة (السؤال الأول + {n} متابعة).")
+    else:
+        await update.message.reply_text("ℹ️ مفيش أسئلة متابعة بعد الـ Case/الصورة دي عشان أربطها.")
 
 async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.poll:
@@ -7554,6 +7993,19 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not ev_photo:
             return
 
+        raw_ev_img_written = extract_spoiler_message_raw(update.message, caption=True)
+        if raw_ev_img_written:
+            async def _stage_event_written_img():
+                ev_au.setdefault("pending_written", []).append({
+                    "id": update.message.message_id, "title": raw_ev_img_written["title"],
+                    "content": raw_ev_img_written["content"],
+                    "image": {"file_id": ev_photo.file_id, "spoiler": bool(getattr(update.message, "has_media_spoiler", False))},
+                    "text": raw_ev_img_written["text"], "entities": raw_ev_img_written["entities"],
+                })
+                await update.message.reply_text("✍️ اتسجل السؤال المكتوب — هيتبعت قبل أول سؤال (Quiz poll) تفورورده دلوقتي.")
+            await _add_lecture_enqueue(real_uid, ev_au, update.message.message_id, _stage_event_written_img)
+            return
+
         async def _stage_event_image():
             ev_au["pending_image"] = {
                 "file_id": ev_photo.file_id,
@@ -7570,6 +8022,22 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not al_photo:
             return
 
+        raw_written_img = extract_spoiler_message_raw(update.message, caption=True)
+        if raw_written_img:
+            written_image = {
+                "file_id":        al_photo.file_id,
+                "file_unique_id": al_photo.file_unique_id,
+                "spoiler":        bool(getattr(update.message, "has_media_spoiler", False)),
+            }
+            await _add_lecture_enqueue(
+                real_uid, al_state, update.message.message_id,
+                lambda: _capture_add_lecture_written(
+                    context, real_uid, al_state, raw_written_img["title"], raw_written_img["content"],
+                    update.message.message_id, raw=raw_written_img, image=written_image,
+                ),
+            )
+            return
+
         async def _stage_image():
             replaced_note = (
                 "\n⚠️ ده استبدل الصورة اللي بعتهالك قبل كده — ده كانت لسه معلقة ومربوطتش بسؤال."
@@ -7580,10 +8048,10 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "file_unique_id": al_photo.file_unique_id,
                 "spoiler":        bool(getattr(update.message, "has_media_spoiler", False)),
             }
-            await update.message.reply_text(
+            _spawn_bg(update.message.reply_text(
                 f"🖼 اتسجلت الصورة — هتترتبط بأول سؤال (Quiz poll) تفورورده دلوقتي.{replaced_note}",
                 parse_mode=ParseMode.HTML,
-            )
+            ))   # confirmation is fire-and-forget: it must not hold up the ordered queue
 
         await _add_lecture_enqueue(real_uid, al_state, update.message.message_id, _stage_image)
         return
@@ -7863,7 +8331,9 @@ async def backup_now_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_creator(update):
         await update.message.reply_text(MSG_ADMIN_ONLY)
         return
-    await update.message.reply_text(await _run_backup_now(context))
+    result = await _run_backup_now(context)
+    await admin_log(context, "💾 Backup Now", html.escape(result)[:1500], update.effective_user, ping=False)
+    await update.message.reply_text(result)
 
 # ═══════════════════════════════════════════════════════════════
 # QUIZ CHANNEL — AUTO-INDEXING
@@ -7891,14 +8361,22 @@ async def handle_quiz_channel_message(update: Update, context: ContextTypes.DEFA
             return
         photo   = msg.photo[-1]   # highest resolution
         caption = (msg.caption or "").strip()
-        written = parse_spoiler_written_caption(msg) if caption else None
-        if written is None and caption:
+        raw_written = extract_spoiler_message_raw(msg, caption=True) if caption else None
+        written = None
+        if raw_written is None and caption:
             written = parse_written_channel_block(caption)
         image_info = {
             "file_id":        photo.file_id,
             "file_unique_id": photo.file_unique_id,   # the immutable part — see QUIZ_PENDING_POLL_IMAGE
             "spoiler":        bool(getattr(msg, "has_media_spoiler", False)),
         }
+        if raw_written:
+            QUIZ_INDEX[year][current].setdefault("written", []).append({
+                "id": msg.message_id, "title": raw_written["title"], "content": raw_written["content"],
+                "image": image_info, "text": raw_written["text"], "entities": raw_written["entities"],
+            })
+            await save_quiz_index(year)
+            return
         if written:
             title, content = written
             QUIZ_INDEX[year][current].setdefault("written", []).append({
@@ -7945,6 +8423,13 @@ async def handle_quiz_channel_message(update: Update, context: ContextTypes.DEFA
             QUIZ_INDEX[year][current].setdefault("poll_images", []).append({
                 "mid": msg.message_id, **pending_img,
             })
+        # "." grouping (see QUIZ_OPEN_ATTACH_GROUP): an image-carrying poll
+        # opens a group, later attachment-less polls join it until a "." post.
+        _grp = QUIZ_OPEN_ATTACH_GROUP[year]
+        if pending_img:
+            _grp[current] = {"first": msg.message_id, "mids": [msg.message_id]}
+        elif _grp.get(current):
+            _grp[current]["mids"].append(msg.message_id)
         await save_quiz_index(year)
         # Track this poll so we know once it's stopped (only then is the
         # correct answer known — needed before it can be delivered as a
@@ -7974,6 +8459,14 @@ async def handle_quiz_channel_message(update: Update, context: ContextTypes.DEFA
     if not msg.text:
         return
     text = msg.text.strip()
+
+    if text == ".":
+        current = QUIZ_STATE[year].get("current_lecture")
+        if current and current in QUIZ_INDEX[year]:
+            group = QUIZ_OPEN_ATTACH_GROUP[year].pop(current, None)
+            if _link_group_attachments(QUIZ_INDEX[year][current], group):
+                await save_quiz_index(year)
+        return
 
     if text.upper() in ("-END", "-FIN"):
         is_fin = text.upper() == "-FIN"
@@ -8019,6 +8512,7 @@ async def handle_quiz_channel_message(update: Update, context: ContextTypes.DEFA
         await save_quiz_state(year)
         QUIZ_INSERT_AFTER[year].pop(current, None)   # done editing (if this was an /edit_quiz re-open)
         QUIZ_PENDING_POLL_IMAGE[year].pop(current, None)   # any unclaimed image dies with the lecture
+        QUIZ_OPEN_ATTACH_GROUP[year].pop(current, None)
 
         # Batched now, once, instead of one reaction call per question:
         # mark every still-open (forgot to Stop Poll) question in this
@@ -8055,10 +8549,11 @@ async def handle_quiz_channel_message(update: Update, context: ContextTypes.DEFA
     # ── Written question ("w: ...") — unscored reference content, not a
     # poll. Checked before lecture-title parsing so it's never mistaken
     # for (and rejected as) a malformed lecture name. ──────────────────
-    written = parse_spoiler_written_message(msg)
-    if written is None:
+    raw_written = extract_spoiler_message_raw(msg)   # ANY spoiler = written, kept as sent
+    written = None
+    if raw_written is None:
         written = parse_written_channel_block(text)
-    if written:
+    if raw_written or written:
         current = QUIZ_STATE[year].get("current_lecture")
         if not current or current not in QUIZ_INDEX[year]:
             await context.bot.send_message(
@@ -8066,7 +8561,10 @@ async def handle_quiz_channel_message(update: Update, context: ContextTypes.DEFA
                 "⚠️ محتاج تبعت اسم المحاضرة الأول (أي رسالة نصية) قبل ما تبعت أسئلة مكتوبة."
             )
             return
-        title, content = written
+        if raw_written:
+            title, content = raw_written["title"], raw_written["content"]
+        else:
+            title, content = written
         # If an image was posted just before this "w:" text (same pattern
         # as an image posted before a poll question — see the msg.photo
         # branch above and _deliver_next_lecture_question), claim it for
@@ -8074,9 +8572,10 @@ async def handle_quiz_channel_message(update: Update, context: ContextTypes.DEFA
         # QUIZ_PENDING_POLL_IMAGE, where it would either get wrongly
         # attached to whatever poll comes next or die unclaimed at -END.
         pending_img = QUIZ_PENDING_POLL_IMAGE[year].pop(current, None)
-        QUIZ_INDEX[year][current].setdefault("written", []).append({
-            "id": msg.message_id, "title": title, "content": content, "image": pending_img,
-        })
+        w_new = {"id": msg.message_id, "title": title, "content": content, "image": pending_img}
+        if raw_written:
+            w_new["text"], w_new["entities"] = raw_written["text"], raw_written["entities"]
+        QUIZ_INDEX[year][current].setdefault("written", []).append(w_new)
         await save_quiz_index(year)
         return
 
@@ -8194,8 +8693,21 @@ async def time_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.HTML,
     )
 
+DQ_PICK: dict = {}          # admin uid -> {"year","module","items":[(subject, lecture_key)],"sel":set(lecture_key),"page"}
+DQ_PICK_PAGE_SIZE = 15
+
+def _daily_scope_summary(year: str) -> str:
+    scope = get_daily_quiz_scope(year)
+    if scope:
+        n = len(scope.get("lectures") or [])
+        tail = f" · {n} محاضرة محددة" if n else " · كل محاضرات الموديول"
+        return f"{html.escape(scope['module'])}{tail}"
+    default = DAILY_QUIZ_ACTIVE_MODULE.get(year)
+    return f"{html.escape(default)} (الافتراضي)" if default else "كل المنهج (الافتراضي)"
+
 def _daily_module_view() -> tuple[str | None, InlineKeyboardMarkup | None]:
-    """Builds the /daily_module picker screen. Shared by daily_module_cmd
+    """Builds the /daily_module screen: one button per configured year/uni
+    (each year has its OWN Daily Quiz scope). Shared by daily_module_cmd
     and the Dev Panel's 📆 Daily Module button. Returns (None, None) if
     there are no configured years to pick from — callers show their own
     'nothing configured' message in that case, since one replies fresh
@@ -8203,13 +8715,56 @@ def _daily_module_view() -> tuple[str | None, InlineKeyboardMarkup | None]:
     years = configured_years()
     if not years:
         return None, None
-    scope = get_daily_quiz_scope()
-    current = f"\n\nدلوقتي محدد: {year_label(scope['year'])} — {scope['module']}" if scope else "\n\nدلوقتي: كل المنهج (مفيش تحديد)"
-    buttons = [[InlineKeyboardButton(year_label(y), callback_data=f"dqy:{y}")] for y in years]
-    if scope:
-        buttons.append([InlineKeyboardButton("🔓 شيل التحديد (رجّع كل المنهج)", callback_data="dq_scope_off")])
-    text = f"📚 <b>Daily Quiz — اختار الموديول اللي هيتحدد عليه:</b>{current}"
-    return text, InlineKeyboardMarkup(buttons)
+    lines = ["📚 <b>Daily Quiz — اختار السنة اللي عايز تظبط الـ scope بتاعها:</b>", ""]
+    buttons = []
+    for y in years:
+        uni = UNIVERSITIES.get(year_university(y), "")
+        lines.append(f"• {uni} {year_label(y)}: {_daily_scope_summary(y)}")
+        buttons.append([InlineKeyboardButton(
+            f"{'🎯 ' if get_daily_quiz_scope(y) else ''}{uni} {year_label(y)}", callback_data=f"dqy:{y}")])
+    return "\n".join(lines), InlineKeyboardMarkup(buttons)
+
+def _dq_pick_items(year: str, module: str) -> list:
+    """[(subject, lecture_key), ...] — every READY lecture of the module, in curriculum order."""
+    return [
+        (subject, key)
+        for subject in ready_subjects(year, module)
+        for key in ready_lecture_keys(year, module, subject)
+    ]
+
+def _dq_pick_view(uid: int):
+    st = DQ_PICK.get(uid)
+    if not st:
+        return "⚠️ الجلسة انتهت — افتح /daily_module تاني.", None
+    year, module, items, sel = st["year"], st["module"], st["items"], st["sel"]
+    pages = max(1, -(-len(items) // DQ_PICK_PAGE_SIZE))
+    page = max(0, min(st.get("page", 0), pages - 1))
+    st["page"] = page
+    rows = []
+    for j in range(page * DQ_PICK_PAGE_SIZE, min(len(items), (page + 1) * DQ_PICK_PAGE_SIZE)):
+        subject, key = items[j]
+        entry = QUIZ_INDEX[year].get(key, {})
+        label = f"{'✅' if key in sel else '▫️'} {subject} — L{entry.get('lecture_number') or j + 1}: {entry.get('name', key)}"
+        rows.append([InlineKeyboardButton(label[:60], callback_data=f"dql:{year}:{j}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"dqlp:{year}:{page - 1}"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"dqlp:{year}:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    all_picked = bool(items) and len(sel) == len(items)
+    rows.append([InlineKeyboardButton("🧹 مسح الكل" if all_picked else "☑️ اختار الكل", callback_data=f"dqla:{year}")])
+    rows.append([InlineKeyboardButton(f"💾 حفظ ({len(sel)})", callback_data=f"dqsave:{year}")])
+    rows.append([InlineKeyboardButton("📚 كل محاضرات الموديول", callback_data=f"dqmall:{year}")])
+    rows.append([InlineKeyboardButton("🔙 رجوع", callback_data=f"dqy:{year}")])
+    text = (
+        f"🎯 <b>{year_label(year)} — {html.escape(module_label(module))}</b>\n"
+        f"اختار المحاضرات اللي الـ Daily Quiz هيسحب منها بس ({len(sel)}/{len(items)})."
+        + (f"\nصفحة {page + 1}/{pages}" if pages > 1 else "")
+        + ("\n\n📭 مفيش محاضرات جاهزة في الموديول ده." if not items else "")
+    )
+    return text, InlineKeyboardMarkup(rows)
 
 async def daily_module_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin: pick a year, then a module, to temporarily override that
@@ -8375,10 +8930,12 @@ async def add_lecture_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #                 "image": {"file_id","spoiler"}|None, "case": str|None}
 EVENTS: dict = {}
 AWAITING_EVENT_NAME: dict = {}   # admin uid -> True while waiting for the typed event name
-EVENT_PICK: dict = {}            # admin uid -> {"name"} while choosing uni / year
+AWAITING_EVENT_DESC: dict = {}   # admin uid -> True while waiting for the event description
+EVENT_PICK: dict = {}            # admin uid -> {"name","description"} while choosing uni / year
 EVENT_AUTHORING: dict = {}       # admin uid -> {"year","pending_image","pending_case_study","status_message_id"}
 EVENT_SESSIONS: dict = {}        # user uid -> in-flight event run (RAM only)
 EVENT_NAME_MAX_LEN = 40
+EVENT_DESC_MAX_LEN = 1500   # raw characters; the preview screen must stay under Telegram's 4096 limit
 EVENT_STATUS_DELAY = 1.5
 _event_status_gen: dict = {}
 _event_status_locks: dict = {}
@@ -8391,8 +8948,7 @@ def _event_admin_years(uid: int) -> list:
     return years
 
 def _event_green_button(text: str, callback_data: str) -> InlineKeyboardButton:
-    """Telegram's native green button style (Bot API `style: success`); the
-    leading 🟢 in `text` is the fallback for clients that ignore it."""
+    """Telegram's native green button style (Bot API `style: success`)."""
     try:
         return InlineKeyboardButton(text, callback_data=callback_data, api_kwargs={"style": "success"})
     except TypeError:
@@ -8406,7 +8962,7 @@ def _event_menu_row(user_id):
     ev = EVENTS.get(year) if year else None
     if not ev or not ev.get("live") or not ev.get("questions"):
         return None
-    return [_event_green_button(f"🟢 {ev['name']}", f"evtu_open:{year}")]
+    return [_event_green_button(ev['name'], f"evtu_open:{year}")]
 
 def _event_status_markup(au: dict | None = None):
     if au and au.get("editing"):
@@ -8435,6 +8991,7 @@ async def event_start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     EVENT_PICK.pop(uid, None)
     AWAITING_EVENT_EDIT.pop(uid, None)
+    AWAITING_EVENT_DESC.pop(uid, None)
     AWAITING_EVENT_NAME[uid] = True
     await update.message.reply_text(
         "🎉 <b>Event Start</b>\n\n"
@@ -8469,6 +9026,7 @@ async def _event_begin(context, uid: int, year: str, send) -> None:
         await send("⚠️ الجلسة انتهت — ابدأ من /event_start تاني.")
         return
     name = pick["name"]
+    description = pick.get("description")
     ev = EVENTS.get(year)
     if ev and ev.get("live"):
         await send(
@@ -8479,11 +9037,13 @@ async def _event_begin(context, uid: int, year: str, send) -> None:
     resumed = bool(ev and ev.get("questions"))
     if ev:
         ev["name"] = name   # unpublished draft left over — reopen it under the new name
+        ev["description"] = description
     else:
         ev = EVENTS[year] = {
-            "name": name, "live": False, "created_by": uid,
+            "name": name, "description": description, "live": False, "created_by": uid,
             "created_at": time.time(), "questions": [], "results": {},
         }
+    _event_uid(ev)
     EVENT_AUTHORING[uid] = {"year": year, "pending_image": None, "pending_case_study": None, "status_message_id": None}
     uni_name = UNIVERSITIES.get(year_university(year), "")
     resume_note = f"\n♻️ فيه {len(ev['questions'])} سؤال محفوظين من قبل — هيتضافوا عليهم." if resumed else ""
@@ -8491,6 +9051,7 @@ async def _event_begin(context, uid: int, year: str, send) -> None:
         f"🎉 <b>{html.escape(name)}</b> — {uni_name} {year_label(year)}{resume_note}\n\n"
         "دلوقتي فوروارد الأسئلة (Quiz polls) واحد واحد بعد ما تشيل اسم المرسل (Hide Sender's Name).\n"
         "لو عايز صورة أو Case study (نص) لسؤال، ابعتها الأول وبعدين فوروارد السؤال.\n"
+        "أي رسالة فيها Spoiler بتتسجل كسؤال مكتوب زي ما هي، والباقي (من غير Spoiler) بيتسجل Case study.\n"
         "لما تخلص دوس 🚀 Publish Event (أو ابعت -END) وهيظهر للطلبة."
     )
 
@@ -8519,6 +9080,33 @@ async def _event_refresh_status(context, uid: int, au: dict) -> None:
             parse_mode=ParseMode.HTML, reply_markup=_event_status_markup(au),
         )
         au["status_message_id"] = sent.message_id
+
+async def _dot_link_event(update: Update, au: dict) -> None:
+    """A lone "." in /event_start authoring: share the last case / image with
+    every poll forwarded since it. Each follow-up gets its own copy (so it
+    still shows the case when drawn alone) tagged with a shared
+    "case_group", which delivery uses to show a text case only once in a row."""
+    group = au.pop("open_group", None)
+    ev = EVENTS.get(au["year"])
+    qids = list((group or {}).get("qids") or [])
+    by_id = {q.get("id"): q for q in (ev["questions"] if ev else [])}
+    first = by_id.get(qids[0]) if qids else None
+    followers = [by_id[i] for i in qids[1:] if i in by_id]
+    if not first or not followers:
+        await update.message.reply_text("ℹ️ مفيش أسئلة متابعة بعد الـ Case/الصورة دي عشان أربطها.")
+        return
+    first["case_group"] = first["id"]
+    for q in followers:
+        if first.get("case"):
+            q["case"] = first["case"]
+            if first.get("case_entities"):
+                q["case_entities"] = first["case_entities"]
+            else:
+                q.pop("case_entities", None)
+        if first.get("image"):
+            q["image"] = dict(first["image"])
+        q["case_group"] = first["id"]
+    await update.message.reply_text(f"🔗 اتربط الـ Case/الصورة بـ {len(followers) + 1} أسئلة (السؤال الأول + {len(followers)} متابعة).")
 
 async def _event_capture_poll(update: Update, context: ContextTypes.DEFAULT_TYPE, uid: int, au: dict) -> None:
     msg, poll = update.message, update.message.poll
@@ -8549,6 +9137,17 @@ async def _event_capture_poll(update: Update, context: ContextTypes.DEFAULT_TYPE
         "image":       {"file_id": img["file_id"], "spoiler": bool(img.get("spoiler"))} if img else None,
         "case":        case["content"] if case else None,
     }
+    if case and case.get("entities"):
+        new_q["case_entities"] = case["entities"]
+    if au.get("pending_written"):
+        new_q["written"] = au.pop("pending_written")   # sent right before this poll
+    # "." grouping: a poll that claimed a case/image opens a group; later
+    # polls with no attachment of their own join it until a "." links them
+    # (see _dot_link_event). No "." = the attachment stays on that one poll.
+    if case or img:
+        au["open_group"] = {"first": new_q["id"], "qids": [new_q["id"]]}
+    elif au.get("open_group"):
+        au["open_group"]["qids"].append(new_q["id"])
     after = au.get("insert_after")
     pos, _anchor = _event_find(ev, after) if after is not None else (None, None)
     if pos is not None:
@@ -8565,6 +9164,8 @@ async def _event_publish(context, uid: int, au: dict):
     if not ev:
         EVENT_AUTHORING.pop(uid, None)
         return None, "⚠️ الـ Event ده اتشال من حتة تانية."
+    if au.get("pending_written"):   # written questions sent after the last poll go at the very end
+        ev.setdefault("written_end", []).extend(au.pop("pending_written"))
     if au.get("editing"):   # /edit_event add/insert session — just close it, publish state untouched
         EVENT_AUTHORING.pop(uid, None)
         await _flush_sessions_if_changed()
@@ -8581,6 +9182,7 @@ async def _event_publish(context, uid: int, au: dict):
     EVENT_AUTHORING.pop(uid, None)
     await _flush_sessions_if_changed()
     await backup_sessions_to_channel(context, force=True)
+    await admin_log(context, "🚀 Event published", f"🎉 {html.escape(ev['name'])} — {UNIVERSITIES.get(year_university(au['year']), '')} {year_label(au['year'])} · {len(ev['questions'])} سؤال", uid)
     return (
         f"🚀 <b>{html.escape(ev['name'])}</b> اتنشر — {len(ev['questions'])} سؤال.\n"
         f"زرار أخضر ظهر في أول القايمة الرئيسية لكل يوزرز {UNIVERSITIES.get(year_university(au['year']), '')} {year_label(au['year'])}.\n"
@@ -8703,6 +9305,7 @@ async def _event_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
                 EVENT_AUTHORING.pop(aid, None)
         await _flush_sessions_if_changed()
         await backup_sessions_to_channel(context, force=True)
+        await admin_log(context, "🏁 Event ended", f"🎉 {html.escape(ev['name'])} — {year_label(year)}\n{_event_results_summary(ev)}", uid)
         await send(f"🏁 اتقفل <b>{html.escape(ev['name'])}</b>.\n\n{_event_results_summary(ev)}")
         return
 
@@ -8715,18 +9318,41 @@ async def _event_send_next(context, user_id: int, s: dict) -> bool:
     questions = ev["questions"]
     while s["queue"]:
         idx = s["queue"].pop(0)
+        if isinstance(idx, dict) and idx.get("type") == "written":
+            # Same flow as lectures: "WRITTEN" header once per run, then ONE written
+            # question, then wait for the user's ❤️ (handle_message_reaction).
+            if not s.get("written_header_sent"):
+                try:
+                    await context.bot.send_message(chat_id=user_id, text=WRITTEN_HEADER_TEXT, parse_mode=ParseMode.HTML)
+                except Exception as e:
+                    print(f"EVENT: couldn't send WRITTEN header to {user_id}: {e}")
+                s["written_header_sent"] = True
+            sent_w = await _deliver_written_item(context, user_id, idx["data"], gated=True)
+            if sent_w is None:
+                continue
+            s["written_pending_msg"] = sent_w.message_id
+            s["current_poll_id"] = None
+            s["current_correct_id"] = None
+            s["current_option_count"] = None
+            return True
         q = next((x for x in questions if x.get("id") == idx), None)   # queue holds stable ids
         if q is None:
             continue   # deleted by an admin since this run started
         s["delivered"] += 1
-        if q.get("case"):
+        _ck = _case_dedupe_key(q.get("case_group"), q.get("case"))
+        _case_seen = _ck is not None and s.get("last_case_group") == _ck
+        s["last_case_group"] = _ck
+        if q.get("case") and not _case_seen:
             try:
-                await context.bot.send_message(chat_id=user_id, text=html.escape(q["case"]), parse_mode=ParseMode.HTML)
+                await _send_case_study(context, user_id, q["case"], q.get("case_entities"))
             except Exception as e:
                 print(f"EVENT: couldn't send case study (user {user_id}): {e}")
+        ev_options, ev_correct = list(q["options"]), q["correct"]
+        if get_randomize_enabled(user_id):
+            ev_options, ev_correct, _ = _shuffle_poll_options(q["options"], q["correct"])
         kwargs = dict(
             chat_id=user_id, question=_numbered_question(q["question"], s["delivered"]),
-            options=q["options"], type="quiz", correct_option_id=q["correct"],
+            options=ev_options, type="quiz", correct_option_id=ev_correct,
             is_anonymous=False, explanation=(q.get("explanation") or None),
         )
         _with_poll_description(kwargs, q.get("description"))
@@ -8745,8 +9371,9 @@ async def _event_send_next(context, user_id: int, s: dict) -> bool:
             print(f"EVENT: couldn't send question {idx} to {user_id}: {e}")
             s["delivered"] -= 1
             continue
+        s["written_header_sent"]  = False   # a poll ends any written run
         s["current_poll_id"]      = msg.poll.id
-        s["current_correct_id"]   = q["correct"]
+        s["current_correct_id"]   = ev_correct
         s["current_option_count"] = len(q["options"])
         return True
     s["current_poll_id"] = None
@@ -8766,15 +9393,41 @@ async def _event_advance(context, user_id: int, s: dict, is_correct: bool) -> No
             pass
         return
     if await _event_send_next(context, user_id, s):
+        if s.get("written_pending_msg") is not None and not _event_polls_left(s):
+            _event_save_result(ev, user_id, s)   # all polls answered — only written ones left; summary waits for them
         return
-    EVENT_SESSIONS.pop(user_id, None)
-    total, correct = s["total"], s["correct"]
-    pct = round(correct / s["answered"] * 100) if s["answered"] else 0
+    await _event_finish(context, user_id, s, ev)
+
+def _event_polls_left(s: dict) -> bool:
+    return any(not isinstance(x, dict) for x in s.get("queue", []))
+
+def _event_save_result(ev: dict, user_id: int, s: dict) -> None:
+    if s.get("result_saved"):
+        return
+    s["result_saved"] = True
+    correct = s["correct"]
     prev = ev.setdefault("results", {}).get(str(user_id))
     if prev is None or correct > prev.get("correct", 0):
         ev["results"][str(user_id)] = {
-            "correct": correct, "answered": s["answered"], "total": total, "name": get_nickname(user_id),
+            "correct": correct, "answered": s["answered"], "total": s["total"], "name": get_nickname(user_id),
         }
+
+async def _event_proceed_after_written(context, user_id: int, s: dict) -> None:
+    """❤️ on the written question an event run was waiting on."""
+    s["written_pending_msg"] = None
+    if await _event_send_next(context, user_id, s):
+        return
+    ev = EVENTS.get(s["year"])
+    if not ev:
+        EVENT_SESSIONS.pop(user_id, None)
+        return
+    await _event_finish(context, user_id, s, ev)
+
+async def _event_finish(context, user_id: int, s: dict, ev: dict) -> None:
+    EVENT_SESSIONS.pop(user_id, None)
+    total, correct = s["total"], s["correct"]
+    pct = round(correct / s["answered"] * 100) if s["answered"] else 0
+    _event_save_result(ev, user_id, s)
     try:
         await context.bot.send_message(
             chat_id=user_id, parse_mode=ParseMode.HTML,
@@ -8788,11 +9441,79 @@ async def _event_advance(context, user_id: int, s: dict, is_correct: bool) -> No
     except Exception:
         pass
 
+def _event_uid(ev: dict) -> str:
+    """Stable random id for one event (assigned lazily for older events) —
+    what its quick link carries, so a link made for one event never opens a
+    later event that reuses the same year."""
+    uid = ev.get("uid")
+    if not (isinstance(uid, str) and uid):
+        uid = ev["uid"] = secrets.token_hex(4)
+    return uid
+
+def _event_quicklink_payload(year: str, ev: dict) -> str:
+    return f"E_{year}_{_event_uid(ev)}"
+
+def _event_preview_view(year: str, user_id: int, uid: str | None = None):
+    """The event preview screen (description + ▶️ Start / ❌ Cancel / 🔗 Quick
+    link), same layout as the lecture preview in /quiz. Shared by the main-menu
+    button and the quick-link /start deep link. `uid`, when given, must match
+    the live event's uid (quick links)."""
+    home = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")]])
+    ev = EVENTS.get(year)
+    if (not ev or not ev.get("live") or not ev.get("questions") or get_year_class(user_id) != year
+            or (uid is not None and _event_uid(ev) != uid)):
+        return "⚠️ الـ Event ده خلص أو مش متاح ليك.", home
+    lines = [
+        quizzy_block(QUIZZY_READY_ART, "CHALLENGE YOURSELF!"),
+        "",
+        f"🎉 <b>{html.escape(ev['name'])}</b>",
+    ]
+    if ev.get("description"):
+        lines += ["", ev["description"]]   # stored as Telegram-HTML (formatting kept)
+    lines += ["", f"📝 {len(ev['questions'])} سؤال"]
+    buttons = [
+        [InlineKeyboardButton("▶️ ابدأ", callback_data=f"evtu_go:{year}")],
+        [InlineKeyboardButton("❌ إلغاء", callback_data="back_home")],
+        [InlineKeyboardButton("🔗 لينك سريع", callback_data=f"evtu_link:{year}")],
+    ]
+    return "\n".join(lines), InlineKeyboardMarkup(buttons)
+
+def _event_quicklink_preview(payload: str, user_id: int):
+    """None if `payload` isn't an event quick-link ("E_<year>_<uid>");
+    otherwise the (text, markup) preview screen."""
+    parts = (payload or "").split("_")
+    if len(parts) != 3 or parts[0] != "E" or parts[1] not in YEARS or not parts[2].isalnum():
+        return None
+    return _event_preview_view(parts[1], user_id, parts[2])
+
 async def _event_user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, query) -> None:
     uid = query.from_user.id
-    if not query.data.startswith("evtu_open:"):
+    action, _, year = query.data.partition(":")
+    if action == "evtu_open":
+        text, markup = _event_preview_view(year, uid)
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
         return
-    year = query.data.split(":", 1)[1]
+    if action == "evtu_link":
+        ev = EVENTS.get(year)
+        if not ev or not ev.get("live") or get_year_class(uid) != year:
+            await context.bot.send_message(chat_id=uid, text="⚠️ الـ Event ده خلص أو مش متاح ليك.")
+            return
+        me = await context.bot.get_me()
+        link = f"https://t.me/{me.username}?start={_event_quicklink_payload(year, ev)}"
+        await _flush_sessions_if_changed()   # the uid may have just been assigned
+        await context.bot.send_message(
+            chat_id=uid,
+            text=(
+                "🔗 <b>لينك سريع للـ Event ده:</b>\n"
+                f"{link}\n\n"
+                "أي حد يدوس عليه هيوديه على طول للـ Event، وهيلاقي زرار ▶️ ابدأ و❌ إلغاء. "
+                "اللينك بيشتغل لحد ما الـ Event يتقفل."
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if action != "evtu_go":
+        return
     ev = EVENTS.get(year)
     if not ev or not ev.get("live") or not ev.get("questions") or get_year_class(uid) != year:
         await query.edit_message_text(
@@ -8801,16 +9522,23 @@ async def _event_user_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
     _event_ensure_ids(ev)
-    queue = [q["id"] for q in ev["questions"]]
-    if get_randomize_enabled(uid):
-        random.shuffle(queue)
+    # Always authoring order (Randomize only shuffles choices). Written questions
+    # sit in the queue as dict items right where they were authored.
+    queue = []
+    for _q in ev["questions"]:
+        for _w in (_q.get("written") or []):
+            queue.append({"type": "written", "data": _w})
+        queue.append(_q["id"])
+    for _w in (ev.get("written_end") or []):
+        queue.append({"type": "written", "data": _w})
+    n_polls = len(ev["questions"])
     s = {
-        "year": year, "queue": queue, "total": len(queue), "answered": 0, "correct": 0, "delivered": 0,
+        "year": year, "queue": queue, "total": n_polls, "answered": 0, "correct": 0, "delivered": 0,
         "current_poll_id": None, "current_correct_id": None, "current_option_count": None,
     }
     EVENT_SESSIONS[uid] = s
     await query.edit_message_text(
-        f"🎉 <b>{html.escape(ev['name'])}</b> — {len(queue)} سؤال، هيتبعتولك واحد واحد 👇",
+        f"🎉 <b>{html.escape(ev['name'])}</b> — {n_polls} سؤال، هيتبعتولك واحد واحد 👇",
         parse_mode=ParseMode.HTML,
     )
     if not await _event_send_next(context, uid, s):
@@ -8868,6 +9596,8 @@ def _event_q_text(ev: dict, q: dict, pos: int) -> str:
         att.append("📝 Case study")
     if q.get("image"):
         att.append("🖼 صورة")
+    if q.get("written"):
+        att.append(f"✍️ {len(q['written'])} written (قبله)")
     expl = f"\n💬 {html.escape(q['explanation'])}" if q.get("explanation") else ""
     return (
         f"✏️ <b>{html.escape(ev['name'])}</b> — سؤال {pos + 1}/{len(ev['questions'])}\n\n"
@@ -8902,6 +9632,7 @@ def _event_menu_view(year: str, ev: dict):
          InlineKeyboardButton("🔎 Search", callback_data=f"evta_srch:{year}")],
         [InlineKeyboardButton("➕ Add questions", callback_data=f"evta_add:{year}"),
          InlineKeyboardButton("✏️ Rename", callback_data=f"evta_ren:{year}")],
+        [InlineKeyboardButton("📝 Description", callback_data=f"evta_dsc:{year}")],
     ]
     if not ev.get("live") and n:
         rows.append([InlineKeyboardButton("🚀 Publish", callback_data=f"evta_pubd:{year}")])
@@ -8969,7 +9700,7 @@ async def _event_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     cmd = parts[0]
     if cmd not in {
         "evta_el", "evta_ev", "evta_ql", "evta_qs", "evta_ed", "evta_edc", "evta_edp", "evta_rm",
-        "evta_qd", "evta_qdok", "evta_ins", "evta_add", "evta_ren", "evta_srch", "evta_pubd",
+        "evta_qd", "evta_qdok", "evta_ins", "evta_add", "evta_ren", "evta_dsc", "evta_srch", "evta_pubd",
     }:
         return False
 
@@ -9072,6 +9803,7 @@ async def _event_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         _, q = _event_find(ev, qid)
         if q is not None:
             q["case"], q["image"] = None, None
+            q.pop("case_entities", None)
             await _event_persist(context)
         await show_q(qid)
         return True
@@ -9131,6 +9863,12 @@ async def _event_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                    InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"evta_ev:{year}")]]))
         return True
 
+    if cmd == "evta_dsc":
+        AWAITING_EVENT_EDIT[uid] = {"kind": "desc", "year": year, "qid": None}
+        await send(f"📝 ابعت الوصف الجديد (لحد {EVENT_DESC_MAX_LEN} حرف) — التنسيق هيتحفظ:",
+                   InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"evta_ev:{year}")]]))
+        return True
+
     if cmd == "evta_srch":
         AWAITING_EVENT_EDIT[uid] = {"kind": "search", "year": year, "qid": None}
         await send("🔎 ابعت كلمة أدور بيها في الأسئلة والاختيارات:",
@@ -9145,6 +9883,7 @@ async def _event_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         ev["live"], ev["published_at"] = True, time.time()
         await _flush_sessions_if_changed()
         await backup_sessions_to_channel(context, force=True)
+        await admin_log(context, "🚀 Event published", f"🎉 {html.escape(ev['name'])} — {year_label(year)} · {len(ev['questions'])} سؤال", uid)
         text, markup = _event_menu_view(year, ev)
         await send("🚀 اتنشر!\n\n" + text, markup)
         return True
@@ -9172,6 +9911,17 @@ async def _event_apply_text_edit(update: Update, context: ContextTypes.DEFAULT_T
             await reply(f"⚠️ الاسم لازم يكون من 1 لـ {EVENT_NAME_MAX_LEN} حرف — ابعته تاني.")
             return
         ev["name"] = name
+        await _event_persist(context)
+        await back_to_event()
+        return
+
+    if kind == "desc":
+        raw = (update.message.text or "").strip()
+        if not raw or len(raw) > EVENT_DESC_MAX_LEN:
+            AWAITING_EVENT_EDIT[uid] = ee
+            await reply(f"⚠️ الوصف لازم يكون من 1 لـ {EVENT_DESC_MAX_LEN} حرف — ابعته تاني.")
+            return
+        ev["description"] = _entities_to_html(update.message.text, update.message.entities).strip()
         await _event_persist(context)
         await back_to_event()
         return
@@ -9219,7 +9969,12 @@ async def _event_apply_text_edit(update: Update, context: ContextTypes.DEFAULT_T
             AWAITING_EVENT_EDIT[uid] = ee
             await reply("⚠️ النص لازم يكون من 1 لـ 4000 حرف — ابعته تاني.")
             return
-        q["case"] = new
+        _rich_edit = _msg_rich(update.message)
+        if _rich_edit["entities"] and len(_rich_edit["text"]) <= 4000:
+            q["case"], q["case_entities"] = _rich_edit["text"], _rich_edit["entities"]
+        else:
+            q["case"] = new
+            q.pop("case_entities", None)
     elif kind == "i":
         AWAITING_EVENT_EDIT[uid] = ee
         await reply("🖼 مستني صورة مش نص — ابعت الصورة، أو دوس Cancel.")
@@ -9291,6 +10046,25 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             AWAITING_EVENT_NAME.pop(real_uid, None)
             EVENT_PICK[real_uid] = {"name": ev_name}
+            AWAITING_EVENT_DESC[real_uid] = True
+            await update.message.reply_text(
+                "📝 دلوقتي ابعت <b>وصف الـ Event</b> — هيظهر للطلبة قبل زراير ابدأ / إلغاء / لينك سريع.\n"
+                "التنسيق (Bold / Italic / Spoiler / لينكات...) هيتحفظ زي ما بعتّه.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+    # ── /event_start: waiting on the event description ───────────────
+    if AWAITING_EVENT_DESC.get(real_uid):
+        if not is_admin(update) or real_uid not in EVENT_PICK:
+            AWAITING_EVENT_DESC.pop(real_uid, None)
+        else:
+            raw_desc = (update.message.text or "").strip()
+            if not raw_desc or len(raw_desc) > EVENT_DESC_MAX_LEN:
+                await update.message.reply_text(f"⚠️ الوصف لازم يكون من 1 لـ {EVENT_DESC_MAX_LEN} حرف — ابعته تاني.")
+                return
+            AWAITING_EVENT_DESC.pop(real_uid, None)
+            EVENT_PICK[real_uid]["description"] = _entities_to_html(update.message.text, update.message.entities).strip()
             await _event_pick_step(
                 context, real_uid, None,
                 lambda t, m=None: update.message.reply_text(t, parse_mode=ParseMode.HTML, reply_markup=m),
@@ -9313,9 +10087,30 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     pass
             await update.message.reply_text(err or summary, parse_mode=ParseMode.HTML)
             return
+        if text.strip() == ".":
+            await _add_lecture_enqueue(
+                real_uid, ev_au, update.message.message_id,
+                lambda: _dot_link_event(update, ev_au),
+            )
+            return
+        raw_ev_written = extract_spoiler_message_raw(update.message)
+        if raw_ev_written:
+            async def _stage_event_written():
+                ev_au.setdefault("pending_written", []).append({
+                    "id": update.message.message_id, "title": raw_ev_written["title"],
+                    "content": raw_ev_written["content"], "image": None,
+                    "text": raw_ev_written["text"], "entities": raw_ev_written["entities"],
+                })
+                await update.message.reply_text("✍️ اتسجل السؤال المكتوب — هيتبعت قبل أول سؤال (Quiz poll) تفورورده دلوقتي.")
+            await _add_lecture_enqueue(real_uid, ev_au, update.message.message_id, _stage_event_written)
+            return
         if len(text) >= ADD_LECTURE_CASE_STUDY_MIN_LEN:
             async def _stage_event_case():
-                ev_au["pending_case_study"] = {"content": text}
+                _rich_ev_cs = _msg_rich(update.message)
+                ev_au["pending_case_study"] = (
+                    {"content": _rich_ev_cs["text"], "entities": _rich_ev_cs["entities"]}
+                    if _rich_ev_cs["entities"] else {"content": text}
+                )
                 await update.message.reply_text("📝 اتسجل الـ Case study — هيترتبط بأول سؤال (Quiz poll) تفورورده دلوقتي.")
             await _add_lecture_enqueue(real_uid, ev_au, update.message.message_id, _stage_event_case)
             return
@@ -9341,13 +10136,23 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(err or summary, parse_mode=ParseMode.HTML)
             return
 
-        auto_written = parse_spoiler_written_message(update.message)
-        if auto_written:
-            title, content = auto_written
+        if text.strip() == ".":
+            await _add_lecture_enqueue(
+                real_uid, al_state, update.message.message_id,
+                lambda: _dot_link_add_lecture(update, al_state),
+            )
+            return
+
+        # A spoiler anywhere in the message = a written question, ALWAYS, kept
+        # exactly as sent/forwarded (formatting included). No spoiler -> falls
+        # through to the case-study handling below.
+        raw_written = extract_spoiler_message_raw(update.message)
+        if raw_written:
             await _add_lecture_enqueue(
                 real_uid, al_state, update.message.message_id,
                 lambda: _capture_add_lecture_written(
-                    context, real_uid, al_state, title, content, update.message.message_id
+                    context, real_uid, al_state, raw_written["title"], raw_written["content"],
+                    update.message.message_id, raw=raw_written,
                 ),
             )
             return
@@ -9365,7 +10170,11 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "\n⚠️ ده استبدل الـ Case study اللي بعتهولك قبل كده — ده كان لسه معلق ومربوطش بسؤال."
                     if al_state.get("pending_case_study") else ""
                 )
-                al_state["pending_case_study"] = {"content": text}
+                _rich_cs = _msg_rich(update.message)
+                al_state["pending_case_study"] = (
+                    {"content": _rich_cs["text"], "entities": _rich_cs["entities"]}
+                    if _rich_cs["entities"] else {"content": text}
+                )
                 await update.message.reply_text(
                     f"📝 اتسجل الـ Case study — هيترتبط بأول سؤال (Quiz poll) تفورورده دلوقتي.{replaced_note}",
                     parse_mode=ParseMode.HTML,
@@ -9375,7 +10184,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         await update.message.reply_text(
-            "📚 لسه في محاضرة مفتوحة للإضافة — فوروارد سؤال (Quiz)، أو ابعت سؤال مكتوب وإجابته مخفية بـ Spoiler، "
+            "📚 لسه في محاضرة مفتوحة للإضافة — فوروارد سؤال (Quiz)، أو ابعت سؤال مكتوب وإجابته مخفية بـ Spoiler (أي رسالة فيها Spoiler بتتسجل كسؤال مكتوب زي ما هي)، "
             "أو ابعت صورة/Case study هيترتبط بالسؤال الجاي، أو استخدم زراير End/Cancel Lecture تحت آخر رسالة.",
             parse_mode=ParseMode.HTML,
         )
@@ -9570,14 +10379,15 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if pending_att["kind"] != "case":
             await update.message.reply_text("🖼 مستني صورة مش نص — ابعت الصورة، أو دوس Cancel.")
             return
-        content = text.strip()
-        if not content:
+        _rich_att = _msg_rich(update.message)
+        content = _rich_att["text"] if _rich_att["entities"] else text.strip()
+        if not content.strip():
             return
         if len(content) > 4000:
             await update.message.reply_text("⚠️ النص طويل أوي (أقصى حاجة 4000 حرف) — قصّره وابعته تاني.")
             return
         AWAITING_EQ_ATTACH.pop(real_uid, None)
-        err = await _apply_eq_attach(context, pending_att, text=content)
+        err = await _apply_eq_attach(context, pending_att, text=content, entities=_rich_att["entities"] or None)
         await update.message.reply_text(
             err or "✅ اتسجل الـ Case study — هيظهر قبل السؤال ده.",
             reply_markup=None if err else _eq_att_done_markup(pending_att),
@@ -10211,7 +11021,7 @@ def _eq_att_menu(year: str, mod_idx: int, subj_idx: int, lec_idx: int, mid: int)
     return None, text, InlineKeyboardMarkup(rows)
 
 async def _apply_eq_attach(context: ContextTypes.DEFAULT_TYPE, pending: dict, *, text: str | None = None,
-                           photo=None, spoiler: bool = False) -> str | None:
+                           photo=None, spoiler: bool = False, entities: list | None = None) -> str | None:
     """Saves a case study (text) or image (photo = a Telegram PhotoSize) onto
     the existing question pending["mid"], replacing any earlier one of the
     same kind. Images are reposted into the year's channel first so we keep
@@ -10224,7 +11034,7 @@ async def _apply_eq_attach(context: ContextTypes.DEFAULT_TYPE, pending: dict, *,
         return "⚠️ السؤال ده مش موجود دلوقتي — يمكن اتشال من حتة تانية."
     if text is not None:
         entry["poll_case_studies"] = [c for c in (entry.get("poll_case_studies") or []) if c["mid"] != mid] + [
-            {"mid": mid, "content": text}
+            {"mid": mid, "content": text, **({"entities": entities} if entities else {})}
         ]
     else:
         stored = {"file_id": photo.file_id, "file_unique_id": photo.file_unique_id, "spoiler": spoiler}
@@ -10502,7 +11312,7 @@ BOOKMARKS_PAGE_SIZE = 5
 def _mistakes_bank_menu_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     """Text + keyboard of the 🧠 Mistakes Bank menu. Shared by the menu
     button and the post-clear refresh, so both always look the same."""
-    scope = get_daily_quiz_scope()
+    scope = get_daily_quiz_scope(get_year_class(user_id))
     count = len(_scoped_mistakes_bank(user_id))
     scope_line = f"📚 {year_label(scope['year'])} — {module_label(scope['module'])}\n\n" if scope else ""
     text = f"🧠 <b>بنك الأخطاء</b>\n\n{scope_line}عدد الأسئلة المسجلة: <b>{count}</b>"
@@ -10657,6 +11467,10 @@ def _lecture_quicklink_preview(payload: str, user_id: int):
     if loc is None:
         return "⚠️ المحاضرة دي مش موجودة دلوقتي.", None
     return _lecture_preview_view(year, *loc, user_id)
+
+def _any_quicklink_preview(payload: str, user_id: int):
+    """Event quick-links ("E_...") first, then lecture quick-links."""
+    return _event_quicklink_preview(payload, user_id) or _lecture_quicklink_preview(payload, user_id)
 
 async def _freeze_legacy_lecture_links(app) -> None:
     """Startup, after the quiz restores: (1) give every ready lecture a
@@ -10880,7 +11694,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             BROADCAST_DRAFTS.pop(user_id, None)
             AWAITING_BROADCAST_MESSAGE.pop(user_id, None)
             await query.edit_message_text("📡 بيتجهز للإرسال…")
-            await _send_broadcast(context, query.message, audience, text, recipients, media)
+            await _send_broadcast(context, query.message, audience, text, recipients, media, actor=query.from_user)
             return
 
 
@@ -10972,6 +11786,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await save_settings()
         await backup_settings_to_channel(context)
         label = get_nickname(target_id) or str(target_id)
+        await admin_log(context, "🔢 Set year", f"🎯 {html.escape(label)} (<code>{target_id}</code>) → {year_class_label(yc)}", query.from_user)
         await query.edit_message_text(
             f"✅ اتعدلت سنة <b>{html.escape(label)}</b> لـ {year_class_label(yc)}.",
             parse_mode=ParseMode.HTML,
@@ -10991,6 +11806,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         label, restore_fn = target
         await query.edit_message_text(f"🔄 بيعمل restore لـ {label}…")
         status = await restore_fn(context.application)
+        await admin_log(context, "♻️ Restore", f"📦 {html.escape(label)} — النتيجة: <code>{html.escape(str(status))}</code>", query.from_user)
         if status == "ok":
             await context.bot.send_message(chat_id=user_id, text=f"✅ {label} — تم الـ restore من آخر نسخة مثبتة.")
         elif status == "no_backup":
@@ -11061,6 +11877,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"🆕 بيعمل reset لـ {label}…")
         try:
             await reset_fn(context)
+            await admin_log(context, "🆕 Reset", f"📦 {html.escape(label)} — اتعمله reset لملف فاضي", query.from_user)
             await context.bot.send_message(chat_id=user_id, text=f"✅ {label} — اتعمله reset، وبقى فيه ملف فاضي جديد متثبت في القناة بتاعته.")
         except Exception as e:
             print(f"{label.upper()} RESET ERROR:", e)
@@ -11137,6 +11954,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton(f"🆕 Reset {_RESTORE_TARGETS[k][0]}", callback_data=f"restore_reset:{k}")]
                 for k in no_backup_keys
             ])
+        await admin_log(context, "🛑 Restore — Everything", "\n".join(lines[1:]), query.from_user)
         await context.bot.send_message(
             chat_id=user_id, text="\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=markup,
         )
@@ -11189,6 +12007,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 print(f"{label.upper()} RESET-ALL ERROR:", e)
                 lines.append(f"❌ {label} — فشل الـ reset: {e}")
+        await admin_log(context, "🛑🆕 Reset — Everything", "\n".join(lines[1:]), query.from_user)
         await context.bot.send_message(chat_id=user_id, text="\n".join(lines), parse_mode=ParseMode.HTML)
         return
 
@@ -11622,20 +12441,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        randomize = get_randomize_enabled(user_id)
-        if randomize:
-            ready_ids = list(ready_ids)
-            random.shuffle(ready_ids)
+        # Question order is ALWAYS the order the questions were first added
+        # (ready_ids follows entry["ids"], i.e. posting order). The
+        # Randomize setting only shuffles each question's CHOICES — see
+        # _deliver_next_lecture_question.
 
         # Written (unscored) entries for this lecture — never counted in
         # "total"/"answered"/"correct" (see _deliver_written_item), just
         # extra content mixed into delivery. Governed by its OWN setting
-        # (Mix Written), independent of Randomize (which only controls the
-        # order of the real poll questions): Mix Written ON scatters written
-        # entries at random positions among the polls WITHOUT reshuffling
-        # the polls' own order a second time (that order was already
-        # decided by Randomize just above); OFF (the default) always trails
-        # them at the end, in authoring order, even while Randomize is on —
+        # (Mix Written), independent of Randomize (which only shuffles each
+        # question's choices): Mix Written ON scatters written
+        # entries at random positions among the polls without touching
+        # the polls' own order (always posting order); OFF (the default)
+        # always trails them at the end, in authoring order —
         # see parse_written_channel_block / handle_quiz_channel_message.
         written_items = []
         for w in (entry.get("written") or []):
@@ -13046,7 +13864,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # in PENDING_LECTURE_LINK by start()), drop them into that
         # lecture's preview screen instead of the normal welcome menu.
         pending_payload = PENDING_LECTURE_LINK.pop(user_id, None)
-        preview = _lecture_quicklink_preview(pending_payload, user_id) if pending_payload else None
+        preview = _any_quicklink_preview(pending_payload, user_id) if pending_payload else None
         if preview:
             text, markup = preview
             await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
@@ -13118,7 +13936,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         count = len(_scoped_mistakes_bank(user_id))
         if not count:
             return   # "already empty" toast was shown by _tap_toast
-        scope = get_daily_quiz_scope()
+        scope = get_daily_quiz_scope(get_year_class(user_id))
         scope_line = f"📚 {year_label(scope['year'])} — {module_label(scope['module'])}\n\n" if scope else ""
         await query.edit_message_text(
             f"⚠️ <b>متأكد إنك عايز تمسح بنك الأخطاء بتاعك؟</b>\n\n"
@@ -13184,6 +14002,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             QUIZ_POLL_STATUS[year].pop(pid, None)
         await save_quiz_poll_status(year)
         await backup_quiz_to_channel(context, year)
+        await admin_log(context, "🗑 Lecture deleted", f"📚 {year_label(year)} — {html.escape(str(removed['module']))} - {html.escape(str(removed['subject']))}: {html.escape(str(removed['name']))}", query.from_user)
         await query.edit_message_text(
             f"🗑 اتشالت محاضرة من {year_label(year)}: {removed['module']} - {removed['subject']}: {removed['name']}\n"
             "(الرسايل نفسها لسه موجودة في القناة — احذفهم يدوي لو عايز)"
@@ -13213,6 +14032,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
         _analytics_backup_msg_id = None
+        await admin_log(context, "🗑 Analytics wiped", "اتمسحت كل الـ Analytics + النسخة الاحتياطية", query.from_user)
         await query.edit_message_text("🗑 Analytics wiped — local file cleared and backup deleted.")
         return
 
@@ -13266,69 +14086,125 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await start_bookmarks_retake(context, user_id, message=query.message)
         return
 
-    # ── Admin: /daily_module picker (dqy:/dqm:/dq_scope_off) ─────────
-    if query.data.startswith("dqy:"):
+    # ── Admin: /daily_module — per-year scope: module, optionally specific
+    # lectures (dqy:/dqm:/dql:/dqla:/dqlp:/dqsave:/dqmall:/dq_scope_off:) ──
+    _dq_cmd = query.data.split(":", 1)[0]
+    if _dq_cmd in ("dqy", "daily_module_years", "dqm", "dql", "dqla", "dqlp", "dqsave", "dqmall", "dq_scope_off"):
         if not is_creator(update):
             await query.edit_message_text(MSG_ADMIN_ONLY)
             return
-        year = query.data.split(":")[1]
+        parts = query.data.split(":")
+        year = parts[1] if len(parts) > 1 else None
+        back_years = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع للسنين", callback_data="daily_module_years")]])
+
+        if _dq_cmd == "daily_module_years":
+            DQ_PICK.pop(user_id, None)
+            text, markup = _daily_module_view()
+            if text is None:
+                await query.edit_message_text("📭 مفيش سنين متاحة دلوقتي.")
+                return
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+            return
+
         if year not in configured_years():
             await query.edit_message_text("⚠️ السنة دي مش متاحة دلوقتي.")
             return
-        modules = ready_modules(year)
-        if not modules:
-            await query.edit_message_text(f"📭 مفيش موديولات متظبطة لـ {year_label(year)} لسه.")
-            return
-        buttons = [[InlineKeyboardButton(module_label(m), callback_data=f"dqm:{year}:{i}")] for i, m in enumerate(modules)]
-        buttons.append([InlineKeyboardButton("🔙 رجوع", callback_data="daily_module_years")])
-        await query.edit_message_text(
-            f"📚 <b>{year_label(year)}</b> — اختار الموديول:", parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup(buttons),
-        )
-        return
 
-    if query.data == "daily_module_years":
-        if not is_creator(update):
-            await query.edit_message_text(MSG_ADMIN_ONLY)
+        if _dq_cmd == "dqy":
+            DQ_PICK.pop(user_id, None)
+            modules = ready_modules(year)
+            if not modules:
+                await query.edit_message_text(f"📭 مفيش موديولات متظبطة لـ {year_label(year)} لسه.")
+                return
+            buttons = [[InlineKeyboardButton(module_label(m), callback_data=f"dqm:{year}:{i}")] for i, m in enumerate(modules)]
+            if get_daily_quiz_scope(year):
+                buttons.append([InlineKeyboardButton("🔓 شيل التحديد (رجّع الافتراضي)", callback_data=f"dq_scope_off:{year}")])
+            buttons.append([InlineKeyboardButton("🔙 رجوع", callback_data="daily_module_years")])
+            await query.edit_message_text(
+                f"📚 <b>{year_label(year)}</b>\nدلوقتي: {_daily_scope_summary(year)}\n\nاختار الموديول:",
+                parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons),
+            )
             return
-        years = configured_years()
-        buttons = [[InlineKeyboardButton(year_label(y), callback_data=f"dqy:{y}")] for y in years]
-        scope = get_daily_quiz_scope()
-        if scope:
-            buttons.append([InlineKeyboardButton("🔓 شيل التحديد (رجّع كل المنهج)", callback_data="dq_scope_off")])
-        await query.edit_message_text(
-            "📚 <b>Daily Quiz — اختار الموديول اللي هيتحدد عليه:</b>",
-            parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons),
-        )
-        return
 
-    if query.data.startswith("dqm:"):
-        if not is_creator(update):
-            await query.edit_message_text(MSG_ADMIN_ONLY)
+        if _dq_cmd == "dqm":
+            modules = ready_modules(year)
+            mod_idx = int(parts[2])
+            if mod_idx >= len(modules):
+                await query.edit_message_text("⚠️ الموديول ده مش موجود دلوقتي.")
+                return
+            module = modules[mod_idx]
+            items = _dq_pick_items(year, module)
+            current = get_daily_quiz_scope(year)
+            keep = set(current.get("lectures") or ()) if current and current["module"] == module else set()
+            DQ_PICK[user_id] = {
+                "year": year, "module": module, "items": items, "page": 0,
+                "sel": {key for _s, key in items if QUIZ_INDEX[year].get(key, {}).get("uid") in keep},
+            }
+            text, markup = _dq_pick_view(user_id)
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
             return
-        _, year, mod_idx_str = query.data.split(":")
-        mod_idx = int(mod_idx_str)
-        modules = ready_modules(year)
-        if mod_idx >= len(modules):
-            await query.edit_message_text("⚠️ الموديول ده مش موجود دلوقتي.")
+
+        if _dq_cmd == "dq_scope_off":
+            await set_daily_quiz_scope(year, None)
+            await backup_settings_to_channel(context)
+            await admin_log(context, "🎯 Daily Quiz scope cleared", f"{year_label(year)} → الافتراضي", query.from_user)
+            await query.edit_message_text(
+                f"✅ اتشال التحديد عن {year_label(year)} — رجع للافتراضي: {_daily_scope_summary(year)}.",
+                parse_mode=ParseMode.HTML, reply_markup=back_years,
+            )
             return
-        module = modules[mod_idx]
-        await set_daily_quiz_scope(year, module)
+
+        st = DQ_PICK.get(user_id)
+        if not st or st["year"] != year:
+            await query.edit_message_text("⚠️ الجلسة انتهت — افتح /daily_module تاني.", reply_markup=back_years)
+            return
+
+        if _dq_cmd in ("dql", "dqla", "dqlp"):
+            if _dq_cmd == "dql":
+                j = int(parts[2])
+                if 0 <= j < len(st["items"]):
+                    key = st["items"][j][1]
+                    st["sel"].symmetric_difference_update({key})
+                    st["page"] = j // DQ_PICK_PAGE_SIZE
+            elif _dq_cmd == "dqla":
+                every = {key for _s, key in st["items"]}
+                st["sel"] = set() if st["sel"] == every else every
+            else:
+                st["page"] = int(parts[2])
+            text, markup = _dq_pick_view(user_id)
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+            return
+
+        # dqsave / dqmall — write the scope
+        module = st["module"]
+        uids = None
+        if _dq_cmd == "dqsave":
+            chosen = [key for _s, key in st["items"] if key in st["sel"]]
+            if not chosen:
+                text, markup = _dq_pick_view(user_id)
+                await query.edit_message_text(
+                    "⚠️ اختار محاضرة واحدة على الأقل (أو دوس 📚 كل محاضرات الموديول).\n\n" + text,
+                    parse_mode=ParseMode.HTML, reply_markup=markup,
+                )
+                return
+            uids, is_new = [], False
+            for key in chosen:
+                uid_, new_ = _lecture_uid(year, key)   # permanent per-lecture uid — survives renames
+                uids.append(uid_)
+                is_new = is_new or new_
+            if is_new:
+                await save_quiz_index(year)
+                await backup_quiz_to_channel(context, year)
+        DQ_PICK.pop(user_id, None)
+        await set_daily_quiz_scope(year, module, uids)
         await backup_settings_to_channel(context)
+        await admin_log(context, "🎯 Daily Quiz scope", f"{year_label(year)}: {_daily_scope_summary(year)}", query.from_user)
         await query.edit_message_text(
-            f"✅ Daily Quiz دلوقتي محدد على: {year_label(year)} — {module_label(module)}\n\n"
-            f"(أسئلة الـ Daily Quiz لسنة {year_label(year)} هيتسحبوا من الموديول ده بس)",
-            parse_mode=ParseMode.HTML,
+            f"✅ Daily Quiz لـ {year_label(year)} دلوقتي: {_daily_scope_summary(year)}\n\n"
+            f"(الأسئلة هتتسحب من الموديول ده{' — المحاضرات المحددة بس' if uids else ''}. "
+            "كويز النهاردة لو اتبني خلاص فالتغيير بيبان من بكرة.)",
+            parse_mode=ParseMode.HTML, reply_markup=back_years,
         )
-        return
-
-    if query.data == "dq_scope_off":
-        if not is_creator(update):
-            await query.edit_message_text(MSG_ADMIN_ONLY)
-            return
-        await set_daily_quiz_scope(None, None)
-        await backup_settings_to_channel(context)
-        await query.edit_message_text("✅ اتشال التحديد — Daily Quiz دلوقتي بيسحب من المنهج كله تاني.")
         return
 
     # ── /report_issue — user sends a message, admin replies from
@@ -13687,9 +14563,9 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(MSG_CANCEL_NOTHING)
 
 async def feedback_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/feedback <message> — sends the user's nickname, Telegram
-    username, and Telegram ID together with their feedback text straight
-    to the Creator's DM (ADMIN_ID). Simple one-shot command (no draft/confirm step,
+    """/feedback <message> — posts the user's nickname, Telegram
+    username, and Telegram ID together with their feedback text into the
+    storage group, pinging the Creator (falls back to the Creator's DM). Simple one-shot command (no draft/confirm step,
     unlike /report_issue) — whatever follows /feedback on the same
     message is sent as-is."""
     if not ADMIN_ID:
@@ -13713,12 +14589,14 @@ async def feedback_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🆔 ID: <code>{real_uid}</code>\n\n"
         f"💬 {html.escape(feedback_text)}"
     )
-    try:
-        await context.bot.send_message(chat_id=ADMIN_ID, text=message, parse_mode=ParseMode.HTML)
-    except Exception as e:
-        print("FEEDBACK SEND FAILED:", e)
-        await update.message.reply_text("⚠️ حصل خطأ وأنا بحاول أبعت الفيدباك، جرب تاني كمان شوية.")
-        return
+    delivered = await admin_log(context, "📩 Feedback جديد", message.split("\n", 1)[1])
+    if not delivered:   # storage group unreachable — fall back to the Creator's DM so it's never lost
+        try:
+            await context.bot.send_message(chat_id=ADMIN_ID, text=message, parse_mode=ParseMode.HTML)
+        except Exception as e:
+            print("FEEDBACK SEND FAILED:", e)
+            await update.message.reply_text("⚠️ حصل خطأ وأنا بحاول أبعت الفيدباك، جرب تاني كمان شوية.")
+            return
 
     await update.message.reply_text(
         quizzy_block(QUIZZY_ADORE_ART, "✅ تم إرسال الفيدباك بتاعك، شكراً ليك!"),
@@ -13796,7 +14674,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # onboard_go, which a fully-onboarded user never taps.
     pending_payload = PENDING_LECTURE_LINK.pop(real_uid, None)
     if pending_payload:
-        preview = _lecture_quicklink_preview(pending_payload, real_uid)
+        preview = _any_quicklink_preview(pending_payload, real_uid)
         if preview:
             text, markup = preview
             await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
@@ -14027,7 +14905,8 @@ async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append("/backup_now")
         lines.append("/quiz_list &lt;year&gt;")
         lines.append("/quiz_delete &lt;year&gt; &lt;number&gt;")
-        lines.append("/daily_module")
+        if is_creator(update):
+            lines.append("/daily_module — per-year Daily Quiz scope (module + specific lectures) — Creator only")
         lines.append("/edit_quiz, /quiz_edit")
         years_line = ", ".join(f"{y} ({year_label(y)})" for y in YEAR_ORDER)
         lines.append(f"    year keys: {years_line}")
@@ -14051,6 +14930,52 @@ def is_creator(update: Update) -> bool:
     is_admin() but NOT this. Reserved for /dev_panel and its own
     callbacks/flows; every other admin surface uses is_admin()."""
     return bool(update.effective_user and update.effective_user.id == ADMIN_ID)
+
+# ── Admin log → storage group, pinging the Creator ──────────────────
+# Major admin actions and /feedback are posted into STORAGE_GROUP_ID with a
+# mention of the Creator so the notification actually rings. Put your @username
+# (no @) below; the tg://user?id link mention is always added too (it pings as
+# long as the Creator is a member of the storage group). Never raises: a failed
+# log must never break the action it's reporting.
+ADMIN_PING_USERNAME = ""   # <- e.g. "yourname"
+
+def _admin_ping() -> str:
+    link = f'<a href="tg://user?id={ADMIN_ID}">👑</a>'
+    handle = ADMIN_PING_USERNAME.strip().lstrip("@")
+    return f"@{html.escape(handle)} {link}" if handle else link
+
+def _actor_label(actor) -> str:
+    """HTML label for who did it: a telegram User, a bare user id, or None."""
+    if actor is None:
+        return "—"
+    uid = getattr(actor, "id", actor)
+    name = getattr(actor, "full_name", None) or (get_nickname(uid) if isinstance(uid, int) else None) or "—"
+    uname = getattr(actor, "username", None)
+    role = "Creator" if uid == ADMIN_ID else "Admin"
+    return f"{html.escape(str(name))}{f' (@{html.escape(uname)})' if uname else ''} · {role} · <code>{uid}</code>"
+
+async def admin_log(context, title: str, details: str = "", actor=None, ping: bool = True) -> bool:
+    """Posts one entry to the storage group. `details` is HTML (escape user text
+    yourself). Returns True if it was delivered."""
+    if not STORAGE_GROUP_ID:
+        return False
+    parts = [f"{_admin_ping() + ' ' if ping else ''}<b>{title}</b>"]
+    if actor is not None:
+        parts.append(f"👤 {_actor_label(actor)}")
+    if details:
+        parts.append(details)
+    text = "\n".join(parts)
+    if len(text) > 4000:
+        text = text[:3990] + "…"
+    try:
+        await context.bot.send_message(
+            chat_id=STORAGE_GROUP_ID, text=text, parse_mode=ParseMode.HTML,
+            disable_notification=False, disable_web_page_preview=True,
+        )
+        return True
+    except Exception as e:
+        print("ADMIN LOG FAILED:", e)
+        return False
 
 def admin_allowed_years(user_id: int) -> list | None:
     """The year keys a secondary admin may touch for quiz-content changes,
@@ -14299,7 +15224,7 @@ async def tell_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await context.bot.send_message(
             chat_id=target_id,
-            text=f"📩 <b>رسالة من الأدمن:</b>\n{html.escape(message_text)}",
+            text=f"📩 <b>Quizician:</b>\n{html.escape(message_text)}",
             parse_mode=ParseMode.HTML,
         )
     except Exception as e:
@@ -14309,6 +15234,7 @@ async def tell_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     label = get_nickname(target_id) or str(target_id)
     await update.message.reply_text(f"✅ اتبعتت الرسالة لـ {html.escape(label)}.")
+    await admin_log(context, "📨 /tell", f"إلى: {html.escape(label)} (<code>{target_id}</code>)\n💬 {html.escape(message_text)}", update.effective_user)
 
 def _format_uptime(seconds: float) -> str:
     seconds = int(seconds)
@@ -14873,7 +15799,7 @@ async def _deliver_broadcast_item(bot, uid: int, text: str | None, media: dict |
             kwargs["parse_mode"] = ParseMode.HTML
     await bot.copy_message(**kwargs)
 
-async def _send_broadcast(context: ContextTypes.DEFAULT_TYPE, status_message, audience: str, text: str | None, recipients: list, media: dict | None = None) -> None:
+async def _send_broadcast(context: ContextTypes.DEFAULT_TYPE, status_message, audience: str, text: str | None, recipients: list, media: dict | None = None, actor=None) -> None:
     """Sends text to every id in recipients, editing status_message into
     a live progress bar + rolling ETA (re-estimated from the actual
     send rate so far, refreshed at most every
@@ -14951,6 +15877,8 @@ async def _send_broadcast(context: ContextTypes.DEFAULT_TYPE, status_message, au
     )
     if blocked:
         summary += f"\n🗑 تم حذف {len(blocked)} يوزر بلوك البوت من القائمة"
+    _preview = (text or (media or {}).get("caption") or "[مرفق]")
+    await admin_log(context, "📡 Broadcast", summary.split("\n", 2)[2] + f"\n\n💬 {html.escape(str(_preview))[:600]}", actor)
     try:
         await status_message.edit_text(summary, parse_mode=ParseMode.HTML)
     except Exception:
@@ -15000,6 +15928,9 @@ async def ban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await backup_settings_to_channel(context)
 
     until_label = datetime.fromtimestamp(until, DAILY_QUIZ_TZ).strftime("%Y-%m-%d %I:%M %p")
+    await admin_log(context, "🚫 Ban",
+                    f"🎯 <code>{target_id}</code> ({html.escape(get_nickname(target_id) or '—')})\n"
+                    f"⏳ {hours:g} ساعة — لحد {until_label}\n📝 {html.escape(reason)}", update.effective_user)
     await update.message.reply_text(
         f"🚫 <b>{target_id}</b> اتعمله بان لمدة {hours:g} ساعة.\n"
         f"⏰ هيترفع البان: {until_label}\n"
@@ -15055,6 +15986,7 @@ async def unban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await backup_settings_to_channel(context)
 
     await update.message.reply_text(f"✅ اتشال البان عن <b>{target_id}</b>.", parse_mode=ParseMode.HTML)
+    await admin_log(context, "✅ Unban", f"🎯 <code>{target_id}</code> ({html.escape(get_nickname(target_id) or '—')})", update.effective_user)
     try:
         await context.bot.send_message(
             chat_id=target_id,
@@ -15170,7 +16102,7 @@ async def _send_mystats(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_
     # of the user's own latest answer — see _current_module_for_stats.
     # Omitted entirely (no empty header) until they've answered something
     # in that module.
-    stats_module = _current_module_for_stats(entry)
+    stats_module = _current_module_for_stats(entry, get_year_class(user_id))
     ranking      = _subject_ranking(entry, stats_module)
     if ranking:
         subj_lines = []
@@ -15355,8 +16287,8 @@ async def _send_settings(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply
         text = (
             "⚙️ <b>الإعدادات</b>\n\n"
             "⏭️ <b>Auto-Next</b>: الأسئلة تتبعت واحد واحد بدل ما تتبعت كلها مرة واحدة.\n"
-            "🔀 <b>Randomize</b>: ترتيب الأسئلة يبقى عشوائي كل مرة.\n"
-            "🔁 <b>Spaced Repetition</b>: بيعيد سؤال غلطت فيه بعد شوية عشان يثبت في ذاكرتك."
+            "🔀 <b>Randomize</b>: ترتيب الاختيارات في كل سؤال يتغير كل مرة (ترتيب الأسئلة نفسه ثابت).\n"
+            "🔁 <b>Spaced Repetition</b>: بيعيد سؤال غلطت فيه بعد شوية (باختيارات متبدلة دايمًا) عشان يثبت في ذاكرتك."
             + ("\n⚠️ لازم الـ Auto-Next يكون شغال عشان الميزة دي تشتغل." if spaced_rep_on and not auto_next_on else "")
             + "\n⏱️ <b>Question Timer</b>: وقت محدد لكل سؤال قبل ما يتقفل تلقائي."
         )
@@ -15413,6 +16345,7 @@ async def restore_analytics_cmd(update: Update, context: ContextTypes.DEFAULT_TY
         return
     before = len(ANALYTICS)
     await restore_analytics_from_channel(context)
+    await admin_log(context, "♻️ Analytics restored", f"👥 {before} → {len(ANALYTICS)} يوزر", update.effective_user)
     await update.message.reply_text(
         f"♻️ Restored from pinned backup.\n"
         f"Users on file: <b>{len(ANALYTICS)}</b> (was {before} before restore).",
@@ -15459,6 +16392,7 @@ async def import_analytics_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     await backup_analytics_to_channel(context)
     dropped = len(imported) - len(cleaned)
     note = f" ({dropped} malformed entr{'y' if dropped == 1 else 'ies'} skipped)" if dropped else ""
+    await admin_log(context, "📥 Analytics imported", f"👥 اتدمج {len(cleaned)} يوزر — الإجمالي {len(ANALYTICS)}", update.effective_user)
     await update.message.reply_text(
         f"✅ Imported <b>{len(cleaned)}</b> user(s){note} — merged into current data, "
         f"saved locally, and re-pinned to the backup channel.\n"
