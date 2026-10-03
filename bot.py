@@ -240,12 +240,13 @@ ADMIN_ID = 940770584
 # ADMIN_ID). All of them pass is_admin() but fail is_creator(); they show
 # up in /mystats as "Admin (<scope>)" (vs. "The Creator" for ADMIN_ID).
 UNIVERSITY_ADMINS = {
-    # 333333333: "mnu",   # MNU admin — all MNU years; MNU-only broadcast/ban
+    8311176123: "mnu",    # MNU admin — all MNU years; MNU-only broadcast/ban
+    # 333333333: "mnu",   # (example) another MNU admin
     # 444444444: "mfm",   # MFM admin — all MFM years; MFM-only broadcast/ban
 }
 YEAR_ADMINS = {
-    111111111: "y1",  # placeholder — replace with a real year admin's Telegram ID
-    222222222: "y2",  # placeholder — replace with a real year admin's Telegram ID
+    6227299969: ["y1", "y2"],   # MFM Year 1 + Year 2 (quiz content only; no broadcast/ban)
+    5959402081: ["y1", "y2"],   # MFM Year 1 + Year 2 (quiz content only; no broadcast/ban)
 }
 # Combined id -> scope map the helpers below read (a year key or a
 # university key). If an ID is in both dicts, the university scope wins.
@@ -7473,6 +7474,14 @@ _add_lecture_status_gen: dict[int, int] = {}
 _add_lecture_status_locks: dict[int, asyncio.Lock] = {}
 
 async def _refresh_add_lecture_status(context: ContextTypes.DEFAULT_TYPE, user_id: int, al_state: dict) -> None:
+    if al_state.get("batch_draining"):
+        # The ordered intake runs jobs one after another, so every capture
+        # used to sleep ADD_LECTURE_STATUS_DELAY and then delete + resend the
+        # count message (~2-3s x N questions). While a batch drains we only
+        # remember that a refresh is owed; _drain_add_lecture_intake posts ONE
+        # message when the whole batch is done.
+        al_state["status_owed_ctx"] = context
+        return
     gen = _add_lecture_status_gen.get(user_id, 0) + 1
     _add_lecture_status_gen[user_id] = gen
     await asyncio.sleep(ADD_LECTURE_STATUS_DELAY)
@@ -7614,16 +7623,27 @@ async def _drain_add_lecture_intake(user_id: int, al_state: dict) -> None:
     async with lock:
         items, box["items"] = box["items"], []
         items.sort(key=lambda it: it[0])
-        for _mid, job in items:
-            if ADD_LECTURE_STATE.get(user_id) is not al_state and EVENT_AUTHORING.get(user_id) is not al_state:
-                return   # ended/cancelled — drop whatever was still waiting
-            try:
-                await job()
-            except Exception as e:
-                print(f"ADD_LECTURE intake job failed (message {_mid}): {e}")
+        al_state["batch_draining"] = True
+        try:
+            for _mid, job in items:
+                if ADD_LECTURE_STATE.get(user_id) is not al_state and EVENT_AUTHORING.get(user_id) is not al_state:
+                    return   # ended/cancelled — drop whatever was still waiting
+                try:
+                    await job()
+                except Exception as e:
+                    print(f"ADD_LECTURE intake job failed (message {_mid}): {e}")
+        finally:
+            al_state["batch_draining"] = False
         # The jobs above only touched memory (see _al_mark_dirty) — write the
         # whole batch to disk ONCE instead of 2-4 full-file writes per question.
         await _flush_add_lecture_saves(al_state)
+        # ...and post the running-count message ONCE for the whole batch.
+        owed_ctx = al_state.pop("status_owed_ctx", None)
+        if owed_ctx is not None:
+            if EVENT_AUTHORING.get(user_id) is al_state:
+                _spawn_bg(_event_refresh_status(owed_ctx, user_id, al_state))
+            else:
+                _spawn_bg(_refresh_add_lecture_status(owed_ctx, user_id, al_state))
 
 async def _add_lecture_enqueue(user_id: int, al_state: dict, message_id: int, job) -> None:
     box = _add_lecture_intake.setdefault(user_id, {"items": [], "gen": 0})
@@ -8015,6 +8035,15 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # _capture_add_lecture_poll, which claims it. Checked before SLEEPING,
     # same reasoning as the report-issue branch above: an admin's own
     # authoring session shouldn't be affected by their SLEEPING flag.
+    dq_edit = AWAITING_DAILY_EDIT.get(real_uid)
+    if dq_edit and is_admin(update):
+        if dq_edit["kind"] != "i":
+            await update.message.reply_text("📝 مستني نص مش صورة — ابعت النص، أو دوس Cancel.")
+            return
+        AWAITING_DAILY_EDIT.pop(real_uid, None)
+        await _dq_apply_image_edit(update, context, dq_edit)
+        return
+
     ev_edit = AWAITING_EVENT_EDIT.get(real_uid)
     if ev_edit and is_admin(update):
         if ev_edit["kind"] != "i":
@@ -8831,11 +8860,171 @@ def _quiz_year_arg(context) -> tuple[str | None, str | None]:
         return None, f"⚠️ {year_label(year)} لسه مفيهاش channel_id متظبط."
     return year, None
 
+# ═══════════════════════════════════════════════════════════════
+# /quiz_list and /quiz_delete — button flow: year > module > subject > lecture.
+# Typing arguments still works (/quiz_list y1, /quiz_delete y1 3); with no
+# arguments the admin gets this picker instead. One shared callback family,
+# "qb…:<mode>:…", where mode "l" = list (read-only) and "d" = delete:
+#   qbyr_root:<m>                      back to the year picker
+#   qbyr:<m>:<year>                    modules
+#   qbmod:<m>:<year>:<mi>              subjects
+#   qbsub:<m>:<year>:<mi>:<si>         lectures (ALL of them, open + closed,
+#                                      unlike /quiz and /edit_quiz which only
+#                                      show closed ones — an open/stuck lecture
+#                                      must be deletable too)
+#   qbdel:<year>:<mi>:<si>:<li>        delete confirmation for one lecture; the
+#                                      final tap reuses quizdel_yes / PENDING_QUIZ_DELETE
+# Lectures are looked up by position inside their subject at tap time; the
+# confirmation screen shows the full lecture name before anything is removed.
+# ═══════════════════════════════════════════════════════════════
+QB_DELETE_BACK: dict = {}   # admin uid -> callback_data of the subject list to return to after a delete
+
+def _qb_title(mode: str) -> str:
+    return "📋 <b>Quiz List</b>" if mode == "l" else "🗑 <b>Quiz Delete</b>"
+
+def _qb_lectures(year: str, module: str, subject: str) -> list:
+    return [(k, v) for k, v in QUIZ_INDEX[year].items()
+            if v.get("module") == module and v.get("subject") == subject]
+
+def _qb_year_view(uid: int, mode: str):
+    years = configured_years()
+    allowed = admin_allowed_years(uid)
+    if allowed is not None:
+        years = [y for y in years if y in allowed]
+    if not years:
+        return "📭 مفيش سنين متاحة دلوقتي.", None
+    rows = [[InlineKeyboardButton(
+        f"{year_label(y)} ({len(QUIZ_INDEX[y])})", callback_data=f"qbyr:{mode}:{y}")] for y in years]
+    return f"{_qb_title(mode)} — اختار السنة:", InlineKeyboardMarkup(rows)
+
+def _qb_module_view(year: str, mode: str):
+    modules = ready_modules(year)
+    if not modules:
+        return f"📭 مفيش موديولات متظبطة لـ {year_label(year)} لسه.", InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🔙 رجوع للسنين", callback_data=f"qbyr_root:{mode}")]])
+    rows = []
+    for i, m in enumerate(modules):
+        n = sum(1 for v in QUIZ_INDEX[year].values() if v.get("module") == m)
+        rows.append([InlineKeyboardButton(f"{module_label(m)} ({n})", callback_data=f"qbmod:{mode}:{year}:{i}")])
+    rows.append([InlineKeyboardButton("🔙 رجوع للسنين", callback_data=f"qbyr_root:{mode}")])
+    return f"{_qb_title(mode)} — <b>{year_label(year)}</b> — اختار الموديول:", InlineKeyboardMarkup(rows)
+
+def _qb_subject_view(year: str, mod_idx: int, mode: str):
+    modules = ready_modules(year)
+    if mod_idx >= len(modules):
+        return "⚠️ الموديول ده مش موجود دلوقتي.", None
+    module = modules[mod_idx]
+    rows = []
+    for i, sub in enumerate(ready_subjects(year, module)):
+        n = len(_qb_lectures(year, module, sub))
+        rows.append([InlineKeyboardButton(f"{subject_label(sub)} ({n})", callback_data=f"qbsub:{mode}:{year}:{mod_idx}:{i}")])
+    rows.append([InlineKeyboardButton("🔙 رجوع للموديولات", callback_data=f"qbyr:{mode}:{year}")])
+    return f"{_qb_title(mode)} — <b>{year_label(year)} — {html.escape(module)}</b> — اختار المادة:", InlineKeyboardMarkup(rows)
+
+def _qb_lecture_view(year: str, mod_idx: int, subj_idx: int, mode: str):
+    modules = ready_modules(year)
+    if mod_idx >= len(modules):
+        return "⚠️ الموديول ده مش موجود دلوقتي.", None
+    module = modules[mod_idx]
+    subjects = ready_subjects(year, module)
+    if subj_idx >= len(subjects):
+        return "⚠️ المادة دي مش موجودة دلوقتي.", None
+    subject = subjects[subj_idx]
+    lectures = _qb_lectures(year, module, subject)
+    back = InlineKeyboardButton("🔙 رجوع للمواد", callback_data=f"qbmod:{mode}:{year}:{mod_idx}")
+    header = f"{_qb_title(mode)} — <b>{year_label(year)} — {html.escape(module)} - {html.escape(subject)}</b>"
+    if not lectures:
+        return header + "\n\n📭 لسه مفيش محاضرات هنا.", InlineKeyboardMarkup([[back]])
+    rows = []
+    lines = []
+    for i, (key, v) in enumerate(lectures):
+        num = v.get("lecture_number") or (i + 1)
+        status = "✅" if v.get("closed") else "🟡"
+        count = _add_lecture_item_count(v)
+        if mode == "d":
+            rows.append([InlineKeyboardButton(
+                f"🗑 {status} Lecture {num}: {v['name']} ({count})"[:64],
+                callback_data=f"qbdel:{year}:{mod_idx}:{subj_idx}:{i}")])
+        else:
+            lines.append(f"{status} Lecture {num}: {html.escape(str(v['name']))} — {count} سؤال"
+                         + ("" if v.get("closed") else " (لسه مفتوحة)"))
+    rows.append([back])
+    if mode == "d":
+        header += "\n\nاختار المحاضرة اللي عايز تمسحها:"
+    else:
+        header += "\n\n" + "\n".join(lines)
+    return header, InlineKeyboardMarkup(rows)
+
+async def _qb_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, query) -> None:
+    uid, parts = query.from_user.id, query.data.split(":")
+    cmd = parts[0]
+
+    async def send(text, markup=None):
+        try:
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        except Exception as e:
+            if "not modified" not in str(e).lower():
+                raise
+
+    if cmd == "qbyr_root":
+        QB_DELETE_BACK.pop(uid, None)
+        PENDING_QUIZ_DELETE.pop(uid, None)
+        text, markup = _qb_year_view(uid, parts[1])
+        await send(text, markup)
+        return
+
+    # every other callback carries a year: validate + scope-check it once
+    year = parts[2] if cmd != "qbdel" else parts[1]
+    if year not in YEARS or not year_channel_id(year):
+        await send("⚠️ السنة دي مش متاحة دلوقتي.")
+        return
+    if not can_edit_year(update, year):
+        await send(_wrong_year_msg(update))
+        return
+
+    try:
+        if cmd == "qbyr":
+            text, markup = _qb_module_view(year, parts[1])
+        elif cmd == "qbmod":
+            text, markup = _qb_subject_view(year, int(parts[3]), parts[1])
+        elif cmd == "qbsub":
+            PENDING_QUIZ_DELETE.pop(uid, None)   # backing out of a confirm screen drops its pending delete
+            text, markup = _qb_lecture_view(year, int(parts[3]), int(parts[4]), parts[1])
+        elif cmd == "qbdel":
+            mod_idx, subj_idx, lec_idx = int(parts[2]), int(parts[3]), int(parts[4])
+            modules = ready_modules(year)
+            subjects = ready_subjects(year, modules[mod_idx])
+            lectures = _qb_lectures(year, modules[mod_idx], subjects[subj_idx])
+            key, lecture = lectures[lec_idx]
+            PENDING_QUIZ_DELETE[uid] = (year, key)
+            QB_DELETE_BACK[uid] = f"qbsub:d:{year}:{mod_idx}:{subj_idx}"
+            text = (
+                f"⚠️ <b>متأكد إنك عايز تمسح المحاضرة دي؟</b>\n\n"
+                f"{year_label(year)} — {html.escape(str(lecture['module']))} - {html.escape(str(lecture['subject']))}: "
+                f"{html.escape(str(lecture['name']))}\n"
+                f"📝 {_add_lecture_item_count(lecture)} سؤال · {'مقفولة' if lecture.get('closed') else 'لسه مفتوحة'}\n"
+                f"(الرسايل نفسها هتفضل في القناة — العملية دي بس بتشيلها من /quiz)"
+            )
+            markup = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🗑 أيوه، امسح", callback_data="quizdel_yes")],
+                [InlineKeyboardButton("🔙 لأ، سيبها", callback_data=QB_DELETE_BACK[uid])],
+            ])
+        else:
+            return
+    except (ValueError, IndexError):
+        await send("⚠️ العنصر ده مش موجود دلوقتي — ابدأ من الأول.")
+        return
+    await send(text, markup)
+
 async def quiz_list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin: /quiz_list <year> — numbered list of ALL lectures (open +
     closed) in that year, for /quiz_delete."""
     if not is_admin(update):
         await update.message.reply_text(MSG_ADMIN_ONLY)
+        return
+    if not context.args:   # no year typed -> button flow (years > modules > subjects > lectures)
+        text, markup = _qb_year_view(update.effective_user.id, "l")
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
         return
     year, err = _quiz_year_arg(context)
     if err:
@@ -8864,6 +9053,10 @@ async def quiz_delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     taps to confirm; see PENDING_QUIZ_DELETE."""
     if not is_admin(update):
         await update.message.reply_text(MSG_ADMIN_ONLY)
+        return
+    if not context.args:   # no args -> button flow (years > modules > subjects > lectures)
+        text, markup = _qb_year_view(update.effective_user.id, "d")
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
         return
     years = configured_years()
     valid = ", ".join(years) if years else "(مفيش سنين متظبطة)"
@@ -8991,13 +9184,27 @@ def _event_green_button(text: str, callback_data: str) -> InlineKeyboardButton:
     except TypeError:
         return InlineKeyboardButton(text, callback_data=callback_data)
 
+def _event_written_count(ev: dict, au: dict | None = None) -> int:
+    """Written (spoiler) questions in an event: attached before a poll, trailing
+    (written_end), and — while authoring — still waiting for the next poll."""
+    n = sum(len(q.get("written") or []) for q in ev.get("questions", []))
+    n += len(ev.get("written_end") or [])
+    if au:
+        n += len(au.get("pending_written") or [])
+    return n
+
+def _event_has_items(ev: dict) -> bool:
+    """True if the event has anything to run: polls OR written questions
+    (a written-only event has no polls at all)."""
+    return bool(ev and (ev.get("questions") or ev.get("written_end")))
+
 def _event_menu_row(user_id):
     """The green event button row for this user's own uni+year, or None."""
     if user_id is None:
         return None
     year = get_year_class(user_id)
     ev = EVENTS.get(year) if year else None
-    if not ev or not ev.get("live") or not ev.get("questions"):
+    if not ev or not ev.get("live") or not _event_has_items(ev):
         return None
     return [_event_green_button(ev['name'], f"evtu_open:{year}")]
 
@@ -9071,7 +9278,7 @@ async def _event_begin(context, uid: int, year: str, send) -> None:
             "اقفله بـ /event_end الأول."
         )
         return
-    resumed = bool(ev and ev.get("questions"))
+    resumed = bool(ev and _event_has_items(ev))
     if ev:
         ev["name"] = name   # unpublished draft left over — reopen it under the new name
         ev["description"] = description
@@ -9093,6 +9300,9 @@ async def _event_begin(context, uid: int, year: str, send) -> None:
     )
 
 async def _event_refresh_status(context, uid: int, au: dict) -> None:
+    if au.get("batch_draining"):
+        au["status_owed_ctx"] = context   # posted once after the batch — see _drain_add_lecture_intake
+        return
     gen = _event_status_gen.get(uid, 0) + 1
     _event_status_gen[uid] = gen
     await asyncio.sleep(EVENT_STATUS_DELAY)
@@ -9113,7 +9323,8 @@ async def _event_refresh_status(context, uid: int, au: dict) -> None:
                 pass
         sent = await context.bot.send_message(
             chat_id=uid,
-            text=f"<b>{html.escape(ev['name'])}</b>\n✅ {len(ev['questions'])} سؤال اتسجل لحد دلوقتي.",
+            text=(f"<b>{html.escape(ev['name'])}</b>\n✅ {len(ev['questions'])} سؤال اتسجل لحد دلوقتي."
+                  + (f"\n✍️ {_event_written_count(ev, au)} سؤال مكتوب" if _event_written_count(ev, au) else "")),
             parse_mode=ParseMode.HTML, reply_markup=_event_status_markup(au),
         )
         au["status_message_id"] = sent.message_id
@@ -9212,8 +9423,8 @@ async def _event_publish(context, uid: int, au: dict):
             f"(المجموع {len(ev['questions'])}).\nكمل من /edit_event.",
             None,
         )
-    if not ev["questions"]:
-        return None, "⚠️ لسه مفيش أسئلة اتسجلت — فوروارد Quiz poll واحد على الأقل قبل ما تنشر."
+    if not _event_has_items(ev):
+        return None, "⚠️ لسه مفيش أسئلة اتسجلت — فوروارد Quiz poll أو ابعت سؤال مكتوب (إجابته مخفية بـ Spoiler) قبل ما تنشر."
     ev["live"] = True
     ev["published_at"] = time.time()
     EVENT_AUTHORING.pop(uid, None)
@@ -9221,7 +9432,8 @@ async def _event_publish(context, uid: int, au: dict):
     await backup_sessions_to_channel(context, force=True)
     await admin_log(context, "🚀 Event published", f"{html.escape(ev['name'])} — {UNIVERSITIES.get(year_university(au['year']), '')} {year_label(au['year'])} · {len(ev['questions'])} سؤال", uid)
     return (
-        f"🚀 <b>{html.escape(ev['name'])}</b> اتنشر — {len(ev['questions'])} سؤال.\n"
+        f"🚀 <b>{html.escape(ev['name'])}</b> اتنشر — {len(ev['questions'])} سؤال"
+        + (f" + ✍️ {_event_written_count(ev)} مكتوب" if _event_written_count(ev) else "") + ".\n"
         f"زرار أخضر ظهر في أول القايمة الرئيسية لكل يوزرز {UNIVERSITIES.get(year_university(au['year']), '')} {year_label(au['year'])}.\n"
         "لما تخلص استخدم /event_end."
     ), None
@@ -9497,7 +9709,7 @@ def _event_preview_view(year: str, user_id: int, uid: str | None = None):
     the live event's uid (quick links)."""
     home = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")]])
     ev = EVENTS.get(year)
-    if (not ev or not ev.get("live") or not ev.get("questions") or get_year_class(user_id) != year
+    if (not ev or not ev.get("live") or not _event_has_items(ev) or get_year_class(user_id) != year
             or (uid is not None and _event_uid(ev) != uid)):
         return "⚠️ الـ Event ده خلص أو مش متاح ليك.", home
     lines = [
@@ -9507,7 +9719,8 @@ def _event_preview_view(year: str, user_id: int, uid: str | None = None):
     ]
     if ev.get("description"):
         lines += ["", ev["description"]]   # stored as Telegram-HTML (formatting kept)
-    lines += ["", f"📝 {len(ev['questions'])} سؤال"]
+    _n_w = _event_written_count(ev)
+    lines += ["", f"📝 {len(ev['questions'])} سؤال" + (f" + ✍️ {_n_w} مكتوب" if _n_w else "")]
     buttons = [
         [InlineKeyboardButton("▶️ ابدأ", callback_data=f"evtu_go:{year}")],
         [InlineKeyboardButton("❌ إلغاء", callback_data="back_home")],
@@ -9552,7 +9765,7 @@ async def _event_user_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     if action != "evtu_go":
         return
     ev = EVENTS.get(year)
-    if not ev or not ev.get("live") or not ev.get("questions") or get_year_class(uid) != year:
+    if not ev or not ev.get("live") or not _event_has_items(ev) or get_year_class(uid) != year:
         await query.edit_message_text(
             "⚠️ الـ Event ده خلص أو مش متاح ليك.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")]]),
@@ -9671,13 +9884,13 @@ def _event_menu_view(year: str, ev: dict):
          InlineKeyboardButton("✏️ Rename", callback_data=f"evta_ren:{year}")],
         [InlineKeyboardButton("📝 Description", callback_data=f"evta_dsc:{year}")],
     ]
-    if not ev.get("live") and n:
+    if not ev.get("live") and _event_has_items(ev):
         rows.append([InlineKeyboardButton("🚀 Publish", callback_data=f"evta_pubd:{year}")])
     rows.append([InlineKeyboardButton("🔙 رجوع للـ Events", callback_data="evta_el")])
     text = (
         f"<b>{html.escape(ev['name'])}</b>\n"
         f"{UNIVERSITIES.get(year_university(year), '')} {year_label(year)} · {state}\n"
-        f"📝 {n} سؤال · 👥 {taken} حلّوه"
+        f"📝 {n} سؤال" + (f" + ✍️ {_event_written_count(ev)} مكتوب" if _event_written_count(ev) else "") + f" · 👥 {taken} حلّوه"
     )
     return text, InlineKeyboardMarkup(rows)
 
@@ -9913,7 +10126,7 @@ async def _event_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return True
 
     if cmd == "evta_pubd":
-        if ev.get("live") or not ev["questions"]:
+        if ev.get("live") or not _event_has_items(ev):
             text, markup = _event_menu_view(year, ev)
             await send(text, markup)
             return True
@@ -10043,6 +10256,410 @@ async def _event_apply_image_edit(update: Update, context: ContextTypes.DEFAULT_
     )
 
 # ═══════════════════════════════════════════════════════════════
+# /edit_daily — edit TODAY'S shared Daily Quiz, like /edit_quiz does for
+# lectures. Today's questions live in _DAILY_QUIZ_QUESTIONS[year] as
+# self-contained snapshot dicts (question / options / correct_option_id /
+# explanation / case_study / image_file_id ...), so editing them is a direct
+# in-place edit of those dicts (same idea as /edit_event), followed by a
+# sessions flush + channel backup so a redeploy doesn't bring the old text
+# back. Edits only reach people who haven't been served that question yet
+# (a question already delivered stays as it was).
+#
+# DAILY_EDIT_SYNC_SOURCE: when True, question / options / correct choice /
+# explanation edits are ALSO written to the original lecture question
+# (QUIZ_POLL_STATUS, found via the snapshot's "source_mid"), so a fixed typo
+# doesn't come back the next time that question is drawn. Case study / image
+# edits and deletes only touch today's quiz. Set False for today-only edits.
+# ═══════════════════════════════════════════════════════════════
+DAILY_EDIT_SYNC_SOURCE = True
+DAILY_EDIT_PAGE_SIZE   = 8
+AWAITING_DAILY_EDIT: dict = {}   # admin uid -> {"kind": q|o|x|c|i, "year", "did"}
+DAILY_EDIT_SEARCH: dict = {}     # admin uid -> {"year", "query", "dids"}
+
+def _dq_admin_years(uid: int) -> list:
+    return _event_admin_years(uid)
+
+def _dq_ensure_ids(questions: list) -> None:
+    """Gives every question a stable int "did" (button callbacks use it, never
+    the list position, so a delete can't make an old button hit another question)."""
+    used = [q["did"] for q in questions if isinstance(q.get("did"), int)]
+    nxt = (max(used) + 1) if used else 1
+    for q in questions:
+        if not isinstance(q.get("did"), int):
+            q["did"] = nxt
+            nxt += 1
+
+def _dq_find(questions: list, did) -> tuple:
+    for pos, q in enumerate(questions):
+        if q.get("did") == did:
+            return pos, q
+    return -1, None
+
+async def _dq_persist(context) -> None:
+    await _flush_sessions_if_changed()
+    await backup_sessions_to_channel(context)
+
+async def _dq_sync_source(context, year: str, q: dict, keys: tuple) -> None:
+    """Mirrors the edited fields back to the original lecture question."""
+    if not DAILY_EDIT_SYNC_SOURCE or q.get("source_mid") is None:
+        return
+    pid = next((p for p, v in QUIZ_POLL_STATUS.get(year, {}).items() if v.get("message_id") == q["source_mid"]), None)
+    if pid is None:
+        return
+    for k in keys:
+        QUIZ_POLL_STATUS[year][pid][k] = q.get(k)
+    await save_quiz_poll_status(year)
+    await backup_quiz_to_channel(context, year)
+
+def _dq_root_view(uid: int):
+    _ensure_daily_quiz_questions_fresh()
+    years = _dq_admin_years(uid)
+    if not years:
+        return "📭 مفيش سنين متاحة ليك دلوقتي.", None
+    rows = []
+    for y in years:
+        qs = _DAILY_QUIZ_QUESTIONS.get(y)
+        label = f"{len(qs)} سؤال" if qs is not None else "⏳ لسه متبناش النهاردة"
+        rows.append([InlineKeyboardButton(
+            f"{UNIVERSITIES.get(year_university(y), '')} {year_label(y)} — {label}",
+            callback_data=f"dqed_y:{y}",
+        )])
+    return ("✏️ <b>Edit Daily Quiz — اختار السنة:</b>\n"
+            "(لو السنة لسه متبناش، فتحها هيبني أسئلة النهاردة دلوقتي)"), InlineKeyboardMarkup(rows)
+
+def _dq_list_view(uid: int, year: str, qs: list, page: int, mode: str):
+    items = list(enumerate(qs))
+    title = "📋 أسئلة الـ Daily Quiz"
+    if mode == "s":
+        srch = DAILY_EDIT_SEARCH.get(uid) or {}
+        keep = set(srch.get("dids") or [])
+        items = [(i, q) for i, q in items if q["did"] in keep]
+        title = f"🔎 نتايج «{html.escape(srch.get('query', ''))}»"
+    pages = max(1, -(-len(items) // DAILY_EDIT_PAGE_SIZE))
+    page = max(0, min(page, pages - 1))
+    chunk = items[page * DAILY_EDIT_PAGE_SIZE:(page + 1) * DAILY_EDIT_PAGE_SIZE]
+    rows = [[InlineKeyboardButton(f"{i + 1}. {q['question'][:45]}", callback_data=f"dqed_s:{year}:{q['did']}")] for i, q in chunk]
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"dqed_l:{year}:{page - 1}:{mode}"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"dqed_l:{year}:{page + 1}:{mode}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("🔎 Search", callback_data=f"dqed_srch:{year}"),
+                 InlineKeyboardButton("🔙 رجوع", callback_data="dqed_root")])
+    text = f"{title} — {UNIVERSITIES.get(year_university(year), '')} {year_label(year)} ({len(items)})"
+    if pages > 1:
+        text += f"\nصفحة {page + 1}/{pages}"
+    if not items:
+        text += "\n\n📭 مفيش أسئلة."
+    return text, InlineKeyboardMarkup(rows)
+
+def _dq_q_text(year: str, q: dict, pos: int, total: int) -> str:
+    correct = q.get("correct_option_id")
+    opts = "\n".join(
+        f"{'✅' if i == correct else '▫️'} {string.ascii_uppercase[i]}) {html.escape(str(o))}"
+        for i, o in enumerate(q["options"])
+    )
+    expl = f"\n\n💬 {html.escape(q['explanation'])}" if q.get("explanation") else ""
+    att = []
+    if q.get("case_study"):
+        att.append("📝 Case study")
+    if q.get("image_file_id"):
+        att.append("🖼 صورة")
+    src = " › ".join(html.escape(str(x)) for x in (q.get("module"), q.get("subject")) if x)
+    return (
+        f"✏️ <b>Daily Quiz</b> — سؤال {pos + 1}/{total}"
+        + (f"\n📚 {src}" if src else "")
+        + f"\n\n❓ {html.escape(q['question'])}\n\n{opts}{expl}"
+        + (f"\n\n📎 {' + '.join(att)}" if att else "")
+        + "\n\nاختار الإجراء:"
+    )
+
+def _dq_q_markup(year: str, q: dict) -> InlineKeyboardMarkup:
+    did = q["did"]
+    rows = [
+        [InlineKeyboardButton("✏️ Question", callback_data=f"dqed_e:q:{year}:{did}"),
+         InlineKeyboardButton("🔤 Options", callback_data=f"dqed_e:o:{year}:{did}")],
+        [InlineKeyboardButton("💬 Explanation", callback_data=f"dqed_e:x:{year}:{did}"),
+         InlineKeyboardButton("✅ Correct choice", callback_data=f"dqed_c:{year}:{did}")],
+        [InlineKeyboardButton("📝 Case study", callback_data=f"dqed_e:c:{year}:{did}"),
+         InlineKeyboardButton("🖼 Image", callback_data=f"dqed_e:i:{year}:{did}")],
+    ]
+    if q.get("case_study") or q.get("image_file_id"):
+        rows.append([InlineKeyboardButton("🧹 Remove case / image", callback_data=f"dqed_rm:{year}:{did}")])
+    rows.append([InlineKeyboardButton("🗑 Delete from today", callback_data=f"dqed_d:{year}:{did}")])
+    rows.append([InlineKeyboardButton("🔙 رجوع للأسئلة", callback_data=f"dqed_l:{year}:0:a")])
+    return InlineKeyboardMarkup(rows)
+
+async def edit_daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: /edit_daily — edit today's Daily Quiz questions, like /edit_quiz."""
+    if not is_admin(update):
+        await update.message.reply_text(MSG_ADMIN_ONLY)
+        return
+    uid = update.effective_user.id
+    AWAITING_DAILY_EDIT.pop(uid, None)
+    text, markup = _dq_root_view(uid)
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+async def _dq_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, query) -> None:
+    uid, data = query.from_user.id, query.data
+    parts = data.split(":")
+    cmd = parts[0]
+
+    async def send(text, markup=None):
+        try:
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        except Exception as e:
+            if "not modified" not in str(e).lower():
+                raise
+
+    if cmd == "dqed_root":
+        AWAITING_DAILY_EDIT.pop(uid, None)
+        text, markup = _dq_root_view(uid)
+        await send(text, markup)
+        return
+
+    year = next((p for p in parts[1:] if p in YEARS), None)
+    if year is None or year not in _dq_admin_years(uid):
+        await send("⚠️ السنة دي مش في صلاحياتك.")
+        return
+
+    _ensure_daily_quiz_questions_fresh()
+    if year not in _DAILY_QUIZ_QUESTIONS:
+        await get_daily_quiz_questions(context, year)   # builds + persists today's set
+    qs = _DAILY_QUIZ_QUESTIONS.get(year) or []
+    _dq_ensure_ids(qs)
+
+    def did_of(i):
+        try:
+            return int(parts[i])
+        except (ValueError, IndexError):
+            return None
+
+    async def show_q(did):
+        pos, q = _dq_find(qs, did)
+        if q is None:
+            await send("⚠️ السؤال ده مش موجود دلوقتي — يمكن اتمسح أو اليوم اتغير.",
+                       InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع للأسئلة", callback_data=f"dqed_l:{year}:0:a")]]))
+            return
+        await send(_dq_q_text(year, q, pos, len(qs)), _dq_q_markup(year, q))
+
+    if cmd in ("dqed_y", "dqed_l", "dqed_s"):
+        AWAITING_DAILY_EDIT.pop(uid, None)
+
+    if cmd == "dqed_y":
+        text, markup = _dq_list_view(uid, year, qs, 0, "a")
+        await send(text, markup)
+        return
+
+    if cmd == "dqed_l":
+        page = did_of(2) or 0
+        mode = parts[3] if len(parts) > 3 else "a"
+        text, markup = _dq_list_view(uid, year, qs, page, mode)
+        await send(text, markup)
+        return
+
+    if cmd == "dqed_s":
+        await show_q(did_of(2))
+        return
+
+    if cmd == "dqed_srch":
+        AWAITING_DAILY_EDIT[uid] = {"kind": "search", "year": year, "did": None}
+        await send("🔎 ابعت كلمة أدور بيها في الأسئلة والاختيارات:",
+                   InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"dqed_y:{year}")]]))
+        return
+
+    if cmd == "dqed_e":   # dqed_e:<kind>:<year>:<did>
+        kind, did = parts[1], did_of(3)
+        _, q = _dq_find(qs, did)
+        if q is None or kind not in ("q", "o", "x", "c", "i"):
+            await show_q(did)
+            return
+        AWAITING_DAILY_EDIT[uid] = {"kind": kind, "year": year, "did": did}
+        prompts = {
+            "q": "✏️ ابعت نص السؤال الجديد:",
+            "o": ("🔤 ابعت الاختيارات الجديدة، سطر لكل اختيار (من غير حروف A)/B)).\n"
+                  "⚠️ لو عدد الاختيارات اتغير ممكن تحتاج تختار الإجابة الصح تاني من <b>✅ Correct choice</b>."),
+            "x": "💬 ابعت الـ explanation الجديد (أو ابعت <code>-</code> عشان تشيله):",
+            "c": "📝 ابعت نص الـ Case study (هيظهر قبل السؤال ده):",
+            "i": "🖼 ابعت الصورة اللي هتتربط بالسؤال ده:",
+        }
+        await send(prompts[kind], InlineKeyboardMarkup([[
+            InlineKeyboardButton("❌ Cancel", callback_data=f"dqed_s:{year}:{did}")]]))
+        return
+
+    if cmd == "dqed_c":
+        did = did_of(2)
+        _, q = _dq_find(qs, did)
+        if q is None:
+            await show_q(did)
+            return
+        rows = [[InlineKeyboardButton(
+            f"{'✅ ' if i == q.get('correct_option_id') else ''}{string.ascii_uppercase[i]}) {str(o)[:40]}",
+            callback_data=f"dqed_p:{year}:{did}:{i}")] for i, o in enumerate(q["options"])]
+        rows.append([InlineKeyboardButton("🔙 رجوع", callback_data=f"dqed_s:{year}:{did}")])
+        await send("✅ اختار الإجابة الصح الجديدة:", InlineKeyboardMarkup(rows))
+        return
+
+    if cmd == "dqed_p":
+        did, idx = did_of(2), did_of(3)
+        _, q = _dq_find(qs, did)
+        if q is not None and idx is not None and 0 <= idx < len(q["options"]):
+            q["correct_option_id"] = idx
+            await _dq_persist(context)
+            await _dq_sync_source(context, year, q, ("correct_option_id",))
+        await show_q(did)
+        return
+
+    if cmd == "dqed_rm":
+        did = did_of(2)
+        _, q = _dq_find(qs, did)
+        if q is not None:
+            for k in ("case_study", "case_study_entities", "case_group", "image_file_id"):
+                q.pop(k, None)
+            await _dq_persist(context)
+        await show_q(did)
+        return
+
+    if cmd == "dqed_d":
+        did = did_of(2)
+        _, q = _dq_find(qs, did)
+        if q is None:
+            await show_q(did)
+            return
+        await send(
+            f"🗑 تمسح السؤال ده من Daily Quiz النهاردة؟\n(السؤال الأصلي في المحاضرة مش هيتأثر)\n\n❓ {html.escape(q['question'])}",
+            InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ أيوه، امسحه", callback_data=f"dqed_dok:{year}:{did}"),
+                InlineKeyboardButton("↩️ لأ", callback_data=f"dqed_s:{year}:{did}"),
+            ]]),
+        )
+        return
+
+    if cmd == "dqed_dok":
+        did = did_of(2)
+        pos, q = _dq_find(qs, did)
+        if q is None:
+            await show_q(did)
+            return
+        if len(qs) <= 1:
+            await send("⚠️ ده آخر سؤال في Daily Quiz النهاردة — مينفعش يفضل فاضي.",
+                       InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data=f"dqed_s:{year}:{did}")]]))
+            return
+        qs.pop(pos)
+        await _dq_persist(context)
+        text, markup = _dq_list_view(uid, year, qs, pos // DAILY_EDIT_PAGE_SIZE, "a")
+        await send("🗑 اتمسح السؤال من النهاردة.\n\n" + text, markup)
+        return
+
+async def _dq_apply_text_edit(update: Update, context: ContextTypes.DEFAULT_TYPE, de: dict, text: str) -> None:
+    """Consumes the admin's typed reply for a pending AWAITING_DAILY_EDIT."""
+    uid, year, kind = update.effective_user.id, de["year"], de["kind"]
+    reply = update.message.reply_text
+    if year not in _dq_admin_years(uid):
+        await reply("⚠️ السنة دي مش في صلاحياتك.")
+        return
+    _ensure_daily_quiz_questions_fresh()
+    qs = _DAILY_QUIZ_QUESTIONS.get(year)
+    if qs is None:
+        await reply("⚠️ اليوم اتغير — افتح /edit_daily تاني.")
+        return
+    _dq_ensure_ids(qs)
+
+    if kind == "search":
+        needle = text.strip().lower()
+        hits = [
+            q["did"] for q in qs
+            if needle and needle in " ".join([q["question"], *[str(o) for o in q["options"]], q.get("explanation") or ""]).lower()
+        ]
+        DAILY_EDIT_SEARCH[uid] = {"year": year, "query": text.strip()[:40], "dids": hits}
+        t, m = _dq_list_view(uid, year, qs, 0, "s")
+        await reply(t, parse_mode=ParseMode.HTML, reply_markup=m)
+        return
+
+    pos, q = _dq_find(qs, de["did"])
+    if q is None:
+        await reply("⚠️ السؤال ده مش موجود دلوقتي.")
+        return
+
+    warn = ""
+    sync_keys: tuple = ()
+    if kind == "q":
+        new = text.strip()
+        if not new or len(new) > TELEGRAM_Q_LIMIT - 10:
+            AWAITING_DAILY_EDIT[uid] = de
+            await reply(f"⚠️ نص السؤال لازم يكون من 1 لـ {TELEGRAM_Q_LIMIT - 10} حرف — ابعته تاني.")
+            return
+        q["question"] = new
+        sync_keys = ("question",)
+    elif kind == "o":
+        opts = [strip_leading_letter_prefix(l.strip()) for l in text.splitlines() if l.strip()]
+        if not 2 <= len(opts) <= 10 or any(len(o) > 100 for o in opts):
+            AWAITING_DAILY_EDIT[uid] = de
+            await reply("⚠️ لازم من 2 لـ 10 اختيارات، وكل واحد مايزيدش عن 100 حرف — ابعتهم تاني.")
+            return
+        q["options"] = opts
+        sync_keys = ("options",)
+        old_correct = q.get("correct_option_id")
+        if not isinstance(old_correct, int) or old_correct >= len(opts):
+            q["correct_option_id"] = 0
+            sync_keys = ("options", "correct_option_id")
+            warn = "\n⚠️ الإجابة الصح القديمة بقت برّه المدى — اتحطت A مؤقتاً، اختار الصح من ✅ Correct choice."
+    elif kind == "x":
+        new = text.strip()
+        q["explanation"] = None if new == "-" else new[:TELEGRAM_EX_LIMIT]
+        sync_keys = ("explanation",)
+    elif kind == "c":
+        new = text.strip()
+        if not new or len(new) > 4000:
+            AWAITING_DAILY_EDIT[uid] = de
+            await reply("⚠️ النص لازم يكون من 1 لـ 4000 حرف — ابعته تاني.")
+            return
+        _rich = _msg_rich(update.message)
+        if _rich["entities"] and len(_rich["text"]) <= 4000:
+            q["case_study"], q["case_study_entities"] = _rich["text"], _rich["entities"]
+        else:
+            q["case_study"] = new
+            q.pop("case_study_entities", None)
+        q.pop("case_group", None)   # its own case now — don't dedupe against the old group
+    elif kind == "i":
+        AWAITING_DAILY_EDIT[uid] = de
+        await reply("🖼 مستني صورة مش نص — ابعت الصورة، أو دوس Cancel.")
+        return
+
+    await _dq_persist(context)
+    if sync_keys:
+        await _dq_sync_source(context, year, q, sync_keys)
+    await reply(
+        "✅ اتعدل." + warn + "\n\n" + _dq_q_text(year, q, pos, len(qs)),
+        parse_mode=ParseMode.HTML, reply_markup=_dq_q_markup(year, q),
+    )
+
+async def _dq_apply_image_edit(update: Update, context: ContextTypes.DEFAULT_TYPE, de: dict) -> None:
+    uid, year = update.effective_user.id, de["year"]
+    if year not in _dq_admin_years(uid):
+        await update.message.reply_text("⚠️ السنة دي مش في صلاحياتك.")
+        return
+    _ensure_daily_quiz_questions_fresh()
+    qs = _DAILY_QUIZ_QUESTIONS.get(year)
+    if qs is None:
+        await update.message.reply_text("⚠️ اليوم اتغير — افتح /edit_daily تاني.")
+        return
+    _dq_ensure_ids(qs)
+    pos, q = _dq_find(qs, de["did"])
+    photo = update.message.photo[-1] if update.message.photo else None
+    if q is None or photo is None:
+        await update.message.reply_text("⚠️ السؤال ده مش موجود دلوقتي.")
+        return
+    q["image_file_id"] = photo.file_id
+    await _dq_persist(context)
+    await update.message.reply_text(
+        "✅ اتربطت الصورة.\n\n" + _dq_q_text(year, q, pos, len(qs)),
+        parse_mode=ParseMode.HTML, reply_markup=_dq_q_markup(year, q),
+    )
+
+# ═══════════════════════════════════════════════════════════════
 # TEXT MESSAGE HANDLER
 # ═══════════════════════════════════════════════════════════════
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -10062,6 +10679,13 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # stray message here could get misread as a search query, nickname,
     # etc. Quiz polls themselves arrive as update.message.poll, not text,
     # and are caught in handle_poll (see _capture_add_lecture_poll).
+    # ── /edit_daily: waiting on a typed edit / search ────────────────
+    dq_edit = AWAITING_DAILY_EDIT.pop(real_uid, None)
+    if dq_edit:
+        if is_admin(update):
+            await _dq_apply_text_edit(update, context, dq_edit, text)
+            return
+
     # ── /edit_event: waiting on a typed edit / rename / search ───────
     ev_edit = AWAITING_EVENT_EDIT.get(real_uid)
     if ev_edit:
@@ -11617,6 +12241,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 🔥COMING SOON🔥 — the toast above is the whole feature; leave the menu as is.
     if query.data == "coming_soon":
+        return
+
+    # ── /edit_daily — see the /edit_daily section ──
+    if query.data.startswith("dqed_"):
+        if not is_admin(update):
+            await query.answer("🚫 للأدمن فقط", show_alert=True)
+            return
+        await _dq_edit_callback(update, context, query)
         return
 
     # ── EVENTS (/event_start, /event_end) — see the EVENTS section ──
@@ -14010,6 +14642,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
         return
 
+    # ── /quiz_list + /quiz_delete button flow (see the QB section) ──
+    if query.data.startswith(("qbyr:", "qbyr_root:", "qbmod:", "qbsub:", "qbdel:")):
+        if not is_admin(update):
+            await query.answer("🚫 للأدمن فقط", show_alert=True)
+            return
+        await _qb_callback(update, context, query)
+        return
+
     # ── /quiz_delete confirmation (admin) ────────────────────────────
     # PENDING_QUIZ_DELETE[admin_id] was set by quiz_delete_cmd right
     # before showing the confirm/cancel buttons — same tap-to-confirm
@@ -14040,14 +14680,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await save_quiz_poll_status(year)
         await backup_quiz_to_channel(context, year)
         await admin_log(context, "🗑 Lecture deleted", f"📚 {year_label(year)} — {html.escape(str(removed['module']))} - {html.escape(str(removed['subject']))}: {html.escape(str(removed['name']))}", query.from_user)
+        _qb_back = QB_DELETE_BACK.pop(user_id, None)
         await query.edit_message_text(
             f"🗑 اتشالت محاضرة من {year_label(year)}: {removed['module']} - {removed['subject']}: {removed['name']}\n"
-            "(الرسايل نفسها لسه موجودة في القناة — احذفهم يدوي لو عايز)"
+            "(الرسايل نفسها لسه موجودة في القناة — احذفهم يدوي لو عايز)",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع للمحاضرات", callback_data=_qb_back)]]) if _qb_back else None,
         )
         return
 
     if query.data == "quizdel_no":
         PENDING_QUIZ_DELETE.pop(user_id, None)
+        QB_DELETE_BACK.pop(user_id, None)
         await query.edit_message_text("🔙 اتلغى — المحاضرة لسه موجودة.")
         return
 
@@ -17070,6 +17713,7 @@ app.add_handler(CommandHandler("time",             time_cmd))
 app.add_handler(CommandHandler("quiz_list",       quiz_list_cmd))
 app.add_handler(CommandHandler("quiz_delete",     quiz_delete_cmd))
 app.add_handler(CommandHandler("edit_quiz",       edit_quiz_cmd))
+app.add_handler(CommandHandler("edit_daily",      edit_daily_cmd))
 app.add_handler(CommandHandler("quiz_edit",       edit_quiz_cmd))
 app.add_handler(CommandHandler("add_lecture",     add_lecture_cmd))
 app.add_handler(CommandHandler("event_start",     event_start_cmd))
