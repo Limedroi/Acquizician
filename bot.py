@@ -433,11 +433,11 @@ def year_channel_id(year: str):
 def year_label(year: str) -> str:
     return YEARS.get(year, {}).get("label", year)
 
-# Credit line shown under the module-selection prompt. MFM Year 1 & 2 were
-# built by MDM44; MFM Year 3 is Medify44; every MNU year (n1-n3) is Apex.
-# Cosmetic only.
+# Credit line shown under the module-selection prompt. MFM Year 1 is
+# MDM 46 | QUIZ; Year 2 is MDM 45 | QUIZ; Year 3 is Medify | QUIZ; every
+# MNU year (n1-n3) is Apex. Cosmetic only.
 YEAR_CREDITS = {
-    "y1": "MDM44", "y2": "MDM44", "y3": "Medify44",
+    "y1": "MDM 46 | QUIZ", "y2": "MDM 45 | QUIZ", "y3": "Medify | QUIZ",
     "n1": "Apex", "n2": "Apex", "n3": "Apex",
 }
 
@@ -13006,19 +13006,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         subject = subjects[subj_idx]
         names = ready_lecture_keys(year, module, subject)
-        # ✅ marks a lecture this user has finished — a recorded result
-        # exists only once a real (non-retake) run reaches the end, see
-        # _finish_lecture_session. .get, not _get_lecture_results, so
-        # merely browsing never creates empty result buckets.
-        def _done_mark(name: str) -> str:
-            return "✅ " if str(user_id) in LECTURE_RESULTS.get(_lr_key(year, name), {}) else ""
-        buttons = [
-            [InlineKeyboardButton(
-                f"{_done_mark(name)}Lecture {QUIZ_INDEX[year][name]['lecture_number'] or (i + 1)}: {QUIZ_INDEX[year][name]['name']}",
-                callback_data=f"lecture:{year}:{mod_idx}:{subj_idx}:{i}",
-            )]
-            for i, name in enumerate(names)
-        ]
+        # A lecture this user hasn't finished yet gets Telegram's native green
+        # button; once they finish it (a recorded result exists only after a
+        # real, non-retake run reaches the end, see _finish_lecture_session)
+        # it goes back to the default button with a ✅. .get, not
+        # _get_lecture_results, so merely browsing never creates empty
+        # result buckets.
+        def _lecture_btn(i: int, name: str) -> InlineKeyboardButton:
+            done = str(user_id) in LECTURE_RESULTS.get(_lr_key(year, name), {})
+            label = f"Lecture {QUIZ_INDEX[year][name]['lecture_number'] or (i + 1)}: {QUIZ_INDEX[year][name]['name']}"
+            cb = f"lecture:{year}:{mod_idx}:{subj_idx}:{i}"
+            if done:
+                return InlineKeyboardButton(f"✅ {label}", callback_data=cb)
+            return _event_green_button(label, cb)
+        buttons = [[_lecture_btn(i, name)] for i, name in enumerate(names)]
         buttons.append([InlineKeyboardButton("🔙 رجوع للمواد", callback_data=f"module:{year}:{mod_idx}")])
         header = f"🎓 <b>{year_label(year)} — {module} - {subject}</b>"
         if not names:
@@ -13285,7 +13286,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("📭 مفيش مواد متعرفة للموديول ده.")
             return
         buttons = [
-            [InlineKeyboardButton(s, callback_data=f"alsubj:{year}:{mod_idx}:{i}")]
+            [InlineKeyboardButton(
+                f"{s} ({len(ready_lecture_keys(year, module, s))})",
+                callback_data=f"alsubj:{year}:{mod_idx}:{i}",
+            )]
             for i, s in enumerate(subjects)
         ]
         buttons.append([InlineKeyboardButton("🔙 رجوع للموديولات", callback_data=f"alyr:{year}")])
@@ -13321,8 +13325,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         AWAITING_ADD_LECTURE_NAME[user_id] = {"year": year, "module": module, "subject": subject}
+        _existing = []
+        for _k in ready_lecture_keys(year, module, subject):
+            _e = QUIZ_INDEX[year][_k]
+            _existing.append(f"{html.escape(str(_e.get('lecture_number', '?')))}- {html.escape(str(_e.get('name', _k)))}")
+        _existing_block = (
+            "\n\n📋 <b>المحاضرات الموجودة:</b>\n" + "\n".join(_existing)
+            if _existing else "\n\n📋 مفيش محاضرات لسه."
+        )
         await query.edit_message_text(
-            f"📚 {module} - {subject}\n\n"
+            f"📚 {html.escape(module)} - {html.escape(subject)}{_existing_block}\n\n"
             "ابعت رقم المحاضرة واسمها بالصيغة:\n<code>رقم: الاسم</code>\n"
             "مثال: <code>3: Insulin Signaling</code>",
             parse_mode=ParseMode.HTML,
