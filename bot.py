@@ -246,7 +246,6 @@ UNIVERSITY_ADMINS = {
 }
 YEAR_ADMINS = {
     6227299969: ["y1", "y2"],   # MFM Year 1 + Year 2 (quiz content only; no broadcast/ban)
-    5959402081: ["y1", "y2"],   # MFM Year 1 + Year 2 (quiz content only; no broadcast/ban)
 }
 # Combined id -> scope map the helpers below read (a year key or a
 # university key). If an ID is in both dicts, the university scope wins.
@@ -14161,8 +14160,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if query.data == "menu_how":
+        # Exactly the same message as onboarding's "what is this place?!"
         await query.edit_message_text(
-            HOW_TO_USE_TEXT, parse_mode=ParseMode.HTML,
+            ONBOARDING_SPECIAL_TEXT, parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("🏠 Back to Home", callback_data="back_home"),
             ]]),
@@ -15508,7 +15508,7 @@ def _build_previewtxt_sections() -> list[str]:
         "🎓 Set University · ⬅️ Back · ➡️ More Settings · 🏠 Back to Home\n\n"
         "Settings (page 3): ℹ️ About Us · 🫶 Support Us · 📜 Terms of Service · "
         "⬅️ Back · 🏠 Back to Home\n\n"
-        "── HOW TO USE ──\n\n" + HOW_TO_USE_TEXT
+        "── HOW TO USE (same as onboarding) ──\n\n" + ONBOARDING_SPECIAL_TEXT
     )
 
     ach_lines = ["── ACHIEVEMENTS (name — quip, per tier) ──\n"]
@@ -15566,6 +15566,142 @@ async def previewtxt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for chunk in _chunk_text(section):
             await update.message.reply_text(chunk, parse_mode=ParseMode.HTML)
 
+# ═══════════════════════════════════════════════════════════════
+# /tutorial — full admin guide (English)
+# ═══════════════════════════════════════════════════════════════
+ADMIN_TUTORIAL_SECTIONS = [
+    (
+        "🎓 <b>QUIZICIAN ADMIN TUTORIAL</b>\n\n"
+        "This guide walks through every admin command and how to use it. "
+        "Commands marked 👑 are Creator-only. Your scope decides which years you can touch: "
+        "a <b>university admin</b> manages every year of one university, a <b>year admin</b> manages "
+        "only the year(s) assigned to them. Year keys: <code>y1 y2 y3</code> = MFM, "
+        "<code>n1 n2 n3</code> = MNU.\n\n"
+        "Send /c any time for the short command list."
+    ),
+    (
+        "📚 <b>1. Adding content</b>\n\n"
+        "<b>/add_lecture</b>\n"
+        "Creates a lecture in a DM session, no channel needed.\n"
+        "1) Pick year → module → subject. Each subject shows how many lectures it already has, e.g. <code>Physiology (4)</code>.\n"
+        "2) The bot lists the existing lectures (<code>1- Intro</code>, <code>2- ...</code>). "
+        "Send the new one as <code>number: name</code>, e.g. <code>3: Insulin Signaling</code>.\n"
+        "3) Forward quiz polls one by one (sender name hidden). A message with a <b>spoiler</b> is saved as a written question. "
+        "A long plain-text message is saved as a case study and attached to the next poll you forward. "
+        "A photo is attached to the next question too. Send a lone <code>.</code> to share the last case/image with the following questions.\n"
+        "4) Finish with <code>-END</code> or the <b>End Lecture</b> button. <b>Cancel Lecture</b> removes only what this session added.\n"
+        "Only one lecture per year can be open at a time.\n\n"
+        "<b>Quick question format</b>\n"
+        "Anyone can send a question like this and the bot turns it into a quiz poll:\n"
+        "<code>What is the powerhouse of the cell?\n"
+        "a) choice 1\n"
+        "b) Mitochondria z\n"
+        "c) choice 2\n"
+        "ex: optional explanation</code>\n"
+        "Mark the correct choice with <code>z</code>."
+    ),
+    (
+        "✏️ <b>2. Editing content</b>\n\n"
+        "<b>/edit_quiz</b> (alias <b>/quiz_edit</b>)\n"
+        "Browse year → module → subject → lecture, then open a question to:\n"
+        "• 🗑 delete it\n"
+        "• ➕ insert new poll(s) right after it (a DM session, closed with <code>-END</code>)\n"
+        "• ➕ Tail poll: append at the end of the lecture\n"
+        "• 📎 add, replace or remove a case study or image on an existing question\n"
+        "• change the correct choice\n"
+        "🔎 <b>Search Questions</b> inside it finds every matching question across the year/module so you don't have to drill lecture by lecture.\n\n"
+        "<b>/quiz_list</b> [year]\n"
+        "Lists every lecture (open and closed). Without a year it opens the button flow.\n\n"
+        "<b>/quiz_delete</b> [year] [number]\n"
+        "Removes a lecture from the index after a confirmation tap. It does not delete the channel messages, "
+        "it just stops showing the lecture to students.\n\n"
+        "<b>/edit_daily</b>\n"
+        "Edit today's Daily Quiz questions, same idea as /edit_quiz."
+    ),
+    (
+        "🎉 <b>3. Events</b>\n\n"
+        "<b>/event_start</b>\n"
+        "Name the event → pick university and year (skipped when your scope leaves only one choice) → forward quiz polls like /add_lecture → "
+        "tap 🚀 <b>Publish</b> (or send <code>-END</code>). A published event puts a green button on students' main menu.\n\n"
+        "<b>/edit_event</b>\n"
+        "Browse, edit, add or delete questions of your events.\n\n"
+        "<b>/event_end</b>\n"
+        "Pick the event to close. It is removed from the sessions backup and the green button disappears."
+    ),
+    (
+        "👥 <b>4. Users</b>\n\n"
+        "<b>/tell</b> &lt;ID or Nickname&gt; &lt;message&gt;\n"
+        "DMs a user directly from the bot. The reference must be a single word, so use their ID for multi-word nicknames.\n\n"
+        "<b>/set_year</b> &lt;Nickname or ID&gt;\n"
+        "Shows the year picker for that person so you can fix their year/class.\n\n"
+        "<b>/mystats</b> [Nickname or ID]\n"
+        "Your own stats, or someone else's when you add a name/ID.\n\n"
+        "<b>/ban</b> &lt;ID&gt; &lt;hours&gt; &lt;reason&gt;\n"
+        "Blocks a user for that many hours, e.g. <code>/ban 123456789 24 spam</code>. A second /ban overwrites the first. "
+        "University admins and the Creator only, and only for their own university's users.\n\n"
+        "<b>/unban</b> &lt;ID&gt;\n"
+        "Lifts a ban early.\n\n"
+        "<b>/broadcast</b> [message]\n"
+        "Opens the composer: choose the audience, set the message (you can also reply to a message or attach a photo/video/file), "
+        "preview it, check the estimated recipient count, then send. A progress bar shows while it goes out. "
+        "University admins reach their own university only; year admins can't broadcast."
+    ),
+    (
+        "🔍 <b>5. Previews and info</b>\n\n"
+        "<b>/preview</b>\n"
+        "Walks you through exactly what a brand-new user sees on first /start (nickname → year → welcome tour). "
+        "It's a safe preview: nothing is saved and the year buttons are inert.\n\n"
+        "<b>/previewtxt</b>\n"
+        "Dumps every static message a normal user can see, as plain text.\n\n"
+        "<b>/time</b>\n"
+        "Current Cairo time and when the next Daily Quiz goes out.\n\n"
+        "<b>/c</b>\n"
+        "The command list. Admin-only commands show up only for admins."
+    ),
+]
+
+ADMIN_TUTORIAL_CREATOR_SECTION = (
+    "👑 <b>6. Creator-only tools</b>\n\n"
+    "<b>/dev_panel</b>\n"
+    "Control panel with a stats snapshot and shortcuts: Set year, Users, Backups, Daily module.\n\n"
+    "<b>/daily_module</b>\n"
+    "Pick a year, then a module (and optionally specific lectures) to scope the Daily Quiz. Use the off option to return to the default.\n\n"
+    "<b>/health</b>\n"
+    "Dashboard: is the bot up, user and lecture counts, whether each backup is trustworthy, live sessions, errors in the last 24h, uptime.\n\n"
+    "<b>/backup_now</b>\n"
+    "Forces the pinned channel backups to refresh right now.\n\n"
+    "<b>/restore</b>\n"
+    "Pick a system and restore it from its latest pinned backup (some options ask for confirmation).\n\n"
+    "<b>/restore_analytics</b>\n"
+    "Re-pulls analytics from the pinned backup without restarting.\n\n"
+    "<b>/import_analytics</b>\n"
+    "Reply to an analytics <code>.json</code> file with this command to merge it in. Existing data is not wiped.\n\n"
+    "<b>/reset_analytics</b>\n"
+    "⚠️ Wipes ALL analytics and the pinned backup after a confirmation. Irreversible."
+)
+
+ADMIN_TUTORIAL_TIPS = (
+    "💡 <b>Tips</b>\n\n"
+    "• Only one authoring session (lecture or event) can be open per year at a time. Close it with <code>-END</code> first.\n"
+    "• Forward polls with the sender name hidden so they can be copied cleanly.\n"
+    "• Use /cancel if something gets stuck mid-flow.\n"
+    "• If a command says it's admin-only or out of scope, it's outside your assigned years.\n"
+    "• To check what students see, run /preview."
+)
+
+async def tutorial_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/tutorial — admin-only English walkthrough of every admin command."""
+    if not is_admin(update):
+        await update.message.reply_text(MSG_ADMIN_ONLY)
+        return
+    sections = list(ADMIN_TUTORIAL_SECTIONS)
+    if is_creator(update):
+        sections.append(ADMIN_TUTORIAL_CREATOR_SECTION)
+    sections.append(ADMIN_TUTORIAL_TIPS)
+    for section in sections:
+        for chunk in _chunk_text(section):
+            await update.message.reply_text(chunk, parse_mode=ParseMode.HTML)
+
 async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/c — lists every command, admin-only ones only shown to the admin."""
     lines = ["📖 <b>Available commands:</b>\n"]
@@ -15585,6 +15721,7 @@ async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append("\n🔐 <b>Admin only</b>")
         if is_creator(update):
             lines.append("/dev_panel — stats snapshot + shortcuts (Set year, Users, Backups, Daily module) — Creator only")
+        lines.append("/tutorial — full admin guide (every admin command explained)")
         lines.append("/set_year &lt;Nickname or ID&gt;")
         lines.append("/tell &lt;ID or Nickname&gt; &lt;message&gt;")
         lines.append("/preview — walk through the onboarding flow (nickname → year/class → bully joke → welcome)")
@@ -17704,6 +17841,7 @@ app.add_handler(CommandHandler("report_issue",   report_issue_cmd))
 app.add_handler(CommandHandler("feedback",       feedback_cmd))
 app.add_handler(CommandHandler("sleep",          sleep_cmd))
 app.add_handler(CommandHandler("dev_panel",      dev_panel_cmd))
+app.add_handler(CommandHandler("tutorial",       tutorial_cmd))
 app.add_handler(CommandHandler("preview",        preview_cmd))
 app.add_handler(CommandHandler("previewtxt",     previewtxt_cmd))
 app.add_handler(CommandHandler("set_year",       set_year_cmd))
