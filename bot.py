@@ -2628,18 +2628,27 @@ def _lecture_leaderboard(lecture_key: str, limit: int = 20) -> list[dict]:
     rows.sort(key=lambda r: (-r["best_pct"], -r["best_correct"], r["last_at"]))
     return rows[:limit]
 
-async def backup_lecture_results_to_channel(context):
-    global _lecture_results_backup_msg_id, _last_lecture_results_backup_at
+async def backup_lecture_results_to_channel(context, force: bool = False):
+    global _lecture_results_backup_msg_id, _last_lecture_results_backup_at, _daily_lb_backup_pending
     if not LECTURE_RESULTS_GROUP_ID:
         return
     if not RESTORE_OK["lecture_results"]:
         print("LECTURE RESULTS BACKUP SKIPPED — last restore failed, refusing to overwrite the channel backup.")
         return
     now = time.monotonic()
-    if now - _last_lecture_results_backup_at < LECTURE_RESULTS_BACKUP_MIN_INTERVAL:
+    if not force and now - _last_lecture_results_backup_at < LECTURE_RESULTS_BACKUP_MIN_INTERVAL:
         return   # backed up recently enough — local save_lecture_results() already has the latest data
     _last_lecture_results_backup_at = now
+    _daily_lb_backup_pending = False   # this upload carries the current daily leaderboard (re-armed below on failure)
     data = _build_university_zip("lecture_results", _split_lecture_results_by_university())
+    # The Daily Quiz leaderboard rides in the same zip as one extra member.
+    # _read_university_backup only looks at the per-university members, so
+    # older code reading this zip simply ignores it.
+    _zbuf = BytesIO(data)
+    with zipfile.ZipFile(_zbuf, "a", zipfile.ZIP_DEFLATED) as _zf:
+        _zf.writestr(DAILY_LEADERBOARD_ZIP_MEMBER,
+                     json.dumps(_daily_leaderboard_payload(), indent=2, ensure_ascii=False))
+    data = _zbuf.getvalue()
     try:
         sent = await context.bot.send_document(
             chat_id=LECTURE_RESULTS_GROUP_ID,
@@ -2648,6 +2657,7 @@ async def backup_lecture_results_to_channel(context):
         )
     except Exception as e:
         print("LECTURE RESULTS BACKUP ERROR:", e)
+        _daily_lb_backup_pending = True
         return
     try:
         await context.bot.pin_chat_message(
@@ -2683,6 +2693,18 @@ async def restore_lecture_results_from_channel(app):
         for part in parts:
             LECTURE_RESULTS.update(part)
         await save_lecture_results()
+        # Daily Quiz leaderboard copy (absent in older backups). Best effort:
+        # a missing/odd member must never fail the lecture-results restore.
+        global _DAILY_LB_FROM_LECTURE_ZIP
+        try:
+            if zipfile.is_zipfile(BytesIO(bytes(raw))):
+                with zipfile.ZipFile(BytesIO(bytes(raw))) as _zf:
+                    if DAILY_LEADERBOARD_ZIP_MEMBER in _zf.namelist():
+                        _DAILY_LB_FROM_LECTURE_ZIP = json.loads(_zf.read(DAILY_LEADERBOARD_ZIP_MEMBER).decode("utf-8"))
+                        if _apply_daily_leaderboard_payload(_DAILY_LB_FROM_LECTURE_ZIP):
+                            await save_daily_leaderboard()
+        except Exception as e:
+            print("DAILY LEADERBOARD: couldn't read it from the lecture-results backup:", e)
         _lecture_results_backup_msg_id = pinned.message_id
         print(f"Restored lecture results: {len(LECTURE_RESULTS)} lecture(s).")
 
@@ -3006,6 +3028,7 @@ def _finalize_daily_leaderboard() -> None:
     if any_ranked:
         _mark_analytics_dirty()
     DAILY_QUIZ_LEADERBOARD = {}
+    _mark_daily_lb_dirty()
 
 def _ensure_daily_leaderboard_fresh() -> None:
     """Call before any read or write of DAILY_QUIZ_LEADERBOARD. The board
@@ -3021,6 +3044,7 @@ def _ensure_daily_leaderboard_fresh() -> None:
         _finalize_daily_leaderboard()
     DAILY_QUIZ_LEADERBOARD_DATE = today
     DAILY_QUIZ_LEADERBOARD = {}
+    _mark_daily_lb_dirty()
 
 def _live_daily_dids(year: str) -> set:
     """did (as str) of every question currently in today's Daily Quiz for `year`."""
@@ -3045,6 +3069,7 @@ def _apply_live_scores(year: str, row: dict) -> None:
 def _recompute_daily_leaderboard(year: str) -> None:
     for row in DAILY_QUIZ_LEADERBOARD.get(year, {}).values():
         _apply_live_scores(year, row)
+    _mark_daily_lb_dirty()
 
 def _rank_daily_leaderboard(year: str, limit: int = 20) -> list[dict]:
     """Today's Daily Quiz finishers for one year, ranked the same way as
@@ -3071,6 +3096,108 @@ def _record_daily_leaderboard_finish(user_id: int, year: str, correct: int, tota
     }
     _apply_live_scores(year, row)
     board[user_id] = row
+    _mark_daily_lb_dirty()
+
+# ═══════════════════════════════════════════════════════════════
+# DAILY QUIZ LEADERBOARD — persistence. Its own local file (saved right
+# when someone finishes) plus a copy inside the lecture-results backup zip
+# (daily_leaderboard.json next to the lecture_results_<uni>.json files, same
+# pinned message in LECTURE_RESULTS_GROUP_ID — see
+# backup_lecture_results_to_channel), restored on startup. It ALSO still rides in the
+# sessions snapshot (see _sessions_snapshot) as a second copy; on restore the
+# two are merged (see _apply_daily_leaderboard_payload).
+#
+# daily_leaderboard.json schema:
+# {"date": "YYYY-MM-DD", "boards": {year: {str(user_id): {row}}}}
+# ═══════════════════════════════════════════════════════════════
+DAILY_LEADERBOARD_FILE          = "daily_leaderboard.json"
+DAILY_LEADERBOARD_ZIP_MEMBER    = "daily_leaderboard.json"   # name inside the lecture-results zip
+DAILY_LEADERBOARD_FLUSH_INTERVAL = 15   # seconds, periodic job
+
+_daily_lb_dirty: bool = False            # local file out of date
+_daily_lb_backup_pending: bool = False   # channel zip out of date
+_DAILY_LB_FROM_LECTURE_ZIP: dict | None = None   # payload read out of the pinned zip (applied after sessions restore)
+
+def _mark_daily_lb_dirty() -> None:
+    global _daily_lb_dirty, _daily_lb_backup_pending
+    _daily_lb_dirty = True
+    _daily_lb_backup_pending = True
+
+def _daily_leaderboard_payload() -> dict:
+    return {
+        "date":   DAILY_QUIZ_LEADERBOARD_DATE,
+        "boards": {y: {str(u): r for u, r in rows.items()} for y, rows in DAILY_QUIZ_LEADERBOARD.items()},
+    }
+
+async def save_daily_leaderboard() -> None:
+    global _daily_lb_dirty
+    _daily_lb_dirty = False
+    await _write_json_serialized(
+        DAILY_LEADERBOARD_FILE, lambda: copy.deepcopy(_daily_leaderboard_payload()),
+        indent=2, ensure_ascii=False)
+
+def _apply_daily_leaderboard_payload(payload) -> bool:
+    """Loads a saved leaderboard into the live one. A payload from an OLDER
+    day is ignored, a NEWER day replaces it, and the SAME day is merged (any
+    finisher missing from the live board is added) so two copies of the
+    same day never cancel each other out. Returns whether anything changed."""
+    global DAILY_QUIZ_LEADERBOARD_DATE, DAILY_QUIZ_LEADERBOARD
+    if not isinstance(payload, dict) or not isinstance(payload.get("boards"), dict):
+        return False
+    date = payload.get("date")
+    if not date:
+        return False
+    cur = DAILY_QUIZ_LEADERBOARD_DATE
+    if cur is not None and date < cur:
+        return False
+    parsed: dict = {}
+    for year, rows in payload["boards"].items():
+        if not isinstance(rows, dict):
+            continue
+        for uid_str, row in rows.items():
+            if isinstance(row, dict) and str(uid_str).lstrip("-").isdigit():
+                parsed.setdefault(year, {})[int(uid_str)] = row
+    if cur is None or date > cur:
+        DAILY_QUIZ_LEADERBOARD_DATE = date
+        DAILY_QUIZ_LEADERBOARD = parsed
+        return True
+    changed = False
+    for year, rows in parsed.items():
+        board = DAILY_QUIZ_LEADERBOARD.setdefault(year, {})
+        for uid, row in rows.items():
+            if uid not in board:
+                board[uid] = row
+                changed = True
+    return changed
+
+def _load_daily_leaderboard_local() -> None:
+    """Startup: merge daily_leaderboard.json into the live board."""
+    payload = _load_json_safe(DAILY_LEADERBOARD_FILE, dict, dict, "DAILY LEADERBOARD")
+    if _apply_daily_leaderboard_payload(payload):
+        print(f"Loaded daily leaderboard from disk ({sum(len(r) for r in DAILY_QUIZ_LEADERBOARD.values())} finisher(s)).")
+
+async def persist_daily_leaderboard(context, force_backup: bool = False) -> None:
+    """Saves to disk now, and mirrors to the channel via the lecture-results
+    backup (throttled unless force_backup). Never raises — a failed save must not break answering."""
+    try:
+        await save_daily_leaderboard()
+        await backup_lecture_results_to_channel(context, force=force_backup)   # the zip carries this board too
+    except Exception as e:
+        print("DAILY LEADERBOARD PERSIST ERROR:", e)
+
+async def _flush_daily_leaderboard_if_dirty() -> None:
+    if _daily_lb_dirty:
+        await save_daily_leaderboard()
+
+async def _flush_daily_leaderboard_job(context: ContextTypes.DEFAULT_TYPE):
+    """Periodic tick: catches changes made by sync code (the 2pm roll,
+    /edit_daily re-scoring) and retries a channel backup the throttle skipped."""
+    try:
+        await _flush_daily_leaderboard_if_dirty()
+        if _daily_lb_backup_pending:
+            await backup_lecture_results_to_channel(context)
+    except Exception as e:
+        print("DAILY LEADERBOARD FLUSH ERROR:", e)
 
 # Push time for the daily 💥Daily Quiz💥 button (see job_queue.run_daily in
 # MAIN, and next_daily_quiz_time() / /time below — all three read from
@@ -3795,6 +3922,7 @@ async def _advance_daily_quiz_session(context: ContextTypes.DEFAULT_TYPE, user_i
         if session.get("day") in (None, _daily_quiz_day()):
             _record_daily_leaderboard_finish(user_id, year, correct, session["answered"], duration,
                                              results=session.get("results"))
+            await persist_daily_leaderboard(context)
 
         # Daily Quiz completion count + its tier achievement, plus the
         # basmagy/insomniac Extras — all reuse data this block already
@@ -4070,7 +4198,7 @@ async def _maybe_send_zikr_poll(context: ContextTypes.DEFAULT_TYPE, user_id: int
 def _daily_backup_export_file_paths() -> list:
     paths = [
         USERS_FILE, ANALYTICS_FILE, SETTINGS_FILE, LECTURE_RESULTS_FILE,
-        MISTAKES_BANK_FILE, STORAGE_INDEX_FILE, STORAGE_BACKUP_STATE_FILE,
+        MISTAKES_BANK_FILE, DAILY_LEADERBOARD_FILE, STORAGE_INDEX_FILE, STORAGE_BACKUP_STATE_FILE,
         REPORT_THREADS_FILE, QUESTION_REPORTS_FILE, STATS_HISTORY_FILE,
     ]
     for year in YEAR_ORDER:
@@ -10638,6 +10766,7 @@ def _dq_after_delete(year: str, did) -> None:
 async def _dq_persist(context) -> None:
     await _flush_sessions_if_changed()
     await backup_sessions_to_channel(context)
+    await persist_daily_leaderboard(context, force_backup=True)   # reset / delete re-scores or clears the board
 
 async def _dq_sync_source(context, year: str, q: dict, keys: tuple) -> None:
     """Mirrors the edited fields back to the original lecture question."""
@@ -10741,6 +10870,356 @@ async def edit_daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     AWAITING_DAILY_EDIT.pop(uid, None)
     text, markup = _dq_root_view(uid)
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+# ═══════════════════════════════════════════════════════════════
+# /re_daily — admin: reset TODAY'S Daily Quiz for one year, after a confirm.
+# What a reset does (for the chosen year only):
+#   • throws away today's shared question set and builds a fresh one
+#   • clears today's leaderboard (no medals are handed out for it)
+#   • ends any Daily Quiz run in progress for that year
+#   • clears everyone-in-that-year's "already played today" flag, so they can
+#     play the new set
+# XP / achievements already earned are NOT taken back. Callbacks:
+#   re_daily_y:<year>   confirm screen
+#   re_daily_ok:<year>  do it
+#   re_daily_no         cancel
+# ═══════════════════════════════════════════════════════════════
+def _re_daily_year_view(uid: int):
+    years = _dq_admin_years(uid)
+    if not years:
+        return "📭 مفيش سنين متاحة ليك دلوقتي.", None
+    rows = [[InlineKeyboardButton(
+        f"{UNIVERSITIES.get(year_university(y), '')} {year_label(y)}",
+        callback_data=f"re_daily_y:{y}",
+    )] for y in years]
+    return "🔄 <b>Reset Daily Quiz — اختار السنة:</b>", InlineKeyboardMarkup(rows)
+
+def _re_daily_confirm_view(year: str):
+    _ensure_daily_leaderboard_fresh()
+    today = _daily_quiz_day()
+    played = sum(
+        1 for k, v in SETTINGS.items()
+        if isinstance(v, dict) and v.get("year_class") == year and v.get("daily_quiz_last_date") == today
+    )
+    finished = len(DAILY_QUIZ_LEADERBOARD.get(year, {}))
+    text = (
+        f"🔄 <b>تعمل Reset للـ Daily Quiz بتاع النهاردة — {year_label(year)}؟</b>\n\n"
+        f"• هيتبني سيت أسئلة جديد\n"
+        f"• الـ leaderboard هيتمسح ({finished} واحد خلصوا)\n"
+        f"• أي حد لسه بيحل هيتوقف، و{played} واحد لعبوا النهاردة هيقدروا يلعبوا تاني\n"
+        f"• الـ XP والإنجازات اللي اتكسبت قبل كده مش هترجع"
+    )
+    markup = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ أيوه، Reset", callback_data=f"re_daily_ok:{year}"),
+        InlineKeyboardButton("↩️ لأ", callback_data="re_daily_no"),
+    ]])
+    return text, markup
+
+async def re_daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: /re_daily — reset today's Daily Quiz (asks for confirmation first)."""
+    if not is_admin(update):
+        await update.message.reply_text(MSG_ADMIN_ONLY)
+        return
+    uid = update.effective_user.id
+    years = _dq_admin_years(uid)
+    if len(years) == 1:   # a year-locked admin has nothing to pick
+        text, markup = _re_daily_confirm_view(years[0])
+    else:
+        text, markup = _re_daily_year_view(uid)
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+async def _reset_daily_quiz_for_year(context: ContextTypes.DEFAULT_TYPE, year: str) -> tuple[int, int]:
+    """Does the reset. Returns (new_question_count, players_unlocked)."""
+    today = _daily_quiz_day()
+
+    # 1) shared question set — drop it and the cached pool it was drawn from
+    _ensure_daily_quiz_questions_fresh()
+    _DAILY_QUIZ_QUESTIONS.pop(year, None)
+    _DAILY_QUIZ_POOL_CACHE.pop(year, None)
+
+    # 2) today's leaderboard for this year (no medals)
+    _ensure_daily_leaderboard_fresh()
+    DAILY_QUIZ_LEADERBOARD.pop(year, None)
+
+    # 3) runs in progress for this year
+    for user_id, sess in list(DAILY_QUIZ_SESSIONS.items()):
+        if sess.get("year") == year:
+            DAILY_QUIZ_SESSIONS.pop(user_id, None)
+
+    # 4) "already played today" flag for everyone in this year
+    unlocked = 0
+    for key, entry in SETTINGS.items():
+        if isinstance(entry, dict) and entry.get("year_class") == year and entry.get("daily_quiz_last_date") == today:
+            entry.pop("daily_quiz_last_date", None)
+            unlocked += 1
+    if unlocked:
+        _mark_settings_dirty()
+        await backup_settings_to_channel(context)
+
+    # 5) build the new set right away (also persists it with the sessions)
+    questions = await get_daily_quiz_questions(context, year)
+    await _dq_persist(context)
+    return len(questions), unlocked
+
+async def _re_daily_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, query) -> None:
+    uid, data = query.from_user.id, query.data
+    parts = data.split(":")
+    cmd = parts[0]
+
+    async def send(text, markup=None):
+        try:
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        except Exception as e:
+            if "not modified" not in str(e).lower():
+                raise
+
+    if cmd == "re_daily_no":
+        await send("↩️ اتلغى — الـ Daily Quiz زي ما هو.")
+        return
+
+    year = parts[1] if len(parts) > 1 else None
+    if year not in YEARS or year not in _dq_admin_years(uid):
+        await send("⚠️ السنة دي مش في صلاحياتك.")
+        return
+
+    if cmd == "re_daily_y":
+        text, markup = _re_daily_confirm_view(year)
+        await send(text, markup)
+        return
+
+    if cmd == "re_daily_ok":
+        await send("⏳ بعمل Reset وببني أسئلة جديدة...")
+        try:
+            count, unlocked = await _reset_daily_quiz_for_year(context, year)
+        except Exception as e:
+            traceback.print_exc()
+            await send(f"⚠️ حصلت مشكلة وأنا بعمل الـ Reset: {html.escape(str(e))}")
+            return
+        await admin_log(
+            context, "🔄 Daily Quiz reset",
+            f"📚 {year_label(year)} — {count} سؤال جديد · {unlocked} لاعب اتفتحلهم تاني",
+            query.from_user,
+        )
+        await send(
+            f"✅ اتعمل Reset للـ Daily Quiz — {year_label(year)}\n"
+            f"📝 {count} سؤال جديد · 🔓 {unlocked} لاعب يقدروا يلعبوا تاني"
+            + ("\n\n⚠️ مفيش أسئلة جاهزة كفاية دلوقتي." if not count else "")
+        )
+        return
+
+# ═══════════════════════════════════════════════════════════════
+# /leaderboard_edit — admin: add or remove a row on TODAY'S Daily Quiz
+# leaderboard (for when data got lost and has to be put back by hand).
+#   lbe_root              year picker
+#   lbe_y:<year>          the board, one 🗑 button per row + ➕ Add entry
+#   lbe_r:<year>:<uid>    confirm removing that row
+#   lbe_rok:<year>:<uid>:<0|1>   do it (1 = also let them play again)
+#   lbe_a:<year>          start adding: type nickname/ID, then "17/20 3:25"
+# Every change is saved + backed up straight away (persist_daily_leaderboard).
+# Medals are handed out from whatever the board holds at the 2pm roll, so
+# edits made before then change who gets them.
+# ═══════════════════════════════════════════════════════════════
+AWAITING_LB_EDIT: dict = {}   # admin uid -> {"step": "user"|"data", "year", "target"?}
+LB_EDIT_MAX_ROWS = 40
+
+def _lb_name(user_id: int) -> str:
+    return get_nickname(user_id) or f"مستخدم #{user_id % 10000}"
+
+def _lb_year_view(uid: int):
+    years = _dq_admin_years(uid)
+    if not years:
+        return "📭 مفيش سنين متاحة ليك دلوقتي.", None
+    rows = [[InlineKeyboardButton(
+        f"{UNIVERSITIES.get(year_university(y), '')} {year_label(y)}", callback_data=f"lbe_y:{y}")] for y in years]
+    return "🏆 <b>Leaderboard Edit — اختار السنة:</b>", InlineKeyboardMarkup(rows)
+
+def _lb_board_view(year: str):
+    _ensure_daily_leaderboard_fresh()
+    ranked = _rank_daily_leaderboard(year, limit=LB_EDIT_MAX_ROWS)
+    total_rows = len(DAILY_QUIZ_LEADERBOARD.get(year, {}))
+    lines = [f"🏆 <b>Daily Quiz Leaderboard — {year_label(year)} — النهاردة</b>", ""]
+    buttons = []
+    if not ranked:
+        lines.append("مفيش حد على اللوحة لسه.")
+    for i, r in enumerate(ranked):
+        label = f"{i + 1}. {r['name']} — {r['correct']}/{r['total']} ✅ · ⏱️ {_format_duration(r['duration'])}"
+        lines.append(html.escape(label))
+        buttons.append([InlineKeyboardButton(f"🗑 {label}"[:60], callback_data=f"lbe_r:{year}:{r['user_id']}")])
+    if total_rows > len(ranked):
+        lines.append(f"\n(بيظهر أول {len(ranked)} من {total_rows})")
+    lines.append("\nدوس على اسم عشان تمسحه، أو ➕ عشان تضيف.")
+    buttons.append([InlineKeyboardButton("➕ Add entry", callback_data=f"lbe_a:{year}")])
+    buttons.append([InlineKeyboardButton("🔙 رجوع", callback_data="lbe_root")])
+    return "\n".join(lines), InlineKeyboardMarkup(buttons)
+
+async def leaderboard_edit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: /leaderboard_edit — add/remove a name on today's Daily Quiz leaderboard."""
+    if not is_admin(update):
+        await update.message.reply_text(MSG_ADMIN_ONLY)
+        return
+    uid = update.effective_user.id
+    AWAITING_LB_EDIT.pop(uid, None)
+    years = _dq_admin_years(uid)
+    if len(years) == 1:
+        text, markup = _lb_board_view(years[0])
+    else:
+        text, markup = _lb_year_view(uid)
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+def _lb_parse_score(text: str):
+    """'17/20 3:25' | '17/20 205' | '17/20 205s' -> (correct, total, seconds) or None."""
+    m = re.fullmatch(r"\s*(\d+)\s*/\s*(\d+)\s+(?:(\d+):(\d{1,2})|(\d+(?:\.\d+)?)\s*s?)\s*", text or "")
+    if not m:
+        return None
+    correct, total = int(m.group(1)), int(m.group(2))
+    seconds = int(m.group(3)) * 60 + int(m.group(4)) if m.group(3) is not None else float(m.group(5))
+    if total < 1 or total > 100 or correct > total:
+        return None
+    return correct, total, float(seconds)
+
+async def _lb_apply_text(update: Update, context: ContextTypes.DEFAULT_TYPE, st: dict, text: str) -> None:
+    """Consumes the admin's typed reply for a pending AWAITING_LB_EDIT."""
+    uid, year = update.effective_user.id, st["year"]
+    reply = update.message.reply_text
+    if year not in _dq_admin_years(uid):
+        await reply("⚠️ السنة دي مش في صلاحياتك.")
+        return
+    cancel = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"lbe_y:{year}")]])
+
+    if st["step"] == "user":
+        target = _resolve_user_ref(text)
+        if target is None:
+            AWAITING_LB_EDIT[uid] = st
+            await reply("⚠️ ملقيتش المستخدم ده — ابعت الـ nickname أو الـ ID تاني.", reply_markup=cancel)
+            return
+        AWAITING_LB_EDIT[uid] = {"step": "data", "year": year, "target": target}
+        warn = ""
+        if get_year_class(target) != year:
+            warn = f"\n⚠️ سنته المتسجلة: {year_class_label(get_year_class(target))} (مختلفة عن {year_label(year)})."
+        await reply(
+            f"👤 <b>{html.escape(_lb_name(target))}</b> (<code>{target}</code>){warn}\n\n"
+            "ابعت النتيجة والوقت بالشكل ده:\n<code>17/20 3:25</code>\n"
+            "(صح/الإجمالي، وبعدين الوقت دقايق:ثواني — أو ثواني بس)",
+            parse_mode=ParseMode.HTML, reply_markup=cancel,
+        )
+        return
+
+    # step == "data"
+    parsed = _lb_parse_score(text)
+    if parsed is None:
+        AWAITING_LB_EDIT[uid] = st
+        await reply("⚠️ الشكل غلط. ابعت زي كده: <code>17/20 3:25</code> (الصح مينفعش يكبر الإجمالي).",
+                    parse_mode=ParseMode.HTML, reply_markup=cancel)
+        return
+    correct, total, duration = parsed
+    target = st["target"]
+    _ensure_daily_leaderboard_fresh()
+    board = DAILY_QUIZ_LEADERBOARD.setdefault(year, {})
+    replaced = target in board
+    board[target] = {
+        "user_id": target, "name": _lb_name(target), "correct": correct, "total": total,
+        "duration": duration, "results": None,   # no per-question data to restore — keeps the typed score as-is
+    }
+    _mark_daily_lb_dirty()
+    # They did finish today's quiz — don't let them start it again.
+    entry = _get_settings_entry(target)
+    entry["daily_quiz_last_date"] = _daily_quiz_day()
+    _mark_settings_dirty()
+    await backup_settings_to_channel(context)
+    await persist_daily_leaderboard(context, force_backup=True)
+    await admin_log(
+        context, "🏆 Daily leaderboard entry " + ("replaced" if replaced else "added"),
+        f"📚 {year_label(year)} — {html.escape(_lb_name(target))} ({target}): {correct}/{total} · {_format_duration(duration)}",
+        update.effective_user,
+    )
+    body, markup = _lb_board_view(year)
+    await reply(f"✅ اتضاف: {html.escape(_lb_name(target))} — {correct}/{total}"
+                + (" (واستبدل الصف القديم)" if replaced else "") + "\n\n" + body,
+                parse_mode=ParseMode.HTML, reply_markup=markup)
+
+async def _lb_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, query) -> None:
+    uid, parts = query.from_user.id, query.data.split(":")
+    cmd = parts[0]
+
+    async def send(text, markup=None):
+        try:
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        except Exception as e:
+            if "not modified" not in str(e).lower():
+                raise
+
+    if cmd == "lbe_root":
+        AWAITING_LB_EDIT.pop(uid, None)
+        text, markup = _lb_year_view(uid)
+        await send(text, markup)
+        return
+
+    year = parts[1] if len(parts) > 1 else None
+    if year not in YEARS or year not in _dq_admin_years(uid):
+        await send("⚠️ السنة دي مش في صلاحياتك.")
+        return
+
+    if cmd == "lbe_y":
+        AWAITING_LB_EDIT.pop(uid, None)
+        text, markup = _lb_board_view(year)
+        await send(text, markup)
+        return
+
+    if cmd == "lbe_a":
+        AWAITING_LB_EDIT[uid] = {"step": "user", "year": year}
+        await send(
+            f"➕ <b>إضافة للـ leaderboard — {year_label(year)}</b>\n\nابعت الـ nickname أو الـ Telegram ID بتاع الشخص:",
+            InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"lbe_y:{year}")]]),
+        )
+        return
+
+    try:
+        target = int(parts[2])
+    except (ValueError, IndexError):
+        await send("⚠️ الطلب ده مش مفهوم.")
+        return
+    row = DAILY_QUIZ_LEADERBOARD.get(year, {}).get(target)
+
+    if cmd == "lbe_r":
+        if row is None:
+            text, markup = _lb_board_view(year)
+            await send("⚠️ الصف ده مش موجود دلوقتي.\n\n" + text, markup)
+            return
+        await send(
+            f"🗑 تمسح <b>{html.escape(row['name'])}</b> ({row['correct']}/{row['total']}) من لوحة {year_label(year)}؟",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("🗑 امسح بس", callback_data=f"lbe_rok:{year}:{target}:0")],
+                [InlineKeyboardButton("🗑🔓 امسح وخليه يلعب تاني", callback_data=f"lbe_rok:{year}:{target}:1")],
+                [InlineKeyboardButton("↩️ لأ", callback_data=f"lbe_y:{year}")],
+            ]),
+        )
+        return
+
+    if cmd == "lbe_rok":
+        if row is None:
+            text, markup = _lb_board_view(year)
+            await send("⚠️ الصف ده مش موجود دلوقتي.\n\n" + text, markup)
+            return
+        DAILY_QUIZ_LEADERBOARD[year].pop(target, None)
+        _mark_daily_lb_dirty()
+        unlock = len(parts) > 3 and parts[3] == "1"
+        if unlock:
+            entry = SETTINGS.get(str(target))
+            if isinstance(entry, dict) and entry.get("daily_quiz_last_date") == _daily_quiz_day():
+                entry.pop("daily_quiz_last_date", None)
+                _mark_settings_dirty()
+                await backup_settings_to_channel(context)
+            DAILY_QUIZ_SESSIONS.pop(target, None)
+        await persist_daily_leaderboard(context, force_backup=True)
+        await admin_log(
+            context, "🏆 Daily leaderboard entry removed",
+            f"📚 {year_label(year)} — {html.escape(row['name'])} ({target}): {row['correct']}/{row['total']}"
+            + (" · can replay" if unlock else ""),
+            query.from_user,
+        )
+        text, markup = _lb_board_view(year)
+        await send(f"✅ اتمسح {html.escape(row['name'])}" + (" (ويقدر يلعب تاني)" if unlock else "") + "\n\n" + text, markup)
+        return
 
 async def _dq_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, query) -> None:
     uid, data = query.from_user.id, query.data
@@ -11020,6 +11499,13 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # stray message here could get misread as a search query, nickname,
     # etc. Quiz polls themselves arrive as update.message.poll, not text,
     # and are caught in handle_poll (see _capture_add_lecture_poll).
+    # ── /leaderboard_edit: waiting on a typed nickname/ID or score ───
+    lb_edit = AWAITING_LB_EDIT.pop(real_uid, None)
+    if lb_edit:
+        if is_admin(update):
+            await _lb_apply_text(update, context, lb_edit, text)
+            return
+
     # ── /edit_daily: waiting on a typed edit / search ────────────────
     dq_edit = AWAITING_DAILY_EDIT.pop(real_uid, None)
     if dq_edit:
@@ -12582,6 +13068,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 🔥COMING SOON🔥 — the toast above is the whole feature; leave the menu as is.
     if query.data == "coming_soon":
+        return
+
+    # ── /leaderboard_edit — see the /leaderboard_edit section ──
+    if query.data.startswith("lbe_"):
+        if not is_admin(update):
+            await query.answer("🚫 للأدمن فقط", show_alert=True)
+            return
+        await _lb_edit_callback(update, context, query)
+        return
+
+    # ── /re_daily — see the /re_daily section ──
+    if query.data.startswith("re_daily_"):
+        if not is_admin(update):
+            await query.answer("🚫 للأدمن فقط", show_alert=True)
+            return
+        await _re_daily_callback(update, context, query)
         return
 
     # ── /edit_daily — see the /edit_daily section ──
@@ -17840,6 +18342,8 @@ async def _post_init(app):
     await _migrate_legacy_bookmarks_into_mistakes_bank()
     await restore_report_threads_from_channel(app)
     await restore_sessions_from_channel(app)
+    _load_daily_leaderboard_local()                  # dedicated file merges over the sessions-snapshot copy
+    _apply_daily_leaderboard_payload(_DAILY_LB_FROM_LECTURE_ZIP)   # copy that rode in the lecture-results zip
 
     if app.job_queue is None:
         print(
@@ -17864,6 +18368,9 @@ async def _post_init(app):
             _flush_settings_job, interval=SETTINGS_FLUSH_INTERVAL, first=SETTINGS_FLUSH_INTERVAL,
         )
         app.job_queue.run_repeating(_stats_flush_job, interval=60, first=60)
+        app.job_queue.run_repeating(
+            _flush_daily_leaderboard_job, interval=DAILY_LEADERBOARD_FLUSH_INTERVAL, first=DAILY_LEADERBOARD_FLUSH_INTERVAL,
+        )
         app.job_queue.run_repeating(
             _flush_mistakes_bank_job, interval=MISTAKES_BANK_FLUSH_INTERVAL, first=MISTAKES_BANK_FLUSH_INTERVAL,
         )
@@ -17973,6 +18480,7 @@ async def _post_shutdown(app):
     await _flush_analytics_if_dirty()
     await _flush_settings_if_dirty()
     await _flush_mistakes_bank_if_dirty()
+    await _flush_daily_leaderboard_if_dirty()
     await _flush_sessions_if_changed()
     try:
         from types import SimpleNamespace
@@ -18338,6 +18846,8 @@ app.add_handler(CommandHandler("quiz_list",       quiz_list_cmd))
 app.add_handler(CommandHandler("quiz_delete",     quiz_delete_cmd))
 app.add_handler(CommandHandler("edit_quiz",       edit_quiz_cmd))
 app.add_handler(CommandHandler("edit_daily",      edit_daily_cmd))
+app.add_handler(CommandHandler("re_daily",        re_daily_cmd))
+app.add_handler(CommandHandler("leaderboard_edit", leaderboard_edit_cmd))
 app.add_handler(CommandHandler("quiz_edit",       edit_quiz_cmd))
 app.add_handler(CommandHandler("add_lecture",     add_lecture_cmd))
 app.add_handler(CommandHandler("event_start",     event_start_cmd))
