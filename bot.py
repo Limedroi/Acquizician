@@ -220,6 +220,9 @@ IMG_BASE_DIR  = os.path.join(tempfile.gettempdir(), "quizician_imgs")
 # ── Replace with YOUR Telegram numeric user ID ──────────────────
 # To find it: message @userinfobot on Telegram → it replies with your ID
 ADMIN_ID = 940770584
+# Every superadmin (full Creator powers). ADMIN_ID stays the primary account —
+# it's the one that gets DMs (sync failures, etc.) and the 👑 admin-log ping.
+SUPERADMIN_IDS = {ADMIN_ID, 815351746}   # 815351746 = the Creator's alt account
 
 # ── Admin hierarchy (three levels) ────────────────────────────────
 # 1. SUPERADMIN = ADMIN_ID above (the Creator): all control — every
@@ -1171,22 +1174,245 @@ def _today() -> str:
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-# ── Global "today" counters for /health ──────────────────────────
-# Questions answered (every poll answer: lectures, Daily Quiz, retakes,
-# events) and real lectures finished, counted for the current Cairo day and
-# reset automatically when the date changes. Persisted in the sessions
-# snapshot ("daily_stats") so a restart/redeploy doesn't zero the day.
-DAILY_STATS: dict = {"date": None, "answered": 0, "lectures": 0}
+# ═══════════════════════════════════════════════════════════════
+# PERMANENT DAILY / WEEKLY ANALYTICS — feeds /health and /stats
+#
+# One record per Cairo calendar day, kept FOREVER in stats_history.json
+# (plus a copy zipped into the Storage channel backup, and one in the
+# daily zipped export). Weeks run Friday -> Thursday, exactly
+# like the weekly leaderboard (WEEKLY_RESET_WEEKDAY).
+#
+# Day record:
+#   answered/correct      every poll answered (lectures, Daily Quiz, both retakes, events)
+#   src                   {source: [answered, correct]} — lecture/daily/mistakes/bookmarks/event
+#   year                  {year_class: [answered, correct]} — by the user's own Year/Class
+#   hours                 answers per Cairo hour (24 ints) — peak hour
+#   lectures[_year]       lectures finished (first-time attempts only)
+#   daily_done/_correct/_total   Daily Quiz completions + summed score (-> average)
+#   xp, achievements, errors, time_spent (seconds)
+#   users / active        ids who answered today (list) / how many; users_total = registered users
+#
+# Once a week is over it is rolled into STATS_HISTORY["weeks"] (same fields,
+# exact unique-user count) and the per-day id lists are dropped to keep the
+# file small. Everything is a counter, so nothing here is ever recomputed
+# from other data — history can't be lost to a later reset of ANALYTICS.
+# ═══════════════════════════════════════════════════════════════
+STATS_HISTORY_FILE = "stats_history.json"
+# No group of its own: stats_history.json is zipped into the Storage
+# backup (STORAGE_GROUP_ID's pinned document) — see backup_storage_to_channel
+# / restore_storage_from_channel. It is also in the daily zipped export.
+STATS_HISTORY_BACKUP_MIN_INTERVAL = 3600   # seconds
+STATS_SOURCES = ("lecture", "daily", "mistakes", "bookmarks", "event")
+STATS_SOURCE_LABELS = {"lecture": "Lectures", "daily": "Daily", "mistakes": "Mistakes",
+                       "bookmarks": "Bookmarks", "event": "Events"}
+_STATS_SUM_KEYS = ("answered", "correct", "lectures", "daily_done", "daily_correct",
+                   "daily_total", "xp", "achievements", "errors")
 
-def _daily_stats_current() -> dict:
-    today = datetime.now(DAILY_QUIZ_TZ).strftime("%Y-%m-%d")
-    if DAILY_STATS.get("date") != today:
-        DAILY_STATS.update(date=today, answered=0, lectures=0)
-    return DAILY_STATS
+def _blank_stats_day() -> dict:
+    return {
+        "answered": 0, "correct": 0,
+        "src": {k: [0, 0] for k in STATS_SOURCES},
+        "year": {},
+        "hours": [0] * 24,
+        "lectures": 0, "lectures_year": {},
+        "daily_done": 0, "daily_correct": 0, "daily_total": 0,
+        "xp": 0, "achievements": 0, "errors": 0, "time_spent": 0.0,
+        "users": [], "active": 0, "users_total": 0,
+    }
 
-def _bump_daily_stat(key: str) -> None:
-    d = _daily_stats_current()
-    d[key] = d.get(key, 0) + 1
+def _normalize_stats_day(rec: dict) -> dict:
+    """Fills any field a record (older version, hand-edited, partial) lacks."""
+    out = _blank_stats_day()
+    for k, v in rec.items():
+        out[k] = v
+    for k in STATS_SOURCES:
+        out["src"].setdefault(k, [0, 0])
+    if not isinstance(out.get("hours"), list) or len(out["hours"]) != 24:
+        out["hours"] = [0] * 24
+    if not isinstance(out.get("users"), list):
+        out["users"] = []
+    return out
+
+def load_stats_history() -> dict:
+    raw = _load_json_safe(STATS_HISTORY_FILE, dict, dict, "STATS_HISTORY")
+    return {
+        "days":  {d: _normalize_stats_day(r) for d, r in (raw.get("days") or {}).items() if isinstance(r, dict)},
+        "weeks": {w: r for w, r in (raw.get("weeks") or {}).items() if isinstance(r, dict)},
+    }
+
+STATS_HISTORY: dict = load_stats_history()
+_stats_dirty: bool = False
+_stats_backup_pending: bool = False
+_stats_last_backup_at: float = -1e9
+_STATS_USER_SET: tuple = (None, set())   # (day, ids) — O(1) "seen today" check for the hot path
+
+def _mark_stats_dirty() -> None:
+    global _stats_dirty
+    _stats_dirty = True
+
+def _stats_today(now: datetime | None = None) -> tuple[str, dict]:
+    """(YYYY-MM-DD in Cairo, today's record), creating the record on first use."""
+    now = now or datetime.now(DAILY_QUIZ_TZ)
+    day = now.strftime("%Y-%m-%d")
+    rec = STATS_HISTORY["days"].get(day)
+    if rec is None:
+        rec = STATS_HISTORY["days"][day] = _blank_stats_day()
+    return day, rec
+
+def _stat_answer(user_id: int, source: str, is_correct: bool) -> None:
+    """One answered poll. Called from every poll-answer advance function."""
+    global _STATS_USER_SET
+    now = datetime.now(DAILY_QUIZ_TZ)
+    day, rec = _stats_today(now)
+    c = 1 if is_correct else 0
+    rec["answered"] += 1
+    rec["correct"] += c
+    sv = rec["src"].setdefault(source, [0, 0]); sv[0] += 1; sv[1] += c
+    yv = rec["year"].setdefault(get_year_class(user_id) or "unknown", [0, 0]); yv[0] += 1; yv[1] += c
+    rec["hours"][now.hour] += 1
+    if _STATS_USER_SET[0] != day:
+        _STATS_USER_SET = (day, set(rec["users"]))
+    seen = _STATS_USER_SET[1]
+    if user_id not in seen:
+        seen.add(user_id)
+        rec["users"].append(user_id)
+        rec["active"] = len(seen)
+    _mark_stats_dirty()
+
+def _stat_add(key: str, amount) -> None:
+    rec = _stats_today()[1]
+    rec[key] = rec.get(key, 0) + amount
+    _mark_stats_dirty()
+
+def _stat_lecture_finished(user_id: int) -> None:
+    rec = _stats_today()[1]
+    rec["lectures"] += 1
+    y = get_year_class(user_id) or "unknown"
+    rec["lectures_year"][y] = rec["lectures_year"].get(y, 0) + 1
+    _mark_stats_dirty()
+
+def _stat_daily_completed(correct: int, answered: int) -> None:
+    rec = _stats_today()[1]
+    rec["daily_done"] += 1
+    rec["daily_correct"] += correct
+    rec["daily_total"] += answered
+    _mark_stats_dirty()
+
+def _stats_week_key(day: str) -> str:
+    """Friday-start week (same as the weekly leaderboard) that contains `day`."""
+    d = datetime.strptime(day, "%Y-%m-%d")
+    return (d - timedelta(days=(d.weekday() - WEEKLY_RESET_WEEKDAY) % 7)).strftime("%Y-%m-%d")
+
+def _agg_stats(recs: list) -> dict:
+    """Sums day records into one block (a week, or any range)."""
+    out = _blank_stats_day()
+    out.pop("users")
+    out["days"] = 0
+    users: set = set()
+    max_active = 0
+    for r in recs:
+        out["days"] += 1
+        for k in _STATS_SUM_KEYS:
+            out[k] += r.get(k, 0)
+        out["time_spent"] += r.get("time_spent", 0.0)
+        for k, (a, c) in (r.get("src") or {}).items():
+            sv = out["src"].setdefault(k, [0, 0]); sv[0] += a; sv[1] += c
+        for k, (a, c) in (r.get("year") or {}).items():
+            yv = out["year"].setdefault(k, [0, 0]); yv[0] += a; yv[1] += c
+        for k, n in (r.get("lectures_year") or {}).items():
+            out["lectures_year"][k] = out["lectures_year"].get(k, 0) + n
+        for i, n in enumerate(r.get("hours") or []):
+            out["hours"][i] += n
+        users.update(r.get("users") or [])
+        max_active = max(max_active, r.get("active", 0))
+        out["users_total"] = max(out["users_total"], r.get("users_total", 0))
+    out["active"] = len(users) if users else max_active
+    return out
+
+def _week_agg(week_key: str) -> dict | None:
+    stored = STATS_HISTORY["weeks"].get(week_key)
+    if stored:
+        return stored
+    recs = [r for d, r in STATS_HISTORY["days"].items() if _stats_week_key(d) == week_key]
+    return _agg_stats(recs) if recs else None
+
+def _stats_roll_weeks() -> bool:
+    """Rolls every finished week into STATS_HISTORY['weeks'] (exact unique
+    users) and drops the per-day id lists of rolled weeks. Returns True if
+    anything changed."""
+    changed = False
+    current = _stats_week_key(_stats_today()[0])
+    by_week: dict = {}
+    for d, r in STATS_HISTORY["days"].items():
+        by_week.setdefault(_stats_week_key(d), []).append(r)
+    for wk, recs in by_week.items():
+        if wk == current:
+            continue
+        if wk not in STATS_HISTORY["weeks"]:
+            STATS_HISTORY["weeks"][wk] = _agg_stats(recs)
+            changed = True
+        for r in recs:
+            if r.get("users"):
+                r["users"] = []
+                changed = True
+    return changed
+
+def _stats_snapshot_today() -> dict:
+    day, rec = _stats_today()
+    return {"date": day, "rec": rec}
+
+def _merge_stats_history(incoming: dict) -> None:
+    """Merges a loaded/restored history in without ever losing data: per day,
+    the record with MORE answers wins (counters only grow within a day);
+    weeks already held are kept."""
+    global _STATS_USER_SET
+    for d, rec in (incoming.get("days") or {}).items():
+        if not isinstance(rec, dict):
+            continue
+        cur = STATS_HISTORY["days"].get(d)
+        if cur is None or rec.get("answered", 0) > cur.get("answered", 0):
+            STATS_HISTORY["days"][d] = _normalize_stats_day(rec)
+    for w, rec in (incoming.get("weeks") or {}).items():
+        if isinstance(rec, dict) and w not in STATS_HISTORY["weeks"]:
+            STATS_HISTORY["weeks"][w] = rec
+    _STATS_USER_SET = (None, set())
+    _mark_stats_dirty()
+
+async def _stats_flush(context=None) -> None:
+    """Periodic tick (and clean-shutdown flush): refreshes the registered-user
+    count, rolls finished weeks, writes stats_history.json if anything
+    changed, and mirrors it to the channel (throttled)."""
+    global _stats_dirty, _stats_backup_pending
+    rec = _stats_today()[1]
+    total = _count_registered_users()
+    if rec.get("users_total") != total:
+        rec["users_total"] = total
+        _stats_dirty = True
+    if _stats_roll_weeks():
+        _stats_dirty = True
+    if _stats_dirty:
+        _stats_dirty = False
+        _stats_backup_pending = True
+        await _write_json_serialized(
+            STATS_HISTORY_FILE, lambda: copy.deepcopy(STATS_HISTORY), indent=2, ensure_ascii=False)
+    if context is not None and _stats_backup_pending:
+        await backup_stats_history_to_channel(context)
+
+async def _stats_flush_job(context: ContextTypes.DEFAULT_TYPE):
+    await _stats_flush(context)
+
+async def backup_stats_history_to_channel(context, force: bool = False) -> None:
+    """Throttled (hourly) trigger: the history has no channel of its own, it
+    rides inside the Storage backup, so this just refreshes that one."""
+    global _stats_last_backup_at, _stats_backup_pending
+    if not STORAGE_GROUP_ID:
+        return
+    now = time.monotonic()
+    if not force and now - _stats_last_backup_at < STATS_HISTORY_BACKUP_MIN_INTERVAL:
+        return
+    _stats_last_backup_at = now
+    if await backup_storage_to_channel(context):
+        _stats_backup_pending = False
 
 def _get_entry(user_id: int) -> dict:
     key   = str(user_id)
@@ -1282,6 +1508,7 @@ def _record_time_spent(user_id: int, seconds: float | None) -> None:
         return
     entry = _get_entry(user_id)
     entry["lecture_time_spent_seconds"] = entry.get("lecture_time_spent_seconds", 0.0) + seconds
+    _stat_add("time_spent", seconds)
     _mark_analytics_dirty()
 
 def _format_duration(seconds: float) -> str:
@@ -1422,6 +1649,7 @@ def _award_xp(entry: dict, amount: int) -> int:
     its own awareness of it."""
     scaled = round(amount * entry.get("xp_multiplier", 1.0))
     entry["xp"] += scaled
+    _stat_add("xp", scaled)
     new_level    = _xp_to_level(entry["xp"])
     levelled_up  = new_level > entry["level"]
     entry["level"] = new_level
@@ -1498,6 +1726,8 @@ def _check_achievements(entry: dict, stat_key: str) -> list[dict]:
                 _award_xp(entry, xp_bonus)
         else:
             break   # tiers are ordered — no point checking higher ones
+    if unlocked:
+        _stat_add("achievements", len(unlocked))
     return unlocked
 
 def _check_extra_achievement(entry: dict, key: str) -> dict | None:
@@ -1514,6 +1744,7 @@ def _check_extra_achievement(entry: dict, key: str) -> dict | None:
     name, emoji, xp_bonus, _desc, quip = EXTRA_ACHIEVEMENTS[key]
     extras[key] = True
     _award_xp(entry, xp_bonus)
+    _stat_add("achievements", 1)
     return {"name": name, "emoji": emoji, "xp_bonus": xp_bonus, "tier": 1, "extra": True, "quip": quip}
 
 # Preference toggles that count as "poking around in Settings" for the
@@ -1967,7 +2198,7 @@ def _blank_settings_entry() -> dict:
         "year_class": None,    # "y1"/"y2"/"y3" (MFM) or "n1"/"n2"/"n3" (MNU) — see YEAR_CLASS_NUMBER above
         "university": None,    # "mfm"/"mnu" — picked in onboarding; see get_university (falls back to the
                                 # year_class's university, so existing MFM users need no migration)
-        "daily_quiz_last_date": None,   # "YYYY-MM-DD" (UTC) of the last completed Daily Quiz
+        "daily_quiz_last_date": None,   # "YYYY-MM-DD" (_daily_quiz_day: 2pm-Cairo window) of the last Daily Quiz started
         "daily_notifs": True,   # the 2pm 💥Daily Quiz💥 push — see get_daily_notifs_enabled
         "zikr_reminders": True,   # Zikr poll every N questions — see get_zikr_enabled / _maybe_send_zikr_poll.
                                     # On by default; opt out via Settings -> More Settings -> Zikr.
@@ -2707,7 +2938,7 @@ async def restore_mistakes_bank_from_channel(app) -> str:
 
 # ═══════════════════════════════════════════════════════════════
 # DAILY QUIZ — 💥Daily Quiz💥: each day, every configured year gets ONE
-# shared run of DAILY_QUIZ_TOTAL_COUNT (15) random
+# shared run of DAILY_QUIZ_TOTAL_COUNT (20) random
 # questions — built once per (year, day) and then IDENTICAL for every
 # user in that year, so everyone's run (and the leaderboard ranking it
 # feeds) is a level playing field. No mistakes-bank content is used here
@@ -2739,17 +2970,15 @@ DAILY_QUIZ_SESSIONS = {}   # user_id -> {"queue": [question dict, ...], "current
                            #             "year",
                            #             "total", "answered", "correct", "xp_earned"}
 
-DAILY_QUIZ_TOTAL_COUNT = 15   # random questions per year, per day
+DAILY_QUIZ_TOTAL_COUNT = 20   # random questions per year, per day
 
 # ═══════════════════════════════════════════════════════════════
-# DAILY QUIZ LEADERBOARD — deliberately RAM-only, unlike everything else
-# in this file. It resets every day anyway (today's ranking is
-# meaningless once a new day's questions exist), so there's no reason to
-# spend backup/restore machinery keeping it alive across a bot restart —
-# worst case, a restart mid-day just clears today's board a little
-# early, which is harmless. Contrast with daily_medals on the ANALYTICS
-# entry (_blank_entry), which IS persistent — that's the lifetime medal
-# count this board hands out before resetting, and that has to survive.
+# DAILY QUIZ LEADERBOARD — lives in RAM but rides along in the sessions
+# snapshot (see _sessions_snapshot / _restore_sessions_dict), exactly like
+# the day's shared question set, so a restart or redeploy no longer wipes
+# it. It stays visible until the next 2pm-Cairo push (see _daily_quiz_day),
+# when it is finalized (medals) and replaced. daily_medals on the ANALYTICS
+# entry (_blank_entry) is the persistent lifetime medal count it hands out.
 #
 # One board PER YEAR — since every user in a year plays the exact same
 # shared run (see DAILY QUIZ above), ranking is only meaningful within a
@@ -2760,10 +2989,10 @@ DAILY_QUIZ_LEADERBOARD: dict[str, dict[int, dict]] = {}   # year -> user_id -> {
 
 def _finalize_daily_leaderboard() -> None:
     """Awards lifetime medals (ANALYTICS[uid]['daily_medals']) to the top 3
-    of each year's board, then clears every board. Called explicitly at
-    the start of _daily_quiz_push_job (the 2pm-Cairo push) — so medals for
-    a day's Daily Quiz are handed out right as the NEXT one goes out,
-    not lazily whenever someone happens to open the leaderboard."""
+    of each year's board, then clears every board. Only ever reached via
+    _ensure_daily_leaderboard_fresh when the 2pm-Cairo day rolls over, so
+    medals for a day's Daily Quiz are handed out right as the NEXT one goes
+    out. Safe to call twice: the first call clears the boards."""
     global DAILY_QUIZ_LEADERBOARD
     any_ranked = False
     for year in list(DAILY_QUIZ_LEADERBOARD):
@@ -2779,18 +3008,43 @@ def _finalize_daily_leaderboard() -> None:
     DAILY_QUIZ_LEADERBOARD = {}
 
 def _ensure_daily_leaderboard_fresh() -> None:
-    """Call before any read or write of DAILY_QUIZ_LEADERBOARD. Just rolls
-    the tracked date forward and clears stale boards on a day change —
-    medal-awarding itself does NOT happen here (see _finalize_daily_leaderboard,
-    called explicitly by _daily_quiz_push_job right as the next Daily Quiz
-    goes out), so this is safe to call at any time of day without handing
-    out medals early."""
+    """Call before any read or write of DAILY_QUIZ_LEADERBOARD. The board
+    now lives from one 2pm-Cairo push to the next (see _daily_quiz_day), so
+    it stays visible all night and morning and only rolls at 2pm. The roll
+    also hands out the medals of the board being retired — which makes this
+    self-healing if the bot was down at exactly 2pm and missed the push job."""
     global DAILY_QUIZ_LEADERBOARD_DATE, DAILY_QUIZ_LEADERBOARD
-    today = _today()
+    today = _daily_quiz_day()
     if DAILY_QUIZ_LEADERBOARD_DATE == today:
         return
+    if DAILY_QUIZ_LEADERBOARD:
+        _finalize_daily_leaderboard()
     DAILY_QUIZ_LEADERBOARD_DATE = today
     DAILY_QUIZ_LEADERBOARD = {}
+
+def _live_daily_dids(year: str) -> set:
+    """did (as str) of every question currently in today's Daily Quiz for `year`."""
+    return {str(q["did"]) for q in (_DAILY_QUIZ_QUESTIONS.get(year) or []) if q.get("did") is not None}
+
+def _apply_live_scores(year: str, row: dict) -> None:
+    """Recomputes row['correct'] / row['total'] from its per-question
+    `results`, counting only questions still in today's quiz — so a question
+    an admin deleted (/edit_daily) stops counting for everyone, right or
+    wrong. Rows without `results` (finished before per-question tracking
+    existed) keep their stored score."""
+    results = row.get("results")
+    live = _live_daily_dids(year)
+    if not results or not live:
+        return
+    kept = {k: v for k, v in results.items() if k in live}
+    if not kept:
+        return
+    row["correct"] = sum(1 for v in kept.values() if v)
+    row["total"] = len(kept)
+
+def _recompute_daily_leaderboard(year: str) -> None:
+    for row in DAILY_QUIZ_LEADERBOARD.get(year, {}).values():
+        _apply_live_scores(year, row)
 
 def _rank_daily_leaderboard(year: str, limit: int = 20) -> list[dict]:
     """Today's Daily Quiz finishers for one year, ranked the same way as
@@ -2800,18 +3054,23 @@ def _rank_daily_leaderboard(year: str, limit: int = 20) -> list[dict]:
     rows.sort(key=lambda r: (-r["correct"], r["duration"]))
     return rows[:limit]
 
-def _record_daily_leaderboard_finish(user_id: int, year: str, correct: int, total: int, duration: float) -> None:
+def _record_daily_leaderboard_finish(user_id: int, year: str, correct: int, total: int, duration: float,
+                                     results: dict | None = None) -> None:
     """Records this user's (one-per-day) finish on today's board for
-    `year`."""
+    `year`. `results` is {str(did): bool} per question, which is what lets
+    the score be recomputed if a question is later deleted."""
     _ensure_daily_leaderboard_fresh()
     board = DAILY_QUIZ_LEADERBOARD.setdefault(year, {})
-    board[user_id] = {
+    row = {
         "user_id":  user_id,
         "name":     get_nickname(user_id) or f"مستخدم #{user_id % 10000}",
         "correct":  correct,
         "total":    total,
         "duration": duration,
+        "results":  dict(results) if results else None,
     }
+    _apply_live_scores(year, row)
+    board[user_id] = row
 
 # Push time for the daily 💥Daily Quiz💥 button (see job_queue.run_daily in
 # MAIN, and next_daily_quiz_time() / /time below — all three read from
@@ -2819,6 +3078,16 @@ def _record_daily_leaderboard_finish(user_id: int, year: str, correct: int, tota
 DAILY_QUIZ_TZ   = ZoneInfo("Africa/Cairo")
 DAILY_QUIZ_HOUR = 14
 DAILY_QUIZ_MIN  = 0
+
+def _daily_quiz_day(now: datetime | None = None) -> str:
+    """The Daily Quiz's own "day" key, \"YYYY-MM-DD\": a day runs from one 2pm
+    Cairo push to the next, NOT midnight. Before 2pm it's still yesterday's
+    quiz (same questions, same leaderboard); at 2pm it flips to the new one.
+    Questions cache, leaderboard, and the once-per-day gate all key off this
+    so they roll over at exactly the same moment the push goes out."""
+    now = now or datetime.now(DAILY_QUIZ_TZ)
+    cutoff = now.replace(hour=DAILY_QUIZ_HOUR, minute=DAILY_QUIZ_MIN, second=0, microsecond=0)
+    return (now if now >= cutoff else now - timedelta(days=1)).strftime("%Y-%m-%d")
 
 # Push time for the daily zipped-backup export (see _daily_backup_export_job
 # and job_queue.run_daily in MAIN). Off-peak hour, well clear of the Daily
@@ -3276,13 +3545,13 @@ def _ensure_daily_quiz_questions_fresh() -> None:
     cached questions the first time it's called on a new day, so the
     day's first request per year rebuilds fresh content."""
     global _DAILY_QUIZ_QUESTIONS_DATE, _DAILY_QUIZ_QUESTIONS
-    today = _today()
+    today = _daily_quiz_day()
     if _DAILY_QUIZ_QUESTIONS_DATE != today:
         _DAILY_QUIZ_QUESTIONS = {}
         _DAILY_QUIZ_QUESTIONS_DATE = today
 
 async def _build_daily_quiz_questions(context: ContextTypes.DEFAULT_TYPE, year: str) -> list:
-    """Up to DAILY_QUIZ_TOTAL_COUNT (15) questions, drawn
+    """Up to DAILY_QUIZ_TOTAL_COUNT (20) questions, drawn
     at random from `year`'s ready pool — no mistakes-bank content.
     Respects the admin-set /daily_module scope if it's set for this year.
     Falls short gracefully (a shorter, or empty, run) if there isn't
@@ -3326,12 +3595,14 @@ async def get_daily_quiz_questions(context: ContextTypes.DEFAULT_TYPE, year: str
             _ensure_daily_quiz_questions_fresh()  # guards against the day rolling over mid-wait
             if year not in _DAILY_QUIZ_QUESTIONS:
                 _DAILY_QUIZ_QUESTIONS[year] = await _build_daily_quiz_questions(context, year)
+                _dq_ensure_ids(_DAILY_QUIZ_QUESTIONS[year])   # stable "did" per question (leaderboard + /edit_daily key off it)
                 # Persist right away rather than waiting for the next periodic
                 # sessions tick — this is the one moment (first build of the day
                 # for this year) a redeploy landing seconds later would otherwise
                 # regenerate a different set. See SESSION PERSISTENCE below.
                 await _flush_sessions_if_changed()
                 await backup_sessions_to_channel(context)
+    _dq_ensure_ids(_DAILY_QUIZ_QUESTIONS[year])   # no-op unless restored from a snapshot that predates ids
     return _DAILY_QUIZ_QUESTIONS[year]
 
 def _shuffle_poll_options(options: list, correct_option_id: int, avoid_order: list | None = None) -> tuple:
@@ -3382,6 +3653,7 @@ async def _deliver_next_daily_question(context: ContextTypes.DEFAULT_TYPE, user_
         session["current_option_count"] = None
         session["current_message_id"] = None
         session["current_delivered_at"] = None
+        session["current_did"] = None
         return False
     q = session["queue"].pop(0)
     session["delivered_count"] = session.get("delivered_count", 0) + 1
@@ -3436,6 +3708,7 @@ async def _deliver_next_daily_question(context: ContextTypes.DEFAULT_TYPE, user_
     session["current_option_count"] = len(options)
     session["current_message_id"] = msg.message_id
     session["current_delivered_at"] = time.time()  # see _record_time_spent / year leaderboard
+    session["current_did"] = q.get("did")          # which Daily Quiz question this is (None for retakes)
     # q was popped off the queue above, so stash its module/subject on the
     # session — _advance_daily_quiz_session / _advance_mistakes_retake_session
     # read these back to credit the right subject in /mystats.
@@ -3456,6 +3729,12 @@ async def _advance_daily_quiz_session(context: ContextTypes.DEFAULT_TYPE, user_i
     no single lecture for this to be an "attempt" of."""
     session["answered"] += 1
     session["correct"] = session.get("correct", 0) + (1 if is_correct else 0)
+    # Per-question result, keyed by the question's did, captured BEFORE the next
+    # delivery overwrites current_did. Lets the leaderboard re-score if the
+    # question is deleted later.
+    _answered_did = session.get("current_did")
+    if _answered_did is not None:
+        session.setdefault("results", {})[str(_answered_did)] = bool(is_correct)
     if delivered_at is not None:
         elapsed = time.time() - delivered_at
         _record_time_spent(user_id, elapsed)
@@ -3469,7 +3748,7 @@ async def _advance_daily_quiz_session(context: ContextTypes.DEFAULT_TYPE, user_i
     session["xp_earned"] = session.get("xp_earned", 0) + xp_delta
 
     events     = await _record_activity(user_id, persist=False)
-    _bump_daily_stat("answered")
+    _stat_answer(user_id, "daily", is_correct)
     user_entry = _get_entry(user_id)
     prev_streak = user_entry.get("lecture_correct_streak_current", 0)
     user_entry["lecture_questions_answered"]  += 1
@@ -3511,7 +3790,11 @@ async def _advance_daily_quiz_session(context: ContextTypes.DEFAULT_TYPE, user_i
         pct       = round(correct / session["answered"] * 100) if session["answered"] else 0
         year      = session["year"]
         duration  = session.get("duration_seconds", 0.0)
-        _record_daily_leaderboard_finish(user_id, year, correct, session["answered"], duration)
+        # A run started before the 2pm roll but finished after it belongs to a
+        # board that's already been finalized — don't drop it onto the new one.
+        if session.get("day") in (None, _daily_quiz_day()):
+            _record_daily_leaderboard_finish(user_id, year, correct, session["answered"], duration,
+                                             results=session.get("results"))
 
         # Daily Quiz completion count + its tier achievement, plus the
         # basmagy/insomniac Extras — all reuse data this block already
@@ -3519,6 +3802,7 @@ async def _advance_daily_quiz_session(context: ContextTypes.DEFAULT_TYPE, user_i
         # tally elsewhere reuses the same DAILY_QUIZ_LEADERBOARD entry
         # for, rather than tracking anything new.
         user_entry["daily_quizzes_completed"] = user_entry.get("daily_quizzes_completed", 0) + 1
+        _stat_daily_completed(correct, session["answered"])
         daily_events = _check_achievements(user_entry, "daily_quiz")
         if duration > 0 and duration < 60 and session["answered"] > 0 and pct == 100:
             ach = _check_extra_achievement(user_entry, "basmagy")
@@ -3651,7 +3935,7 @@ async def show_daily_quiz_menu(context: ContextTypes.DEFAULT_TYPE, user_id: int,
 
     board_text = f"{quizzy_block(QUIZZY_READY_ART, 'CHALLENGE YOURSELF!')}\n\n{board_text}"
 
-    already_done = get_daily_quiz_last_date(user_id) == _today()
+    already_done = get_daily_quiz_last_date(user_id) == _daily_quiz_day()
     status_line = (
         f"✅ خلصت الـ Daily Quiz بتاع النهاردة خلاص.\n\n{_next_daily_quiz_line()}"
         if already_done else
@@ -3683,7 +3967,7 @@ async def start_daily_quiz(context: ContextTypes.DEFAULT_TYPE, user_id: int, mes
         await _prompt_daily_quiz_year_class(context, user_id, message)
         return
 
-    today = _today()
+    today = _daily_quiz_day()
     if get_daily_quiz_last_date(user_id) == today:
         # Already done — send them back to the hub (leaderboard + status)
         # rather than re-starting it.
@@ -3713,7 +3997,7 @@ async def start_daily_quiz(context: ContextTypes.DEFAULT_TYPE, user_id: int, mes
     session = {
         "queue": list(questions), "current_poll_id": None, "current_correct_id": None,
         "current_message_id": None, "total": len(questions), "answered": 0, "correct": 0,
-        "year": year_class, "kind": "daily",
+        "year": year_class, "kind": "daily", "day": today,
     }
     DAILY_QUIZ_SESSIONS[user_id] = session
 
@@ -3787,7 +4071,7 @@ def _daily_backup_export_file_paths() -> list:
     paths = [
         USERS_FILE, ANALYTICS_FILE, SETTINGS_FILE, LECTURE_RESULTS_FILE,
         MISTAKES_BANK_FILE, STORAGE_INDEX_FILE, STORAGE_BACKUP_STATE_FILE,
-        REPORT_THREADS_FILE, QUESTION_REPORTS_FILE,
+        REPORT_THREADS_FILE, QUESTION_REPORTS_FILE, STATS_HISTORY_FILE,
     ]
     for year in YEAR_ORDER:
         paths += [
@@ -3841,12 +4125,11 @@ async def _daily_quiz_push_job(context: ContextTypes.DEFAULT_TYPE):
     Notification (get_daily_notifs_enabled) — the quiz itself stays
     reachable from the main menu either way, this only silences the ping.
 
-    Finalizes (awards medals for) the outgoing day's Daily Quiz
-    leaderboard FIRST, right as this next one goes out — so top-3
+    Rolls the leaderboard FIRST (which awards medals for the outgoing
+    day's Daily Quiz), right as this next one goes out — so top-3
     finishers get their medal exactly when the new quiz appears, instead
     of whenever someone next happens to open the leaderboard screen."""
-    _finalize_daily_leaderboard()
-    _ensure_daily_leaderboard_fresh()   # rolls the tracked date forward for today's fresh board
+    _ensure_daily_leaderboard_fresh()   # day just rolled: awards medals for the outgoing board, starts a fresh one
     for uid in list(USERS):
         if not get_daily_notifs_enabled(uid):
             continue
@@ -3925,7 +4208,7 @@ async def _advance_mistakes_retake_session(context: ContextTypes.DEFAULT_TYPE, u
     session["xp_earned"] = session.get("xp_earned", 0) + xp_delta
 
     events     = await _record_activity(user_id, persist=False)
-    _bump_daily_stat("answered")
+    _stat_answer(user_id, "mistakes", is_correct)
     user_entry = _get_entry(user_id)
     prev_streak = user_entry.get("lecture_correct_streak_current", 0)
     user_entry["lecture_questions_answered"]  += 1
@@ -4087,7 +4370,7 @@ async def _advance_bookmarks_retake_session(context: ContextTypes.DEFAULT_TYPE, 
     session["xp_earned"] = session.get("xp_earned", 0) + xp_delta
 
     events     = await _record_activity(user_id, persist=False)
-    _bump_daily_stat("answered")
+    _stat_answer(user_id, "bookmarks", is_correct)
     user_entry = _get_entry(user_id)
     prev_streak = user_entry.get("lecture_correct_streak_current", 0)
     user_entry["lecture_questions_answered"]  += 1
@@ -4179,6 +4462,7 @@ ALBUM_BUFFER: dict = {}
 # message in the storage group itself, and rebuild the local cache from
 # it on startup if the local files are ever missing/wiped.
 STORAGE_BACKUP_MARKER     = "🗄 QUIZICIAN_STORAGE_BACKUP"
+STORAGE_BACKUP_JSON_NAME  = "quizician_storage_backup.json"   # member inside the backup zip
 STORAGE_BACKUP_STATE_FILE = "storage_backup_state.json"
 
 def load_storage_backup_state():
@@ -4192,18 +4476,27 @@ async def save_storage_backup_state():
 
 STORAGE_BACKUP_STATE: dict = load_storage_backup_state()  # {"backup_msg_id": int}
 
-async def backup_storage_to_channel(context: ContextTypes.DEFAULT_TYPE):
+async def backup_storage_to_channel(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Uploads + pins the Storage backup (users + storage index + analytics
+    history, zipped). Returns True if the document was sent."""
     if not STORAGE_GROUP_ID:
-        return
+        return False
     if not RESTORE_OK["storage"]:
         print("STORAGE BACKUP SKIPPED — last restore failed, refusing to overwrite the channel backup.")
-        return
+        return False
     payload = {"users": list(USERS), "storage_index": STORAGE_INDEX}
     data    = json.dumps(payload).encode("utf-8")
+    # The analytics history (stats_history.json) travels in the same pinned
+    # document — a zip of the two files — so it needs no group of its own.
+    _zbuf = BytesIO()
+    with zipfile.ZipFile(_zbuf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(STORAGE_BACKUP_JSON_NAME, data)
+        zf.writestr(STATS_HISTORY_FILE, json.dumps(STATS_HISTORY, ensure_ascii=False))
+    data = _zbuf.getvalue()
     # A pinned document instead of a pinned text message: Bot API caps
     # documents at 50MB vs ~4KB for a text message — effectively removes
     # the size ceiling for any realistic amount of data this bot handles.
-    filename = _backup_filename("quizician_storage_backup.json")
+    filename = _backup_filename("quizician_storage_backup.zip")
 
     try:
         sent = await context.bot.send_document(
@@ -4213,7 +4506,7 @@ async def backup_storage_to_channel(context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         print("STORAGE BACKUP ERROR:", e)
-        return
+        return False
 
     # Save the message id immediately — pinning is a nice-to-have on top,
     # and its failure (e.g. bot isn't admin / lacks rights) must NOT stop
@@ -4228,6 +4521,7 @@ async def backup_storage_to_channel(context: ContextTypes.DEFAULT_TYPE):
 
     # Previous backups are no longer deleted — see the analytics backup
     # function's comment for why.
+    return True
 
 async def restore_storage_from_channel(app) -> str:
     """Runs once on startup — rebuilds USERS + STORAGE_INDEX from the
@@ -4241,8 +4535,18 @@ async def restore_storage_from_channel(app) -> str:
         if not pinned or not pinned.document or (pinned.caption or "") != STORAGE_BACKUP_MARKER:
             raise _RestoreNoBackup()
         tg_file = await app.bot.get_file(pinned.document.file_id)
-        raw     = await tg_file.download_as_bytearray()
-        payload = json.loads(bytes(raw).decode("utf-8"))
+        raw     = bytes(await tg_file.download_as_bytearray())
+        stats_part = None
+        if zipfile.is_zipfile(BytesIO(raw)):   # current format: storage json + stats_history.json
+            with zipfile.ZipFile(BytesIO(raw)) as zf:
+                names = zf.namelist()
+                if STORAGE_BACKUP_JSON_NAME not in names:
+                    raise _RestoreInvalidArchitecture(f"backup zip has no {STORAGE_BACKUP_JSON_NAME}")
+                payload = json.loads(zf.read(STORAGE_BACKUP_JSON_NAME).decode("utf-8"))
+                if STATS_HISTORY_FILE in names:
+                    stats_part = json.loads(zf.read(STATS_HISTORY_FILE).decode("utf-8"))
+        else:                                   # older backups: a bare json document
+            payload = json.loads(raw.decode("utf-8"))
         if (
             not isinstance(payload, dict)
             or not isinstance(payload.get("users", []), list)
@@ -4255,6 +4559,11 @@ async def restore_storage_from_channel(app) -> str:
         await save_storage_index()
         STORAGE_BACKUP_STATE["backup_msg_id"] = pinned.message_id
         await save_storage_backup_state()
+        if (isinstance(stats_part, dict) and isinstance(stats_part.get("days", {}), dict)
+                and isinstance(stats_part.get("weeks", {}), dict)):
+            _merge_stats_history(stats_part)   # keeps whichever copy of each day has more answers
+            await _write_json_serialized(
+                STATS_HISTORY_FILE, lambda: copy.deepcopy(STATS_HISTORY), indent=2, ensure_ascii=False)
         print(f"Restored storage backup: {len(USERS)} user(s), {len(STORAGE_INDEX)} password(s).")
 
     not_found_hint = (
@@ -5155,10 +5464,15 @@ def _sessions_snapshot() -> dict:
         # these ride along in the same snapshot/backup as the sessions.
         "daily_quiz_questions_date": _DAILY_QUIZ_QUESTIONS_DATE,
         "daily_quiz_questions":      _DAILY_QUIZ_QUESTIONS,
+        # Daily Quiz leaderboard (survives restarts; rolls at 2pm Cairo).
+        "daily_quiz_leaderboard_date": DAILY_QUIZ_LEADERBOARD_DATE,
+        "daily_quiz_leaderboard":    {y: {str(u): r for u, r in rows.items()}
+                                      for y, rows in DAILY_QUIZ_LEADERBOARD.items()},
         # /event_start events live here until /event_end (never expire) — see the EVENTS section.
         "events":                    EVENTS,
-        # /health "today" counters (questions answered / lectures finished)
-        "daily_stats":               DAILY_STATS,
+        # Today's analytics record (the permanent history lives in
+        # stats_history.json — this keeps today intact if the disk is wiped).
+        "stats_today":               _stats_snapshot_today(),
     }
 
 def _session_age_seconds(session: dict) -> float:
@@ -5204,6 +5518,7 @@ def _restore_sessions_dict(raw: dict) -> None:
     already discards it the next time it's read if the date has since
     rolled over."""
     global _DAILY_QUIZ_QUESTIONS_DATE, _DAILY_QUIZ_QUESTIONS
+    global DAILY_QUIZ_LEADERBOARD_DATE, DAILY_QUIZ_LEADERBOARD
     targets = {
         "lecture_sessions":          LECTURE_SESSIONS,
         "daily_quiz_sessions":       DAILY_QUIZ_SESSIONS,
@@ -5225,10 +5540,21 @@ def _restore_sessions_dict(raw: dict) -> None:
             restored += 1
     _DAILY_QUIZ_QUESTIONS_DATE = raw.get("daily_quiz_questions_date")
     _DAILY_QUIZ_QUESTIONS      = raw.get("daily_quiz_questions") or {}
+    if "daily_quiz_leaderboard" in raw:   # older snapshots predate it — leave the live board alone then
+        DAILY_QUIZ_LEADERBOARD_DATE = raw.get("daily_quiz_leaderboard_date")
+        DAILY_QUIZ_LEADERBOARD = {
+            y: {int(u): r for u, r in (rows or {}).items()}
+            for y, rows in (raw.get("daily_quiz_leaderboard") or {}).items()
+        }
     EVENTS.clear()
     EVENTS.update(raw.get("events") or {})
-    DAILY_STATS.update(date=None, answered=0, lectures=0)
-    DAILY_STATS.update(raw.get("daily_stats") or {})
+    _st = raw.get("stats_today")
+    if isinstance(_st, dict) and _st.get("date") and isinstance(_st.get("rec"), dict):
+        _merge_stats_history({"days": {_st["date"]: _st["rec"]}})
+    _old = raw.get("daily_stats")   # snapshots from before the permanent history existed
+    if isinstance(_old, dict) and _old.get("date"):
+        _merge_stats_history({"days": {_old["date"]: {"answered": _old.get("answered", 0),
+                                                       "lectures": _old.get("lectures", 0)}}})
     print(f"Restored {restored} session(s) ({dropped_stale} dropped as stale), "
           f"daily quiz questions for {len(_DAILY_QUIZ_QUESTIONS)} year(s) dated {_DAILY_QUIZ_QUESTIONS_DATE}.")
 
@@ -7276,7 +7602,7 @@ async def _finish_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: i
         await backup_lecture_results_to_channel(context)
         user_entry = _get_entry(user_id)
         user_entry["lectures_completed"] = user_entry.get("lectures_completed", 0) + 1
-        _bump_daily_stat("lectures")
+        _stat_lecture_finished(user_id)
         extra_events += _check_achievements(user_entry, "lectures_completed")
         started_at = session.get("started_at")
         if started_at is not None and (time.time() - started_at) <= 15 * 60:
@@ -7411,7 +7737,7 @@ async def _advance_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: 
     session["xp_earned"] = session.get("xp_earned", 0) + xp_delta
 
     events     = await _record_activity(user_id, persist=False)
-    _bump_daily_stat("answered")
+    _stat_answer(user_id, "lecture", is_correct)
     user_entry = _get_entry(user_id)
     prev_streak = user_entry.get("lecture_correct_streak_current", 0)
     user_entry["lecture_questions_answered"]  += 1
@@ -8241,7 +8567,7 @@ ONBOARDING_SPECIAL_TEXT = (
     "وبتاخد XP على كل إجابة صح، وفالآخر نتيجتك بتظهر وتقدر تعيد أسئلتك اللي غلط فيها، وبتتحفظ "
     "فالMistakes bank (نظفه علطول علشان ميكونش شكلك وحش 🌚)\n\n"
     "<b>💥 Daily Quiz</b>\n"
-    "15 سؤال عشوائي من كل المحاضرات المتاحه، بتتجدد كل يوم الساعة 2 الضهر، لكن ركز! عندك "
+    "20 سؤال عشوائي من كل المحاضرات المتاحه، بتتجدد كل يوم الساعة 2 الضهر، لكن ركز! عندك "
     "محاولة واحدة بس في اليوم علشان تبقا المركز الأول!!\n"
     "(أول تلات مراكز بياخدو ماديليات🥇، المركز بيعتمد على سرعتك + صحة إجاباتك... يعني بلاش "
     "بصمجة يا دولي 😂)\n\n"
@@ -9629,7 +9955,7 @@ async def _event_send_next(context, user_id: int, s: dict) -> bool:
 
 async def _event_advance(context, user_id: int, s: dict, is_correct: bool) -> None:
     s["answered"] += 1
-    _bump_daily_stat("answered")
+    _stat_answer(user_id, "event", is_correct)
     if is_correct:
         s["correct"] += 1
     ev = EVENTS.get(s["year"])
@@ -10294,6 +10620,21 @@ def _dq_find(questions: list, did) -> tuple:
             return pos, q
     return -1, None
 
+def _dq_after_delete(year: str, did) -> None:
+    """Keeps everything derived from today's question list in step with a
+    delete: people mid-quiz stop being served the deleted question (their
+    total shrinks to match), and the leaderboard is re-scored without it for
+    everyone who already finished."""
+    for sess in DAILY_QUIZ_SESSIONS.values():
+        if sess.get("year") != year:
+            continue
+        before = len(sess["queue"])
+        sess["queue"][:] = [x for x in sess["queue"] if x.get("did") != did]
+        removed = before - len(sess["queue"])
+        if removed:
+            sess["total"] = max(0, sess.get("total", 0) - removed)
+    _recompute_daily_leaderboard(year)
+
 async def _dq_persist(context) -> None:
     await _flush_sessions_if_changed()
     await backup_sessions_to_channel(context)
@@ -10547,6 +10888,7 @@ async def _dq_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                        InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data=f"dqed_s:{year}:{did}")]]))
             return
         qs.pop(pos)
+        _dq_after_delete(year, did)
         await _dq_persist(context)
         text, markup = _dq_list_view(uid, year, qs, pos // DAILY_EDIT_PAGE_SIZE, "a")
         await send("🗑 اتمسح السؤال من النهاردة.\n\n" + text, markup)
@@ -11382,7 +11724,7 @@ def _tap_toast(callback_data: str | None, user_id: int) -> str | None:
         # after the quiz was completed some other way, and it's the more
         # specific joke for that exact case.
         if data == "daily_quiz_begin":
-            if get_daily_quiz_last_date(user_id) == _today():
+            if get_daily_quiz_last_date(user_id) == _daily_quiz_day():
                 return QUIZZY_ALREADY_DONE_MSG
             return QUIZZY_LATE_NIGHT_MSG if _quizzy_is_late_night() else None
 
@@ -15667,7 +16009,9 @@ ADMIN_TUTORIAL_CREATOR_SECTION = (
     "<b>/daily_module</b>\n"
     "Pick a year, then a module (and optionally specific lectures) to scope the Daily Quiz. Use the off option to return to the default.\n\n"
     "<b>/health</b>\n"
-    "Dashboard: is the bot up, user and lecture counts, whether each backup is trustworthy, live sessions, errors in the last 24h, uptime.\n\n"
+    "Dashboard: is the bot up, user and lecture counts, today / yesterday / this week / last week analytics (answers, accuracy, active users, sources, years, peak hour, XP), backups, live sessions, errors, uptime.\n\n"
+    "<b>/stats</b>\n"
+    "Permanent analytics history: last 14 days, <code>/stats weeks</code>, <code>/stats YYYY-MM-DD</code>, or <code>/stats export</code> to get stats_history.json.\n\n"
     "<b>/backup_now</b>\n"
     "Forces the pinned channel backups to refresh right now.\n\n"
     "<b>/restore</b>\n"
@@ -15727,6 +16071,7 @@ async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append("/preview — walk through the onboarding flow (nickname → year/class → bully joke → welcome)")
         lines.append("/previewtxt — text dump of every static message a normal user can see")
         lines.append("/health")
+        lines.append("/stats — permanent daily/weekly analytics history — Creator only")
         lines.append("/restore")
         lines.append("/broadcast &lt;message&gt;  (or attach a file/photo/video with /broadcast as its caption)")
         lines.append("/ban &lt;ID&gt; &lt;hours&gt; &lt;reason&gt;")
@@ -15752,13 +16097,13 @@ def is_admin(update: Update) -> bool:
     callbacks/typed-reply flows), which uses is_creator() below instead
     so secondary admins don't get the full panel."""
     uid = update.effective_user.id if update.effective_user else None
-    return uid is not None and (uid == ADMIN_ID or uid in SECONDARY_ADMIN_IDS)
+    return uid is not None and (uid in SUPERADMIN_IDS or uid in SECONDARY_ADMIN_IDS)
 
 def is_creator(update: Update) -> bool:
     """True only for the Creator (ADMIN_ID) — secondary admins pass
     is_admin() but NOT this. Reserved for /dev_panel and its own
     callbacks/flows; every other admin surface uses is_admin()."""
-    return bool(update.effective_user and update.effective_user.id == ADMIN_ID)
+    return bool(update.effective_user and update.effective_user.id in SUPERADMIN_IDS)
 
 # ── Admin log → storage group, pinging the Creator ──────────────────
 # Major admin actions and /feedback are posted into STORAGE_GROUP_ID with a
@@ -15780,7 +16125,7 @@ def _actor_label(actor) -> str:
     uid = getattr(actor, "id", actor)
     name = getattr(actor, "full_name", None) or (get_nickname(uid) if isinstance(uid, int) else None) or "—"
     uname = getattr(actor, "username", None)
-    role = "Creator" if uid == ADMIN_ID else "Admin"
+    role = "Creator" if uid in SUPERADMIN_IDS else "Admin"
     return f"{html.escape(str(name))}{f' (@{html.escape(uname)})' if uname else ''} · {role} · <code>{uid}</code>"
 
 async def admin_log(context, title: str, details: str = "", actor=None, ping: bool = True) -> bool:
@@ -15812,7 +16157,7 @@ def admin_allowed_years(user_id: int) -> list | None:
     expanding to all of that university's years — or a list of either) —
     or None for the Creator (unrestricted, every year) and for anyone who
     isn't a secondary admin at all."""
-    if user_id == ADMIN_ID or user_id not in SECONDARY_ADMIN_YEARS:
+    if user_id in SUPERADMIN_IDS or user_id not in SECONDARY_ADMIN_YEARS:
         return None
     scope = SECONDARY_ADMIN_YEARS[user_id]
     scopes = [scope] if isinstance(scope, str) else list(scope)
@@ -15843,7 +16188,7 @@ def admin_universities(user_id: int) -> list | None:
     """Universities this person may broadcast to / ban in: None = all of
     them (the superadmin); [uni] for a university admin; [] for year
     admins and everyone else (no broadcast, no ban)."""
-    if user_id == ADMIN_ID:
+    if user_id in SUPERADMIN_IDS:
         return None
     scope = UNIVERSITY_ADMINS.get(user_id)
     return [scope] if scope in UNIVERSITIES else []
@@ -15851,7 +16196,7 @@ def admin_universities(user_id: int) -> list | None:
 def can_broadcast(update: Update) -> bool:
     """Superadmin or a university admin — year admins can't broadcast."""
     uid = update.effective_user.id if update.effective_user else None
-    return uid is not None and (uid == ADMIN_ID or bool(admin_universities(uid)))
+    return uid is not None and (uid in SUPERADMIN_IDS or bool(admin_universities(uid)))
 
 def can_moderate_user(admin_id: int, target_id: int) -> bool:
     """/ban and /unban gate. The superadmin can act on anyone; a university
@@ -15863,7 +16208,7 @@ def can_moderate_user(admin_id: int, target_id: int) -> bool:
         return True
     if not unis:
         return False
-    if target_id == ADMIN_ID or target_id in SECONDARY_ADMIN_IDS:
+    if target_id in SUPERADMIN_IDS or target_id in SECONDARY_ADMIN_IDS:
         return False
     return get_university(target_id) in unis
 
@@ -15898,7 +16243,7 @@ def admin_role_label(user_id: int) -> str:
     """Role string shown on /mystats: 'The Creator' for ADMIN_ID, 'Admin
     (MNU)' / 'Admin (MFM Year 1)' for a secondary admin (naming what
     they're scoped to), 'Student' for everyone else."""
-    if user_id == ADMIN_ID:
+    if user_id in SUPERADMIN_IDS:
         return "The Creator"
     if user_id in SECONDARY_ADMIN_YEARS:
         return f"Admin ({admin_scope_label(user_id)})"
@@ -15998,7 +16343,7 @@ async def dev_panel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     that need a free-text argument (Set year / Users) or open a submenu
     (Backups / Daily module).
 
-    Gated on is_creator() specifically (exactly "== ADMIN_ID"), NOT
+    Gated on is_creator() specifically (exactly "in SUPERADMIN_IDS"), NOT
     is_admin() — secondary admins (SECONDARY_ADMIN_IDS) pass is_admin()
     and so get every other admin command/callback, but not this panel.
     Every devpanel_* callback and AWAITING_DEVPANEL_* typed-reply flow
@@ -16112,6 +16457,111 @@ def _format_uptime(seconds: float) -> str:
         return f"{hours}h {minutes}m"
     return f"{minutes}m"
 
+def _pct_str(correct: int, answered: int) -> str:
+    return f"{round(correct / answered * 100)}%" if answered else "—"
+
+def _fmt_time_spent(seconds: float) -> str:
+    h, rem = divmod(int(seconds), 3600)
+    return f"{h}h {rem // 60}m" if h else f"{rem // 60}m"
+
+def _fmt_day(day: str) -> str:
+    return datetime.strptime(day, "%Y-%m-%d").strftime("%a %d %b")
+
+def _add_days(day: str, n: int) -> str:
+    return (datetime.strptime(day, "%Y-%m-%d") + timedelta(days=n)).strftime("%Y-%m-%d")
+
+def _stats_year_name(y: str) -> str:
+    try:
+        return year_label(y) if y != "unknown" else "No year"
+    except Exception:
+        return y
+
+def _stats_one_liner(title: str, rec: dict) -> str:
+    return (f"{title}: ❓ {rec['answered']:,} ({_pct_str(rec['correct'], rec['answered'])}) · "
+            f"👤 {rec['active']:,} · 🎓 {rec['lectures']:,} · 💥 {rec['daily_done']:,}")
+
+def _stats_block(title: str, agg: dict | None, lectures_all_time: int | None = None, registered: bool = False) -> str:
+    """One analytics block for /health (a day, or a week)."""
+    if not agg or not agg.get("answered") and not agg.get("lectures") and not agg.get("daily_done"):
+        return f"<b>{title}</b>\nNo activity recorded yet."
+    a, c = agg["answered"], agg["correct"]
+    days = max(agg.get("days", 1), 1)
+    lines = [f"<b>{title}</b>"]
+    lines.append(f"❓ Questions answered: {a:,} (✅ {c:,} · {_pct_str(c, a)})"
+                 + (f" · {a // days:,}/day" if days > 1 else ""))
+    users = f"👤 Active users: {agg['active']:,}"
+    if registered and agg.get("users_total"):
+        users += f" of {agg['users_total']:,} registered ({round(agg['active'] / agg['users_total'] * 100)}%)"
+    lines.append(users)
+    lec = f"🎓 Lectures finished: {agg['lectures']:,}"
+    if lectures_all_time is not None:
+        lec += f" (all-time: {lectures_all_time:,})"
+    lines.append(lec)
+    if agg["daily_done"]:
+        lines.append(f"💥 Daily Quiz completed: {agg['daily_done']:,} · avg {_pct_str(agg['daily_correct'], agg['daily_total'])}")
+    src = [f"{STATS_SOURCE_LABELS.get(k, k)} {v[0]:,}" for k, v in agg["src"].items() if v[0]]
+    if src:
+        lines.append("📊 By source: " + " · ".join(src))
+    yrs = [f"{_stats_year_name(k)} {v[0]:,} ({_pct_str(v[1], v[0])})"
+           for k, v in sorted(agg["year"].items()) if v[0]]
+    if yrs:
+        lines.append("🏫 By year: " + " · ".join(yrs))
+    if agg["time_spent"]:
+        per = f" (~{_fmt_time_spent(agg['time_spent'] / agg['active'])}/user)" if agg["active"] else ""
+        lines.append(f"⏱ Time spent answering: {_fmt_time_spent(agg['time_spent'])}{per}")
+    lines.append(f"✨ XP awarded: {agg['xp']:,} · 🏅 Achievements: {agg['achievements']:,}")
+    if max(agg["hours"]) > 0:
+        h = max(range(24), key=lambda i: agg["hours"][i])
+        lines.append(f"⏰ Peak hour: {datetime(2000, 1, 1, h).strftime('%I %p').lstrip('0')} ({agg['hours'][h]:,} answers)")
+    if agg["errors"]:
+        lines.append(f"🐞 Errors: {agg['errors']:,}")
+    return "\n".join(lines)
+
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Creator-only: /stats (last 14 days), /stats weeks (last 12 weeks),
+    /stats <YYYY-MM-DD> (one full day), /stats export (stats_history.json)."""
+    if not is_creator(update):
+        await update.message.reply_text(MSG_ADMIN_ONLY)
+        return
+    arg = (context.args[0].lower() if context.args else "")
+    if arg == "export":
+        await _stats_flush()
+        if not os.path.exists(STATS_HISTORY_FILE):
+            await update.message.reply_text("No history saved yet.")
+            return
+        with open(STATS_HISTORY_FILE, "rb") as f:
+            await update.message.reply_document(InputFile(f, filename="stats_history.json"),
+                                                caption=f"📈 {len(STATS_HISTORY['days'])} day(s), {len(STATS_HISTORY['weeks'])} finished week(s)")
+        return
+    if arg and arg[:2] == "20":
+        rec = STATS_HISTORY["days"].get(arg)
+        if not rec:
+            await update.message.reply_text("No record for that day.")
+            return
+        await update.message.reply_text(_stats_block(f"📅 {arg}", _agg_stats([rec]), registered=True), parse_mode=ParseMode.HTML)
+        return
+    if arg in ("weeks", "week", "w"):
+        await _stats_flush()
+        keys = sorted({_stats_week_key(d) for d in STATS_HISTORY["days"]} | set(STATS_HISTORY["weeks"]), reverse=True)[:12]
+        rows = ["Week start  Answers  Acc  Users  Lect  Daily"]
+        for k in keys:
+            w = _week_agg(k)
+            if w:
+                rows.append(f"{k[5:]:<10} {w['answered']:>8,} {_pct_str(w['correct'], w['answered']):>4} "
+                            f"{w['active']:>6,} {w['lectures']:>5,} {w['daily_done']:>6,}")
+        await update.message.reply_text("📈 <b>Weekly analytics</b> (Fri→Thu)\n<code>" + "\n".join(rows) + "</code>",
+                                        parse_mode=ParseMode.HTML)
+        return
+    days = sorted(STATS_HISTORY["days"], reverse=True)[:14]
+    rows = ["Date     Answers  Acc  Users  Lect  Daily"]
+    for d in days:
+        r = STATS_HISTORY["days"][d]
+        rows.append(f"{d[5:]:<8} {r['answered']:>8,} {_pct_str(r['correct'], r['answered']):>4} "
+                    f"{r['active']:>6,} {r['lectures']:>5,} {r['daily_done']:>6,}")
+    await update.message.reply_text(
+        "📈 <b>Daily analytics</b> (last 14 days)\n<code>" + "\n".join(rows) + "</code>\n\n"
+        "<i>/stats weeks · /stats YYYY-MM-DD · /stats export</i>", parse_mode=ParseMode.HTML)
+
 async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin-only at-a-glance dashboard: is the bot up, how many users/
     lectures exist, whether each channel backup is currently trustworthy
@@ -16158,26 +16608,41 @@ async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📚 {year_label(y)} lectures: {lecture_counts[y]}" for y in YEAR_ORDER
     )
 
-    today_stats = _daily_stats_current()
     lectures_all_time = sum(
         e.get("lectures_completed", 0)
         for k, e in ANALYTICS.items()
         if isinstance(k, str) and k.lstrip("-").isdigit() and isinstance(e, dict)
     )
 
+    now_c = datetime.now(DAILY_QUIZ_TZ)
+    today_key, today_rec = _stats_today(now_c)
+    today_agg = _agg_stats([today_rec])
+    yday_rec = STATS_HISTORY["days"].get((now_c - timedelta(days=1)).strftime("%Y-%m-%d"))
+    wk = _stats_week_key(today_key)
+    last_wk = (datetime.strptime(wk, "%Y-%m-%d") - timedelta(days=7)).strftime("%Y-%m-%d")
+    this_week = _week_agg(wk)
+    prev_week = _week_agg(last_wk)
+
+    stats_text = (
+        _stats_block(f"📅 Today — {today_key}", today_agg, lectures_all_time=lectures_all_time, registered=True)
+        + (("\n\n" + _stats_one_liner("🕘 Yesterday", yday_rec)) if yday_rec else "")
+        + "\n\n" + _stats_block(f"🗓 This week — since {_fmt_day(wk)}", this_week)
+        + (("\n\n" + _stats_block(f"⏮ Last week — {_fmt_day(last_wk)} → {_fmt_day(_add_days(last_wk, 6))}", prev_week))
+           if prev_week else "")
+    )
+
     text = (
         f"🟢 Bot: ONLINE\n"
         f"👥 Users: {_count_registered_users()}\n"
         f"{lecture_lines}\n\n"
-        f"❓ Questions answered today: {today_stats['answered']:,}\n"
-        f"🎓 Lectures finished today: {today_stats['lectures']:,} (all-time: {lectures_all_time:,})\n\n"
+        f"{stats_text}\n\n"
         f"💾 Backups:\n"
         f"<code>{backup_lines}</code>\n\n"
         f"⚠️ Active sessions (answered in last 10 min): {active_sessions}\n"
         f"❌ Errors last 24h: {errors_24h}\n"
         f"⏱ Uptime: {uptime}\n\n"
         f"<i>Error count is since the last restart — it resets when the process does. "
-        f"\"Today\" = Cairo day.</i>"
+        f"\"Today\" = Cairo day; weeks run Fri→Thu. Full history: /stats</i>"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
@@ -16602,7 +17067,7 @@ class _BroadcastAttachmentFilter(filters.MessageFilter):
         user = message.from_user
         if message.chat.type != "private" or not user:
             return False
-        if user.id != ADMIN_ID and not admin_universities(user.id):
+        if user.id not in SUPERADMIN_IDS and not admin_universities(user.id):
             return False
         if _broadcast_media_kind(message) is None:
             return False
@@ -17398,6 +17863,7 @@ async def _post_init(app):
         app.job_queue.run_repeating(
             _flush_settings_job, interval=SETTINGS_FLUSH_INTERVAL, first=SETTINGS_FLUSH_INTERVAL,
         )
+        app.job_queue.run_repeating(_stats_flush_job, interval=60, first=60)
         app.job_queue.run_repeating(
             _flush_mistakes_bank_job, interval=MISTAKES_BANK_FLUSH_INTERVAL, first=MISTAKES_BANK_FLUSH_INTERVAL,
         )
@@ -17508,6 +17974,12 @@ async def _post_shutdown(app):
     await _flush_settings_if_dirty()
     await _flush_mistakes_bank_if_dirty()
     await _flush_sessions_if_changed()
+    try:
+        from types import SimpleNamespace
+        await _stats_flush()
+        await backup_stats_history_to_channel(SimpleNamespace(bot=app.bot), force=True)
+    except Exception as e:
+        print(f"Stats history shutdown flush failed: {e}")
 
 # ── Backup reconciliation ────────────────────────────────────────
 # Every backup_*_to_channel() call above is reactive and fire-and-forget:
@@ -17748,6 +18220,7 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
     # sitting there — not what the handler merely attempted to send.
     now = time.time()
     _ERROR_LOG_TIMES.append(now)
+    _stat_add("errors", 1)
     cutoff = now - _ERROR_LOG_MAX_AGE_SECONDS
     while _ERROR_LOG_TIMES and _ERROR_LOG_TIMES[0] < cutoff:
         _ERROR_LOG_TIMES.pop(0)
@@ -17847,6 +18320,7 @@ app.add_handler(CommandHandler("previewtxt",     previewtxt_cmd))
 app.add_handler(CommandHandler("set_year",       set_year_cmd))
 app.add_handler(CommandHandler("tell",           tell_cmd))
 app.add_handler(CommandHandler("health",         health_cmd))
+app.add_handler(CommandHandler("stats",          stats_cmd))
 app.add_handler(CommandHandler("restore",        restore_cmd))
 app.add_handler(CommandHandler("broadcast",      broadcast_cmd))
 app.add_handler(CommandHandler("ban",            ban_cmd))
