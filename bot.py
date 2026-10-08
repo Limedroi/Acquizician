@@ -2364,6 +2364,33 @@ def _resolve_user_ref(ref: str) -> int | None:
             substring_match = int(uid_str)
     return substring_match
 
+def _resolve_user_refs(ref: str) -> list[int]:
+    """Like _resolve_user_ref but returns EVERY match instead of just one,
+    so a caller can show a picker when a nickname is shared. A numeric ID
+    gives [that id] (if known). A nickname gives all users whose normalized
+    nickname equals it; if nobody matches exactly, all users whose nickname
+    contains it. Empty list = nothing found."""
+    ref = ref.strip()
+    if not ref:
+        return []
+    if ref.lstrip("-").isdigit():
+        uid = _resolve_user_ref(ref)
+        return [uid] if uid is not None else []
+    target = _normalize_for_filter(ref)
+    if not target:
+        return []
+    exact, partial = [], []
+    for uid_str, entry in SETTINGS.items():
+        nickname = entry.get("nickname")
+        if not nickname:
+            continue
+        normalized = _normalize_for_filter(nickname)
+        if normalized == target:
+            exact.append(int(uid_str))
+        elif target in normalized:
+            partial.append(int(uid_str))
+    return exact or partial
+
 async def _prompt_set_year(reply_target, ref: str) -> None:
     """Resolves `ref` (a nickname or ID, as typed) and replies on
     reply_target (an update.message — this is only ever reached from a
@@ -18112,6 +18139,110 @@ async def _send_broadcast(context: ContextTypes.DEFAULT_TYPE, status_message, au
     except Exception:
         pass
 
+async def info_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: /info <user_id> — everything the bot knows about one user:
+    Telegram name + @username, nickname, year/university, XP/level, quiz
+    stats, medals, settings and ban status. Read-only: it never creates
+    a settings/analytics entry for an ID the bot has never seen."""
+    if not is_admin(update):
+        await update.message.reply_text(MSG_ADMIN_ONLY)
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ استخدام:\n<code>/info ID</code>\nمثال: <code>/info 123456789</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    try:
+        target = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("⚠️ الـ ID لازم يكون رقم.")
+        return
+
+    admin_id = update.effective_user.id
+    st = SETTINGS.get(str(target))
+    an = ANALYTICS.get(str(target))
+    if st is None and an is None:
+        await update.message.reply_text("❌ مفيش يوزر بالـ ID ده في الداتا.")
+        return
+
+    # Secondary admins only see users inside their own scope.
+    if admin_id not in SUPERADMIN_IDS:
+        allowed = admin_allowed_years(admin_id) or []
+        if get_year_class(target) not in allowed and not can_moderate_user(admin_id, target):
+            await update.message.reply_text("🚫 اليوزر ده برّه نطاقك.")
+            return
+
+    st = st or {}
+    an = an or {}
+    e = html.escape
+
+    # Fresh @username / name straight from Telegram when possible
+    # (works if the user has ever started the bot); else the stored copy.
+    username = an.get("telegram_username")
+    tg_name  = an.get("telegram_name")
+    try:
+        chat = await context.bot.get_chat(target)
+        username = chat.username or username
+        live_name = " ".join(x for x in (chat.first_name, chat.last_name) if x)
+        tg_name = live_name or tg_name
+    except Exception:
+        pass
+
+    def fmt(v, dash="—"):
+        return e(str(v)) if v not in (None, "") else dash
+
+    answered = an.get("lecture_questions_answered", 0) or 0
+    correct  = an.get("lecture_questions_correct", 0) or 0
+    pct      = f"{correct / answered * 100:.1f}%" if answered else "—"
+    medals   = an.get("daily_medals") or {}
+    unlocked = sum(1 for k in ACHIEVEMENTS if (an.get("achievements") or {}).get(k))
+
+    until, reason = get_ban_info(target)
+    if until:
+        left_h = (until - time.time()) / 3600
+        ban_txt = f"🚫 محظور — باقي {left_h:.1f} ساعة\n   السبب: {fmt(reason)}"
+    else:
+        ban_txt = "✅ مش محظور"
+        if st.get("ban_reason"):
+            ban_txt += f" (آخر حظر: {fmt(st.get('ban_reason'))})"
+
+    role = ("Creator" if target in SUPERADMIN_IDS
+            else "Admin" if target in SECONDARY_ADMIN_IDS else "User")
+
+    def onoff(v):
+        return "✅" if v else "❌"
+
+    text = (
+        f"👤 <b>User Info</b>\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"🆔 <code>{target}</code>  ({role})\n"
+        f"🔗 Username: {('@' + e(username)) if username else '(no username)'}\n"
+        f"📛 Telegram name: {fmt(tg_name)}\n"
+        f"🏷️ Nickname: {fmt(st.get('nickname') or an.get('nickname'))}\n"
+        f"🎓 Year: {e(year_class_label(st.get('year_class')))}\n"
+        f"🏫 University: {fmt(UNIVERSITIES.get(get_university(target) or ''))}\n"
+        f"\n📊 <b>Progress</b>\n"
+        f"⭐ XP: {fmt(an.get('xp', 0))}  ·  Level: {fmt(an.get('level', 0))}\n"
+        f"🔥 Streak: {fmt(an.get('streak', 0))}  (best {fmt(an.get('streak_best', 0))})\n"
+        f"📅 Last active: {fmt(an.get('last_active_date'))}\n"
+        f"🎯 Answered: {answered}  ·  ✅ {correct}  ·  ❌ {an.get('lecture_questions_incorrect', 0) or 0}  ·  {pct}\n"
+        f"⏱️ Time spent: {_format_duration(an.get('lecture_time_spent_seconds', 0) or 0)}\n"
+        f"📚 Lectures completed: {an.get('lectures_completed', 0) or 0}\n"
+        f"💥 Daily quizzes: {an.get('daily_quizzes_completed', 0) or 0}  (last: {fmt(st.get('daily_quiz_last_date'))})\n"
+        f"🥇 {medals.get('gold', 0)}  🥈 {medals.get('silver', 0)}  🥉 {medals.get('bronze', 0)}\n"
+        f"🏆 Achievements: {unlocked}/{len(ACHIEVEMENTS)}\n"
+        f"✍️ Questions created: {an.get('questions_created', 0) or 0}\n"
+        f"\n⚙️ <b>Settings</b>\n"
+        f"Reactions {onoff(st.get('reactions', True))} · Auto-next {onoff(st.get('auto_next', True))} · "
+        f"Randomize {onoff(st.get('randomize', True))}\n"
+        f"Daily push {onoff(st.get('daily_notifs', True))} · Zikr {onoff(st.get('zikr_reminders', True))} · "
+        f"Spaced rep {onoff(st.get('spaced_repetition', True))}\n"
+        f"Question timer: {st.get('question_timer', 0) or 'off'}\n"
+        f"\n{ban_txt}"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
 async def ban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin: /ban <user_id> <hours> <reason> — blocks that user from
     using the bot for the given number of hours. What's actually saved
@@ -18538,11 +18669,31 @@ async def mystats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # non-admin's args are just ignored; they always get their own stats.
     if context.args and is_admin(update):
         ref = " ".join(context.args)
-        target_id = _resolve_user_ref(ref)
-        if target_id is None:
+        matches = _resolve_user_refs(ref)
+        if not matches:
             await update.message.reply_text(f"⚠️ مش لاقي حد بالاسم/الـ ID ده: {html.escape(ref)}")
             return
-        user_id = target_id
+        if len(matches) > 1:
+            # Shared nickname — list everyone who matches so the admin can
+            # re-run /mystats with the exact ID of the one they want.
+            lines = [f"👥 <b>{len(matches)} يوزرز بالاسم ده:</b> {html.escape(ref)}\n"]
+            for i, uid in enumerate(matches[:30], 1):
+                st = SETTINGS.get(str(uid), {})
+                an = ANALYTICS.get(str(uid), {})
+                uname = an.get("telegram_username")
+                lines.append(
+                    f"{i}. <b>{html.escape(str(st.get('nickname') or '—'))}</b>"
+                    f" · {('@' + html.escape(uname)) if uname else '(no username)'}\n"
+                    f"   🎓 {html.escape(year_class_label(st.get('year_class')))}"
+                    f" · ⭐ {an.get('xp', 0)} XP\n"
+                    f"   <code>/mystats {uid}</code>"
+                )
+            if len(matches) > 30:
+                lines.append(f"\n… و{len(matches) - 30} كمان — حدد الاسم أكتر.")
+            lines.append("\n👆 اضغط على الأمر عشان تنسخه وابعته.")
+            await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+            return
+        user_id = matches[0]
     await _send_mystats(context, user_id, update.message)
 
 
@@ -19248,6 +19399,7 @@ app.add_handler(CommandHandler("stats",          stats_cmd))
 app.add_handler(CommandHandler("restore",        restore_cmd))
 app.add_handler(CommandHandler("broadcast",      broadcast_cmd))
 app.add_handler(CommandHandler("ban",            ban_cmd))
+app.add_handler(CommandHandler("info",           info_cmd))
 app.add_handler(CommandHandler("unban",          unban_cmd))
 app.add_handler(CommandHandler("mystats",           mystats_cmd))
 app.add_handler(CommandHandler("restore_analytics", restore_analytics_cmd))
