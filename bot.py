@@ -2391,6 +2391,26 @@ def _resolve_user_refs(ref: str) -> list[int]:
             partial.append(int(uid_str))
     return exact or partial
 
+def _multi_match_text(ref: str, matches: list[int], cmd: str) -> str:
+    """HTML list of users sharing a nickname, each with a tap-to-copy
+    '/<cmd> <id>' line. Shared by /mystats and /info."""
+    lines = [f"👥 <b>{len(matches)} يوزرز بالاسم ده:</b> {html.escape(ref)}\n"]
+    for i, uid in enumerate(matches[:30], 1):
+        st = SETTINGS.get(str(uid), {})
+        an = ANALYTICS.get(str(uid), {})
+        uname = an.get("telegram_username")
+        lines.append(
+            f"{i}. <b>{html.escape(str(st.get('nickname') or '—'))}</b>"
+            f" · {('@' + html.escape(uname)) if uname else '(no username)'}\n"
+            f"   🎓 {html.escape(year_class_label(st.get('year_class')))}"
+            f" · ⭐ {an.get('xp', 0)} XP\n"
+            f"   <code>/{cmd} {uid}</code>"
+        )
+    if len(matches) > 30:
+        lines.append(f"\n… و{len(matches) - 30} كمان — حدد الاسم أكتر.")
+    lines.append("\n👆 اضغط على الأمر عشان تنسخه وابعته.")
+    return "\n".join(lines)
+
 async def _prompt_set_year(reply_target, ref: str) -> None:
     """Resolves `ref` (a nickname or ID, as typed) and replies on
     reply_target (an update.message — this is only ever reached from a
@@ -18140,7 +18160,7 @@ async def _send_broadcast(context: ContextTypes.DEFAULT_TYPE, status_message, au
         pass
 
 async def info_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin: /info <user_id> — everything the bot knows about one user:
+    """Admin: /info <user_id or nickname> — everything the bot knows about one user:
     Telegram name + @username, nickname, year/university, XP/level, quiz
     stats, medals, settings and ban status. Read-only: it never creates
     a settings/analytics entry for an ID the bot has never seen."""
@@ -18149,29 +18169,35 @@ async def info_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if not context.args:
         await update.message.reply_text(
-            "⚠️ استخدام:\n<code>/info ID</code>\nمثال: <code>/info 123456789</code>",
+            "⚠️ استخدام:\n<code>/info ID</code> أو <code>/info Nickname</code>\n"
+            "مثال: <code>/info 123456789</code>",
             parse_mode=ParseMode.HTML,
         )
         return
-    try:
-        target = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("⚠️ الـ ID لازم يكون رقم.")
-        return
-
-    admin_id = update.effective_user.id
-    st = SETTINGS.get(str(target))
-    an = ANALYTICS.get(str(target))
-    if st is None and an is None:
-        await update.message.reply_text("❌ مفيش يوزر بالـ ID ده في الداتا.")
-        return
+    ref = " ".join(context.args)
+    matches = _resolve_user_refs(ref)
 
     # Secondary admins only see users inside their own scope.
+    admin_id = update.effective_user.id
     if admin_id not in SUPERADMIN_IDS:
         allowed = admin_allowed_years(admin_id) or []
-        if get_year_class(target) not in allowed and not can_moderate_user(admin_id, target):
+        in_scope = [u for u in matches
+                    if get_year_class(u) in allowed or can_moderate_user(admin_id, u)]
+        if matches and not in_scope:
             await update.message.reply_text("🚫 اليوزر ده برّه نطاقك.")
             return
+        matches = in_scope
+
+    if not matches:
+        await update.message.reply_text(f"❌ مفيش يوزر بالاسم/الـ ID ده: {html.escape(ref)}")
+        return
+    if len(matches) > 1:
+        await update.message.reply_text(_multi_match_text(ref, matches, "info"), parse_mode=ParseMode.HTML)
+        return
+
+    target = matches[0]
+    st = SETTINGS.get(str(target))
+    an = ANALYTICS.get(str(target))
 
     st = st or {}
     an = an or {}
@@ -18674,24 +18700,7 @@ async def mystats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"⚠️ مش لاقي حد بالاسم/الـ ID ده: {html.escape(ref)}")
             return
         if len(matches) > 1:
-            # Shared nickname — list everyone who matches so the admin can
-            # re-run /mystats with the exact ID of the one they want.
-            lines = [f"👥 <b>{len(matches)} يوزرز بالاسم ده:</b> {html.escape(ref)}\n"]
-            for i, uid in enumerate(matches[:30], 1):
-                st = SETTINGS.get(str(uid), {})
-                an = ANALYTICS.get(str(uid), {})
-                uname = an.get("telegram_username")
-                lines.append(
-                    f"{i}. <b>{html.escape(str(st.get('nickname') or '—'))}</b>"
-                    f" · {('@' + html.escape(uname)) if uname else '(no username)'}\n"
-                    f"   🎓 {html.escape(year_class_label(st.get('year_class')))}"
-                    f" · ⭐ {an.get('xp', 0)} XP\n"
-                    f"   <code>/mystats {uid}</code>"
-                )
-            if len(matches) > 30:
-                lines.append(f"\n… و{len(matches) - 30} كمان — حدد الاسم أكتر.")
-            lines.append("\n👆 اضغط على الأمر عشان تنسخه وابعته.")
-            await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+            await update.message.reply_text(_multi_match_text(ref, matches, "mystats"), parse_mode=ParseMode.HTML)
             return
         user_id = matches[0]
     await _send_mystats(context, user_id, update.message)
