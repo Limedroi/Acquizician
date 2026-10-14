@@ -243,7 +243,9 @@ SUPERADMIN_IDS = {ADMIN_ID, 815351746}   # 815351746 = the Creator's alt account
 # ADMIN_ID). All of them pass is_admin() but fail is_creator(); they show
 # up in /mystats as "Admin (<scope>)" (vs. "The Creator" for ADMIN_ID).
 UNIVERSITY_ADMINS = {
-    8311176123: "mnu",    # MNU admin — all MNU years; MNU-only broadcast/ban
+    8311176123: "mnu",
+    1019997042: "mnu",
+    # MNU admin — all MNU years; MNU-only broadcast/ban
     # 333333333: "mnu",   # (example) another MNU admin
     # 444444444: "mfm",   # MFM admin — all MFM years; MFM-only broadcast/ban
 }
