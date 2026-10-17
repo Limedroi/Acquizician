@@ -243,9 +243,8 @@ SUPERADMIN_IDS = {ADMIN_ID, 815351746}   # 815351746 = the Creator's alt account
 # ADMIN_ID). All of them pass is_admin() but fail is_creator(); they show
 # up in /mystats as "Admin (<scope>)" (vs. "The Creator" for ADMIN_ID).
 UNIVERSITY_ADMINS = {
-    8311176123: "mnu",
-    1019997042: "mnu",
-    # MNU admin — all MNU years; MNU-only broadcast/ban
+    8311176123: "mnu",    # MNU admin — all MNU years; MNU-only broadcast/ban
+    1019997042: "mnu",    # MNU admin — all MNU years; MNU-only broadcast/ban
     # 333333333: "mnu",   # (example) another MNU admin
     # 444444444: "mfm",   # MFM admin — all MFM years; MFM-only broadcast/ban
 }
@@ -1204,11 +1203,12 @@ STATS_HISTORY_FILE = "stats_history.json"
 # backup (STORAGE_GROUP_ID's pinned document) — see backup_storage_to_channel
 # / restore_storage_from_channel. It is also in the daily zipped export.
 STATS_HISTORY_BACKUP_MIN_INTERVAL = 3600   # seconds
-STATS_SOURCES = ("lecture", "daily", "mistakes", "bookmarks", "event")
+STATS_SOURCES = ("lecture", "daily", "mistakes", "bookmarks", "event", "custom")
 STATS_SOURCE_LABELS = {"lecture": "Lectures", "daily": "Daily", "mistakes": "Mistakes",
-                       "bookmarks": "Bookmarks", "event": "Events"}
+                       "bookmarks": "Bookmarks", "event": "Events", "custom": "Custom Quiz"}
 _STATS_SUM_KEYS = ("answered", "correct", "lectures", "daily_done", "daily_correct",
-                   "daily_total", "xp", "achievements", "errors")
+                   "daily_total", "xp", "achievements", "errors",
+                   "custom_runs", "custom_questions", "custom_correct", "custom_time")
 
 def _blank_stats_day() -> dict:
     return {
@@ -1218,6 +1218,7 @@ def _blank_stats_day() -> dict:
         "hours": [0] * 24,
         "lectures": 0, "lectures_year": {},
         "daily_done": 0, "daily_correct": 0, "daily_total": 0,
+        "custom_runs": 0, "custom_questions": 0, "custom_correct": 0, "custom_time": 0.0,
         "xp": 0, "achievements": 0, "errors": 0, "time_spent": 0.0,
         "users": [], "active": 0, "users_total": 0,
     }
@@ -1298,6 +1299,16 @@ def _stat_daily_completed(correct: int, answered: int) -> None:
     rec["daily_done"] += 1
     rec["daily_correct"] += correct
     rec["daily_total"] += answered
+    _mark_stats_dirty()
+
+def _stat_custom_finished(answered: int, correct: int, seconds: float) -> None:
+    """One finished 🎯 Custom Quiz run (the per-answer counts already went in
+    through _stat_answer with source "custom")."""
+    rec = _stats_today()[1]
+    rec["custom_runs"] = rec.get("custom_runs", 0) + 1
+    rec["custom_questions"] = rec.get("custom_questions", 0) + answered
+    rec["custom_correct"] = rec.get("custom_correct", 0) + correct
+    rec["custom_time"] = round(rec.get("custom_time", 0.0) + seconds, 1)
     _mark_stats_dirty()
 
 def _stats_week_key(day: str) -> str:
@@ -1520,7 +1531,26 @@ def _format_duration(seconds: float) -> str:
     m, s = divmod(total, 60)
     return f"{m}m {s}s" if m else f"{s}s"
 
-YEAR_LEADERBOARD_PAGE_SIZE = 20   # rows per page of the global (year_leaderboard) view
+YEAR_LEADERBOARD_PAGE_SIZE = 20   # rows per page of every leaderboard view
+
+def _lb_pager(total: int, page: int, size: int = YEAR_LEADERBOARD_PAGE_SIZE) -> tuple:
+    """(page, pages, start, end) for `total` rows — page is 0-based and clamped
+    into range, so a stale Next/Back button can never land outside the board."""
+    pages = max(1, -(-total // size))
+    page = max(0, min(int(page or 0), pages - 1))
+    start = page * size
+    return page, pages, start, min(total, start + size)
+
+def _lb_nav_row(prefix: str, page: int, pages: int) -> list:
+    """[⬅️ Back] [➡️ Next] row for a 0-based paged board — the callback is
+    f"{prefix}:{page}". Next keeps showing until the last page; [] when the
+    board fits on one page."""
+    row = []
+    if page > 0:
+        row.append(InlineKeyboardButton("⬅️ Back", callback_data=f"{prefix}:{page - 1}"))
+    if page < pages - 1:
+        row.append(InlineKeyboardButton("➡️ Next", callback_data=f"{prefix}:{page + 1}"))
+    return row
 
 def _year_leaderboard(year_class: str, limit: int = 100) -> list[dict]:
     """Top users in one Year/Class cohort (SETTINGS' year_class — see the
@@ -2603,6 +2633,10 @@ async def restore_settings_from_channel(app) -> str:
 #   lecture_key: {
 #     str(user_id): {
 #       "best_correct": int, "best_total": int, "best_pct": int,
+#       "best_wrong": [mid, ...], "best_upto": mid,   # which questions the best attempt got wrong, and the
+#                                                     # highest question id it was served — lets the board
+#                                                     # re-score against the questions that still exist
+#                                                     # (see _lecture_live_score); absent on older rows
 #       "attempts": int, "last_at": "YYYY-MM-DD",
 #     }
 #   }
@@ -2647,33 +2681,73 @@ def _lr_key(year: str, lecture_key: str) -> str:
 def _get_lecture_results(lecture_key: str) -> dict:
     return LECTURE_RESULTS.setdefault(lecture_key, {})
 
-async def _record_lecture_result(user_id: int, lecture_key: str, correct: int, total: int) -> None:
+def _lecture_live_ids(lecture_key: str) -> set | None:
+    """Question ids (channel message ids) currently in the lecture behind a
+    LECTURE_RESULTS key ("<year>:<lecture>"), or None if it's gone."""
+    year, _, name = lecture_key.partition(":")
+    entry = QUIZ_INDEX.get(year, {}).get(name)
+    return set(entry.get("ids") or []) if entry else None
+
+def _lecture_live_score(live: set | None, r: dict) -> tuple:
+    """(correct, total, pct) of a stored best result, counting only the
+    questions still in the lecture — so deleting a question re-scores everyone
+    the same way instead of leaving 20/20 above 19/19.
+
+    New rows carry best_wrong + best_upto: the questions served are the live
+    ones with id <= best_upto (question ids only ever grow, so anything newer
+    was added after the attempt and was never served), minus the ones answered
+    wrong. Older rows have no per-question record, so a lecture that shrank
+    rescales their percentage onto the new size; one that grew is left alone."""
+    c, tot, pct = r.get("best_correct", 0), r.get("best_total", 0), r.get("best_pct", 0)
+    if live is None:
+        return c, tot, pct
+    wrong, upto = r.get("best_wrong"), r.get("best_upto")
+    if wrong is not None and upto is not None:
+        served = {m for m in live if m <= upto}
+        if served:
+            correct = len(served) - len(served & set(wrong))
+            return correct, len(served), round(correct / len(served) * 100)
+        return c, tot, pct   # nothing of that attempt's questions is left
+    n = len(live)
+    if 0 < n < tot:
+        correct = round(pct * n / 100)
+        return correct, n, round(correct / n * 100)
+    return c, tot, pct
+
+async def _record_lecture_result(user_id: int, lecture_key: str, correct: int, total: int,
+                                 wrong_mids: list | None = None, upto: int | None = None) -> None:
     if total <= 0:
         return
     results = _get_lecture_results(lecture_key)
     key     = str(user_id)
     pct     = round(correct / total * 100)
     prev    = results.get(key)
-    if prev is None or pct > prev.get("best_pct", -1) or (
-        pct == prev.get("best_pct", -1) and correct > prev.get("best_correct", -1)
-    ):
-        best_correct, best_total, best_pct = correct, total, pct
+    if prev is None:
+        better = True
+    else:   # compare with the previous best as it counts NOW (questions may have been deleted since)
+        p_correct, _p_total, p_pct = _lecture_live_score(_lecture_live_ids(lecture_key), prev)
+        better = pct > p_pct or (pct == p_pct and correct > p_correct)
+    if better:
+        best = {"best_correct": correct, "best_total": total, "best_pct": pct}
+        if wrong_mids is not None and upto is not None:
+            best["best_wrong"] = sorted(set(wrong_mids))
+            best["best_upto"] = upto
     else:
-        best_correct, best_total, best_pct = prev["best_correct"], prev["best_total"], prev["best_pct"]
+        best = {k: prev[k] for k in ("best_correct", "best_total", "best_pct", "best_wrong", "best_upto") if k in prev}
     results[key] = {
-        "best_correct": best_correct,
-        "best_total":   best_total,
-        "best_pct":     best_pct,
+        **best,
         "attempts":     (prev.get("attempts", 0) if prev else 0) + 1,
         "last_at":      _today(),
     }
     await save_lecture_results()
 
-def _lecture_leaderboard(lecture_key: str, limit: int = 20) -> list[dict]:
+def _lecture_leaderboard(lecture_key: str, limit: int | None = 20) -> list[dict]:
     """Top attempts for this lecture, best % first (ties broken by more
-    correct answers, then earlier last_at). Each row also carries the
-    nickname (falling back to a generic label if the user never set one)."""
+    correct answers, then earlier last_at). Scores count only the questions
+    still in the lecture (see _lecture_live_score). Each row also carries the
+    nickname; users without one are left off."""
     results = _get_lecture_results(lecture_key)
+    live = _lecture_live_ids(lecture_key)
     rows = []
     for uid_str, r in results.items():
         if not (isinstance(uid_str, str) and uid_str.lstrip("-").isdigit()):
@@ -2681,13 +2755,29 @@ def _lecture_leaderboard(lecture_key: str, limit: int = 20) -> list[dict]:
         uid = int(uid_str)
         if not has_nickname(uid):
             continue   # no nickname -> not on the board
+        c, tot, pct = _lecture_live_score(live, r)
         rows.append({
             "user_id":  uid,
             "nickname": get_nickname(uid),
             **r,
+            "best_correct": c, "best_total": tot, "best_pct": pct,
         })
     rows.sort(key=lambda r: (-r["best_pct"], -r["best_correct"], r["last_at"]))
-    return rows[:limit]
+    return rows if limit is None else rows[:limit]
+
+def _lecture_rank_line(user_id: int, lr_key: str) -> str:
+    """'🏅 your rank in this lecture' for the results message, based on the
+    user's best result (same ordering as the lecture board). Empty string if
+    they aren't on the board (no nickname)."""
+    board = _lecture_leaderboard(lr_key, limit=None)
+    pos = next((i for i, r in enumerate(board, 1) if r["user_id"] == user_id), None)
+    if pos is None:
+        return ""
+    me = board[pos - 1]
+    return (
+        f"🏅 ترتيبك في المحاضرة: <b>#{pos}</b> من {len(board)} "
+        f"(أحسن نتيجة: {me['best_correct']}/{me['best_total']} — {me['best_pct']}%)"
+    )
 
 async def backup_lecture_results_to_channel(context, force: bool = False):
     global _lecture_results_backup_msg_id, _last_lecture_results_backup_at, _daily_lb_backup_pending
@@ -4087,13 +4177,15 @@ async def _advance_daily_quiz_session(context: ContextTypes.DEFAULT_TYPE, user_i
         await _announce_events(context, user_id, {"achievements": daily_events, "level_up": daily_level})
         await backup_analytics_to_channel(context)
 
+        _rank_line = _daily_rank_line(user_id, year)
         summary = (
             f"💥 <b>خلصت الـ Daily Quiz!</b>\n\n"
             f"✅ صح: {correct}\n"
             f"❌ غلط: {incorrect}\n"
             f"📊 نسبة: {pct}%\n"
             f"📝 عدد الأسئلة: {session['answered']}/{total}\n"
-            f"✨ XP: <b>+{session['xp_earned']}</b>\n\n"
+            f"✨ XP: <b>+{session['xp_earned']}</b>\n"
+            + (f"{_rank_line}\n" if _rank_line else "") + "\n"
             + (f"{QUIZZY_PERFECT_SCORE_LINE}\n\n" if session["answered"] > 0 and pct == 100 else "")
             + f"{_next_daily_quiz_line()}"
         )
@@ -4108,6 +4200,13 @@ async def _advance_daily_quiz_session(context: ContextTypes.DEFAULT_TYPE, user_i
         except Exception:
             pass
         DAILY_QUIZ_SESSIONS.pop(user_id, None)
+
+def _daily_rank_line(user_id: int, year: str) -> str:
+    """'🏅 your rank on today's board' for the results message, or '' if the
+    run isn't on the board (no nickname, or it belongs to a rolled-over day)."""
+    ranked = _rank_daily_leaderboard(year, limit=None)
+    pos = next((i for i, r in enumerate(ranked, 1) if r.get("user_id") == user_id), None)
+    return f"🏅 ترتيبك النهاردة: <b>#{pos}</b> من {len(ranked)}" if pos else ""
 
 def get_daily_quiz_last_date(user_id: int) -> str | None:
     return SETTINGS.get(str(user_id), {}).get("daily_quiz_last_date")
@@ -4169,7 +4268,7 @@ async def _prompt_daily_quiz_year_class(context: ContextTypes.DEFAULT_TYPE, user
     else:
         await context.bot.send_message(chat_id=user_id, text=text, reply_markup=keyboard)
 
-async def show_daily_quiz_menu(context: ContextTypes.DEFAULT_TYPE, user_id: int, message=None) -> None:
+async def show_daily_quiz_menu(context: ContextTypes.DEFAULT_TYPE, user_id: int, message=None, page: int = 0) -> None:
     """The 💥Daily Quiz💥 main-menu button's destination: always shows
     today's Daily Quiz leaderboard for the user's own Year/Class
     (get_year_class — prompting them to set it first if they haven't),
@@ -4182,14 +4281,16 @@ async def show_daily_quiz_menu(context: ContextTypes.DEFAULT_TYPE, user_id: int,
         return
 
     _ensure_daily_leaderboard_fresh()
-    rows = _rank_daily_leaderboard(year_class)
-    board_title = f"🏆 <b>Daily Quiz Leaderboard — {year_class_label(year_class)} — النهاردة</b>"
+    rows = _rank_daily_leaderboard(year_class, limit=None)
+    page, pages, p_start, p_end = _lb_pager(len(rows), page)
+    board_title = (f"🏆 <b>Daily Quiz Leaderboard — {year_class_label(year_class)} — النهاردة</b>"
+                   + (f" (صفحة {page + 1}/{pages})" if pages > 1 else ""))
     if not rows:
         board_text = f"{board_title}\n\nمفيش حد خلص الـ Daily Quiz النهاردة لسه."
     else:
         medal = {0: "🥇", 1: "🥈", 2: "🥉"}
         lines = [board_title, ""]
-        for i, r in enumerate(rows):
+        for i, r in enumerate(rows[p_start:p_end], p_start):
             rank = medal.get(i, f"{i + 1}.")
             lines.append(
                 f"{rank} {html.escape(r['name'])} — "
@@ -4208,6 +4309,9 @@ async def show_daily_quiz_menu(context: ContextTypes.DEFAULT_TYPE, user_id: int,
     text = f"{board_text}\n\n{status_line}"
 
     rows_buttons = []
+    _nav = _lb_nav_row("daily_lb", page, pages)
+    if _nav:
+        rows_buttons.append(_nav)
     if not already_done:
         rows_buttons.append([InlineKeyboardButton("▶️ Start Daily Quiz", callback_data="daily_quiz_begin")])
     rows_buttons.append([InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")])
@@ -5669,22 +5773,23 @@ async def restore_report_threads_from_channel(app) -> str:
 #     ONE deletes the previous pinned message on each new upload. A 30s
 #     cadence keeping full history would post thousands of documents a
 #     day for data nobody needs a history of.
-#   - A session older than SESSIONS_MAX_AGE_SECONDS (48h) is dropped on
+#   - A session older than SESSIONS_MAX_AGE_SECONDS (3 days) is dropped on
 #     restore rather than revived — see _cleanup_stale_sessions_job's own
-#     6h idle-based cleanup, which already reclaims abandoned sessions
-#     during normal operation; this 48h check is just what keeps a
+#     3-day idle-based cleanup, which already reclaims abandoned sessions
+#     during normal operation; this 3-day check is just what keeps a
 #     restored snapshot from ever reviving something that old.
-#   - _sessions_stale_sweep_job additionally re-runs that same 48h check
-#     against the LIVE in-memory dicts every 48h, as an independent
+#   - _sessions_stale_sweep_job additionally re-runs that same 3-day check
+#     against the LIVE in-memory dicts every day, as an independent
 #     backstop in case _cleanup_stale_sessions_job's hourly job was ever
 #     down for an extended stretch (e.g. a JobQueue outage) — it only
-#     removes entries already past 48h old, never active sessions, so it
+#     removes entries already past 3 days old, never active sessions, so it
 #     can't interrupt anyone mid-quiz.
 # ═══════════════════════════════════════════════════════════════
 SESSIONS_FILE                = "sessions.json"
 SESSIONS_BACKUP_MARKER       = "🧩 QUIZICIAN_SESSIONS_BACKUP"
 SESSIONS_BACKUP_MIN_INTERVAL = 30          # seconds
-SESSIONS_MAX_AGE_SECONDS     = 48 * 3600   # 48 hours
+SESSIONS_MAX_AGE_SECONDS     = 3 * 24 * 3600   # 3 days — must not be shorter than STALE_SESSION_IDLE_SECONDS, or a
+                                                   # restore / the stale sweep would kill sessions the idle rule still allows
 
 def _sessions_snapshot() -> dict:
     """A plain-dict, JSON-safe snapshot of all three session stores.
@@ -5735,7 +5840,8 @@ def _sessions_snapshot() -> dict:
         "daily_quiz_leaderboard_date": DAILY_QUIZ_LEADERBOARD_DATE,
         "daily_quiz_leaderboard":    {y: {str(u): r for u, r in rows.items()}
                                       for y, rows in DAILY_QUIZ_LEADERBOARD.items()},
-        # /event_start events live here until /event_end (never expire) — see the EVENTS section.
+        # /event_start events (keyed by event id) live here until an admin deletes them; /event_end
+        # archives a played event with its leaderboard — see the EVENTS section.
         "events":                    EVENTS,
         # Today's analytics record (the permanent history lives in
         # stats_history.json — this keeps today intact if the disk is wiped).
@@ -5743,7 +5849,7 @@ def _sessions_snapshot() -> dict:
     }
 
 def _session_age_seconds(session: dict) -> float:
-    """Best-effort age for the 48h checks above. Lecture sessions have
+    """Best-effort age for the 3-day checks above. Lecture sessions have
     started_at; Daily Quiz / mistakes-retake sessions don't, so this
     falls back to current_delivered_at (when the in-flight question was
     sent). If neither is present, treat it as already-ancient rather
@@ -5818,6 +5924,7 @@ def _restore_sessions_dict(raw: dict) -> None:
         }
     EVENTS.clear()
     EVENTS.update(raw.get("events") or {})
+    _events_rekey()   # snapshots from before multi-event keyed EVENTS by year
     _st = raw.get("stats_today")
     if isinstance(_st, dict) and _st.get("date") and isinstance(_st.get("rec"), dict):
         _merge_stats_history({"days": {_st["date"]: _st["rec"]}})
@@ -5921,11 +6028,11 @@ async def _sessions_backup_job(context: ContextTypes.DEFAULT_TYPE):
     await _flush_sessions_if_changed()
     await backup_sessions_to_channel(context)
 
-SESSIONS_STALE_SWEEP_INTERVAL = 48 * 3600  # seconds
+SESSIONS_STALE_SWEEP_INTERVAL = 24 * 3600  # seconds — daily, so a swept session is at most ~1 day past the 3-day limit
 
 async def _sessions_stale_sweep_job(context: ContextTypes.DEFAULT_TYPE):
     """Independent backstop alongside _cleanup_stale_sessions_job's normal
-    6h idle-based cleanup — see the section banner above. Only removes
+    3-day idle-based cleanup — see the section banner above. Only removes
     entries already older than SESSIONS_MAX_AGE_SECONDS; never touches an
     active session, so this can't interrupt anyone mid-quiz."""
     removed = 0
@@ -5935,7 +6042,7 @@ async def _sessions_stale_sweep_job(context: ContextTypes.DEFAULT_TYPE):
                 sessions.pop(user_id, None)
                 removed += 1
     if removed:
-        print(f"SESSIONS — 48h stale sweep removed {removed} session(s).")
+        print(f"SESSIONS — 3-day stale sweep removed {removed} session(s).")
         await _flush_sessions_if_changed()
         await backup_sessions_to_channel(context)
 
@@ -6662,8 +6769,8 @@ async def deliver_quiz(
 # KEYBOARD HELPERS
 # ═══════════════════════════════════════════════════════════════
 def start_menu_keyboard(user_id: int | None = None):
-    _event_row = _event_menu_row(user_id)   # green /event_start button, on top
-    return InlineKeyboardMarkup(([_event_row] if _event_row else []) + [
+    _event_rows = _event_menu_rows(user_id)   # green /event_start buttons, on top
+    return InlineKeyboardMarkup(_event_rows + [
         [
             InlineKeyboardButton("🦦 How To Use", callback_data="menu_how"),
             InlineKeyboardButton("Quizzes ⁉️",    callback_data="menu_quizzes"),
@@ -6683,7 +6790,7 @@ def start_menu_keyboard(user_id: int | None = None):
             InlineKeyboardButton("🏆 Leaderboard", callback_data="leaderboard_menu"),
         ],
         [
-            InlineKeyboardButton("🔥COMING SOON🔥", callback_data="coming_soon"),
+            InlineKeyboardButton("🎯 Custom Quiz", callback_data="custom_quiz"),
         ],
     ])
 
@@ -7868,7 +7975,10 @@ async def _finish_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: i
         # Retakes are practice, not a new attempt at the lecture proper —
         # they never touch the leaderboard or best-score file, and don't
         # count toward lectures_completed or its Extras either.
-        await _record_lecture_result(user_id, _lr_key(year, session["lecture_key"]), correct, session["answered"])
+        await _record_lecture_result(
+            user_id, _lr_key(year, session["lecture_key"]), correct, session["answered"],
+            wrong_mids=session.get("wrong_mids", []), upto=session.get("served_upto"),
+        )
         await backup_lecture_results_to_channel(context)
         user_entry = _get_entry(user_id)
         user_entry["lectures_completed"] = user_entry.get("lectures_completed", 0) + 1
@@ -7908,6 +8018,9 @@ async def _finish_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: i
         f"✨ XP: <b>+{session['xp_earned']}</b>"
     )
     if not is_retake:
+        _rank_line = _lecture_rank_line(user_id, _lr_key(year, session["lecture_key"]))
+        if _rank_line:
+            summary += f"\n{_rank_line}"
         summary = f"{quizzy_block(QUIZZY_VICTORY_ART, 'Nice one! 🎉')}\n\n{summary}"
     result_buttons = [[
         InlineKeyboardButton("🏠 Back to Home", callback_data="back_home"),
@@ -8298,6 +8411,11 @@ async def _close_add_lecture(context: ContextTypes.DEFAULT_TYPE, real_uid: int, 
     QUIZ_STATE[year]["current_lecture"] = None
     await save_quiz_state(year)
     ADD_LECTURE_STATE.pop(real_uid, None)
+    # The lecture's permanent quick-link id: assign it now (if it has none yet) so it's
+    # part of the index save + channel backup right below and can never change later.
+    _lec_uid, _lec_uid_new = _lecture_uid(year, current)
+    if _lec_uid_new:
+        await save_quiz_index(year)
     # Single backup for the whole lecture, once it's actually closed —
     # same "batched at close, not per-question" convention the
     # channel-authoring -END uses.
@@ -8306,9 +8424,16 @@ async def _close_add_lecture(context: ContextTypes.DEFAULT_TYPE, real_uid: int, 
     await admin_log(context, "📚 Lecture added",
                     f"{year_label(year)} — {html.escape(str(_ent.get('module', '')))} - {html.escape(str(_ent.get('subject', '')))}: {html.escape(str(current))}\n📝 {count} سؤال",
                     real_uid)
+    try:
+        _me = await context.bot.get_me()
+        _link = f"https://t.me/{_me.username}?start={_build_lecture_quicklink_payload(year, _lec_uid)}"
+        _link_block = f"\n\n🔗 <b>لينك سريع للمحاضرة:</b>\n{_link}"
+    except Exception as e:   # the lecture is already closed and saved — never fail the close over the link
+        print("ADD_LECTURE quick link failed:", repr(e))
+        _link_block = ""
     return (
         f"✅ اتقفلت محاضرة <b>{current}</b> — {count} سؤال، وكلهم جاهزين للإرسال على طول "
-        "(مفيش انتظار لإقفال بولات — الإجابات كانت معروفة من ساعة ما اتفورورد).",
+        "(مفيش انتظار لإقفال بولات — الإجابات كانت معروفة من ساعة ما اتفورورد)." + _link_block,
         None,
     )
 
@@ -9492,12 +9617,33 @@ def _quiz_year_arg(context) -> tuple[str | None, str | None]:
 #                                      unlike /quiz and /edit_quiz which only
 #                                      show closed ones — an open/stuck lecture
 #                                      must be deletable too)
+#   qbswp:<year>:<mi>:<si>:<li>        /quiz_list only: tap one lecture then another to swap their
+#                                      order (see _swap_lecture_order / QB_SWAP_PENDING)
 #   qbdel:<year>:<mi>:<si>:<li>        delete confirmation for one lecture; the
 #                                      final tap reuses quizdel_yes / PENDING_QUIZ_DELETE
 # Lectures are looked up by position inside their subject at tap time; the
 # confirmation screen shows the full lecture name before anything is removed.
 # ═══════════════════════════════════════════════════════════════
 QB_DELETE_BACK: dict = {}   # admin uid -> callback_data of the subject list to return to after a delete
+QB_SWAP_PENDING: dict = {}  # admin uid -> (year, lecture_key, (module, subject)): first lecture tapped in a swap
+
+def _swap_lecture_order(year: str, key_a: str, key_b: str) -> bool:
+    """Exchanges the positions of two lectures in the year's index. Lecture
+    order everywhere (/quiz, /edit_quiz, the lecture pickers) IS the index's key
+    order ("insertion order = numbering order"), so this is the whole feature.
+    Done in place with no await in between, so nothing ever sees a half-swapped
+    index. Lectures keep their lecture_number labels and their permanent quick-link
+    ids; only their place in the list changes."""
+    index = QUIZ_INDEX[year]
+    if key_a == key_b or key_a not in index or key_b not in index:
+        return False
+    keys = list(index)
+    i, j = keys.index(key_a), keys.index(key_b)
+    keys[i], keys[j] = keys[j], keys[i]
+    items = [(k, index[k]) for k in keys]
+    index.clear()
+    index.update(items)
+    return True
 
 def _qb_title(mode: str) -> str:
     return "📋 <b>Quiz List</b>" if mode == "l" else "🗑 <b>Quiz Delete</b>"
@@ -9541,7 +9687,7 @@ def _qb_subject_view(year: str, mod_idx: int, mode: str):
     rows.append([InlineKeyboardButton("🔙 رجوع للموديولات", callback_data=f"qbyr:{mode}:{year}")])
     return f"{_qb_title(mode)} — <b>{year_label(year)} — {html.escape(module)}</b> — اختار المادة:", InlineKeyboardMarkup(rows)
 
-def _qb_lecture_view(year: str, mod_idx: int, subj_idx: int, mode: str):
+def _qb_lecture_view(year: str, mod_idx: int, subj_idx: int, mode: str, uid: int | None = None):
     modules = ready_modules(year)
     if mod_idx >= len(modules):
         return "⚠️ الموديول ده مش موجود دلوقتي.", None
@@ -9557,10 +9703,16 @@ def _qb_lecture_view(year: str, mod_idx: int, subj_idx: int, mode: str):
         return header + "\n\n📭 لسه مفيش محاضرات هنا.", InlineKeyboardMarkup([[back]])
     rows = []
     lines = []
+    pending = QB_SWAP_PENDING.get(uid) if uid is not None else None
+    picked = pending[1] if pending and pending[0] == year and pending[2] == (module, subject) else None
     for i, (key, v) in enumerate(lectures):
         num = v.get("lecture_number") or (i + 1)
         status = "✅" if v.get("closed") else "🟡"
         count = _add_lecture_item_count(v)
+        if mode == "l" and len(lectures) > 1:   # tap one lecture, then another, to swap their order
+            rows.append([InlineKeyboardButton(
+                f"{'👉 ' if key == picked else '🔀 '}{i + 1}. {status} Lecture {num}: {v['name']}"[:64],
+                callback_data=f"qbswp:{year}:{mod_idx}:{subj_idx}:{i}")])
         if mode == "d":
             rows.append([InlineKeyboardButton(
                 f"🗑 {status} Lecture {num}: {v['name']} ({count})"[:64],
@@ -9573,6 +9725,10 @@ def _qb_lecture_view(year: str, mod_idx: int, subj_idx: int, mode: str):
         header += "\n\nاختار المحاضرة اللي عايز تمسحها:"
     else:
         header += "\n\n" + "\n".join(lines)
+        if len(lectures) > 1:
+            header += ("\n\n🔀 <b>لتبديل الترتيب:</b> دوس على المحاضرة الأولى وبعدين على التانية — هيتبدلوا."
+                       + (f"\n👉 مختار دلوقتي: <b>{html.escape(str(QUIZ_INDEX[year][picked]['name']))}</b> — دوس على المحاضرة التانية (أو عليها تاني عشان تلغي)."
+                          if picked in QUIZ_INDEX[year] else ""))
     return header, InlineKeyboardMarkup(rows)
 
 async def _qb_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, query) -> None:
@@ -9594,7 +9750,7 @@ async def _qb_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, query
         return
 
     # every other callback carries a year: validate + scope-check it once
-    year = parts[2] if cmd != "qbdel" else parts[1]
+    year = parts[2] if cmd not in ("qbdel", "qbswp") else parts[1]
     if year not in YEARS or not year_channel_id(year):
         await send("⚠️ السنة دي مش متاحة دلوقتي.")
         return
@@ -9609,7 +9765,23 @@ async def _qb_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, query
             text, markup = _qb_subject_view(year, int(parts[3]), parts[1])
         elif cmd == "qbsub":
             PENDING_QUIZ_DELETE.pop(uid, None)   # backing out of a confirm screen drops its pending delete
-            text, markup = _qb_lecture_view(year, int(parts[3]), int(parts[4]), parts[1])
+            QB_SWAP_PENDING.pop(uid, None)       # entering a subject's list starts with nothing picked
+            text, markup = _qb_lecture_view(year, int(parts[3]), int(parts[4]), parts[1], uid)
+        elif cmd == "qbswp":
+            mod_idx, subj_idx, lec_idx = int(parts[2]), int(parts[3]), int(parts[4])
+            modules = ready_modules(year)
+            module = modules[mod_idx]
+            subject = ready_subjects(year, module)[subj_idx]
+            key = _qb_lectures(year, module, subject)[lec_idx][0]
+            pending = QB_SWAP_PENDING.get(uid)
+            if pending and pending[0] == year and pending[2] == (module, subject) and pending[1] in QUIZ_INDEX[year]:
+                QB_SWAP_PENDING.pop(uid, None)
+                if _swap_lecture_order(year, pending[1], key):   # tapping the same lecture twice just un-picks it
+                    await save_quiz_index(year)
+                    await backup_quiz_to_channel(context, year)
+            else:
+                QB_SWAP_PENDING[uid] = (year, key, (module, subject))
+            text, markup = _qb_lecture_view(year, mod_idx, subj_idx, "l", uid)
         elif cmd == "qbdel":
             mod_idx, subj_idx, lec_idx = int(parts[2]), int(parts[3]), int(parts[4])
             modules = ready_modules(year)
@@ -9663,6 +9835,7 @@ async def quiz_list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lecnum = f" {v['lecture_number']}" if v.get("lecture_number") else ""
         lines.append(f"{i}. {v['module']} - {v['subject']} Lecture{lecnum}: {v['name']} — {len(v['ids'])} سؤال — {status}")
     lines.append(f"\nاستخدم /quiz_delete {year} &lt;رقم&gt; للحذف")
+    lines.append("لتبديل ترتيب محاضرتين: ابعت /quiz_list من غير سنة وافتح المادة.")
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 async def quiz_delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -9766,12 +9939,21 @@ async def add_lecture_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════════════════════════
 # EVENTS — /event_start (author) · /event_end (close)
 # ═══════════════════════════════════════════════════════════════
-# One event per year key (y1-y3 = MFM, n1-n3 = MNU), so each uni+year has its
-# own. EVENTS[year] = {"name", "live", "created_by", "questions": [...],
-# "results": {uid: {...}}}. It is NOT stored in QUIZ_INDEX (so it never shows
+# Any number of events per year. A "year" here is a YEARS key (y1-y3 = MFM,
+# n1-n3 = MNU); each event belongs to exactly one of them (ev["year"]) and is
+# shown only to that year's users. EVENTS is keyed by the event's own id (its
+# "uid", a short random hex token — same one the quick link carries):
+# EVENTS[eid] = {"uid", "year", "name", "live", "created_by", "questions": [...],
+# "results": {str(user_id): {"user_id","name","correct","answered","total","duration"}}}.
+# "results" IS the event's leaderboard (best attempt per user, ranked by correct
+# count then time — same ranking as the Daily Quiz board) and is kept after
+# /event_end: an ended event is archived (ev["ended"]=True, questions dropped,
+# results kept) until an admin deletes it from /edit_event.
+# Older snapshots keyed EVENTS by year — _events_rekey() converts them on restore.
+# It is NOT stored in QUIZ_INDEX (so it never shows
 # up in the module/lecture lists): it rides in the SESSIONS snapshot
 # (_sessions_snapshot / _restore_sessions_dict -> sessions.json + the pinned
-# backup in SESSIONS_GROUP_ID) and is exempt from the 48h session expiry. It
+# backup in SESSIONS_GROUP_ID) and is exempt from the 3-day session expiry. It
 # lives there until /event_end deletes it.
 #   draft  (live=False): admin is still forwarding polls; invisible to users
 #   live   (live=True) : a green button on top of the main menu for that
@@ -9782,7 +9964,7 @@ EVENTS: dict = {}
 AWAITING_EVENT_NAME: dict = {}   # admin uid -> True while waiting for the typed event name
 AWAITING_EVENT_DESC: dict = {}   # admin uid -> True while waiting for the event description
 EVENT_PICK: dict = {}            # admin uid -> {"name","description"} while choosing uni / year
-EVENT_AUTHORING: dict = {}       # admin uid -> {"year","pending_image","pending_case_study","status_message_id"}
+EVENT_AUTHORING: dict = {}       # admin uid -> {"eid","year","pending_image","pending_case_study","status_message_id"}
 EVENT_SESSIONS: dict = {}        # user uid -> in-flight event run (RAM only)
 EVENT_NAME_MAX_LEN = 40
 EVENT_DESC_MAX_LEN = 1500   # raw characters; the preview screen must stay under Telegram's 4096 limit
@@ -9818,15 +10000,20 @@ def _event_has_items(ev: dict) -> bool:
     (a written-only event has no polls at all)."""
     return bool(ev and (ev.get("questions") or ev.get("written_end")))
 
-def _event_menu_row(user_id):
-    """The green event button row for this user's own uni+year, or None."""
+def _event_menu_rows(user_id) -> list:
+    """Green event button rows (one per live event) for this user's own
+    uni+year — oldest first, empty list if there is none."""
     if user_id is None:
-        return None
+        return []
     year = get_year_class(user_id)
-    ev = EVENTS.get(year) if year else None
-    if not ev or not ev.get("live") or not _event_has_items(ev):
-        return None
-    return [_event_green_button(ev['name'], f"evtu_open:{year}")]
+    if not year:
+        return []
+    live = [
+        (eid, ev) for eid, ev in EVENTS.items()
+        if ev.get("year") == year and ev.get("live") and not ev.get("ended") and _event_has_items(ev)
+    ]
+    live.sort(key=lambda t: t[1].get("published_at") or t[1].get("created_at") or 0)
+    return [[_event_green_button(ev["name"], f"evtu_open:{eid}")] for eid, ev in live]
 
 def _event_status_markup(au: dict | None = None):
     if au and au.get("editing"):
@@ -9891,33 +10078,23 @@ async def _event_begin(context, uid: int, year: str, send) -> None:
         return
     name = pick["name"]
     description = pick.get("description")
-    ev = EVENTS.get(year)
-    if ev and ev.get("live"):
-        await send(
-            f"⚠️ فيه Event شغال بالفعل لـ <b>{year_label(year)}</b>: <b>{html.escape(ev['name'])}</b>\n"
-            "اقفله بـ /event_end الأول."
-        )
-        return
-    resumed = bool(ev and _event_has_items(ev))
-    if ev:
-        ev["name"] = name   # unpublished draft left over — reopen it under the new name
-        ev["description"] = description
-    else:
-        ev = EVENTS[year] = {
-            "name": name, "description": description, "live": False, "created_by": uid,
-            "created_at": time.time(), "questions": [], "results": {},
-        }
-    _event_uid(ev)
-    EVENT_AUTHORING[uid] = {"year": year, "pending_image": None, "pending_case_study": None, "status_message_id": None}
+    # Every /event_start makes a NEW event (several per year are fine).
+    ev = {
+        "name": name, "description": description, "year": year, "live": False, "created_by": uid,
+        "created_at": time.time(), "questions": [], "results": {},
+    }
+    eid = _event_uid(ev)
+    while eid in EVENTS:   # ids are random; this is just a collision guard
+        ev.pop("uid", None)
+        eid = _event_uid(ev)
+    EVENTS[eid] = ev
+    EVENT_AUTHORING[uid] = {
+        "eid": eid, "year": year, "pending_image": None, "pending_case_study": None, "status_message_id": None,
+    }
+    PICKER[uid] = {"purpose": "event", "year": year, "eid": eid, "count": None, "sel": set(), "name": name}
     uni_name = UNIVERSITIES.get(year_university(year), "")
-    resume_note = f"\n♻️ فيه {len(ev['questions'])} سؤال محفوظين من قبل — هيتضافوا عليهم." if resumed else ""
-    await send(
-        f"<b>{html.escape(name)}</b> — {uni_name} {year_label(year)}{resume_note}\n\n"
-        "دلوقتي فوروارد الأسئلة (Quiz polls) واحد واحد بعد ما تشيل اسم المرسل (Hide Sender's Name).\n"
-        "لو عايز صورة أو Case study (نص) لسؤال، ابعتها الأول وبعدين فوروارد السؤال.\n"
-        "أي رسالة فيها Spoiler بتتسجل كسؤال مكتوب زي ما هي، والباقي (من غير Spoiler) بيتسجل Case study.\n"
-        "لما تخلص دوس 🚀 Publish Event (أو ابعت -END) وهيظهر للطلبة."
-    )
+    await send(_pick_count_text(PICKER[uid], f"<b>{html.escape(name)}</b> — {uni_name} {year_label(year)}"),
+               _pick_count_markup(PICKER[uid]))
 
 async def _event_refresh_status(context, uid: int, au: dict) -> None:
     if au.get("batch_draining"):
@@ -9932,7 +10109,7 @@ async def _event_refresh_status(context, uid: int, au: dict) -> None:
     async with lock:
         if _event_status_gen.get(uid) != gen or EVENT_AUTHORING.get(uid) is not au:
             return
-        ev = EVENTS.get(au["year"])
+        ev = EVENTS.get(au["eid"])
         if not ev:
             return
         old = au.get("status_message_id")
@@ -9955,7 +10132,7 @@ async def _dot_link_event(update: Update, au: dict) -> None:
     still shows the case when drawn alone) tagged with a shared
     "case_group", which delivery uses to show a text case only once in a row."""
     group = au.pop("open_group", None)
-    ev = EVENTS.get(au["year"])
+    ev = EVENTS.get(au["eid"])
     qids = list((group or {}).get("qids") or [])
     by_id = {q.get("id"): q for q in (ev["questions"] if ev else [])}
     first = by_id.get(qids[0]) if qids else None
@@ -9978,7 +10155,7 @@ async def _dot_link_event(update: Update, au: dict) -> None:
 
 async def _event_capture_poll(update: Update, context: ContextTypes.DEFAULT_TYPE, uid: int, au: dict) -> None:
     msg, poll = update.message, update.message.poll
-    ev = EVENTS.get(au["year"])
+    ev = EVENTS.get(au["eid"])
     if not ev or (ev.get("live") and not au.get("editing")):
         EVENT_AUTHORING.pop(uid, None)
         await msg.reply_text("⚠️ الـ Event ده اتقفل أو اتشال — ابدأ من /event_start تاني.")
@@ -10028,7 +10205,7 @@ async def _event_capture_poll(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def _event_publish(context, uid: int, au: dict):
     """(summary, None) on success or (None, error). Makes the event live."""
-    ev = EVENTS.get(au["year"])
+    ev = EVENTS.get(au["eid"])
     if not ev:
         EVENT_AUTHORING.pop(uid, None)
         return None, "⚠️ الـ Event ده اتشال من حتة تانية."
@@ -10058,33 +10235,92 @@ async def _event_publish(context, uid: int, au: dict):
         "لما تخلص استخدم /event_end."
     ), None
 
+EVENT_LB_USER_ROWS = 20    # rows per page (students and admins)
+
+def _events_rekey() -> None:
+    """Older snapshots keyed EVENTS by year ('y1'). Re-key each such event by
+    its own uid and record its year on it. Idempotent."""
+    for key in list(EVENTS):
+        ev = EVENTS.get(key)
+        if not isinstance(ev, dict):
+            EVENTS.pop(key, None)
+            continue
+        if not ev.get("year") and key in YEARS:
+            ev["year"] = key
+            EVENTS.pop(key, None)
+            EVENTS[_event_uid(ev)] = ev
+
+def _event_rank(ev: dict, limit: int | None = EVENT_LB_USER_ROWS) -> list:
+    """The event's leaderboard: best attempt per user, correct count highest
+    first, total time lowest first as the tiebreaker. Users without a nickname
+    are never shown (same rule as the Daily Quiz board)."""
+    rows = []
+    for key, r in (ev.get("results") or {}).items():
+        try:
+            uid = int(r.get("user_id", key))
+        except (TypeError, ValueError):
+            continue
+        if not has_nickname(uid):
+            continue
+        rows.append({
+            **r, "user_id": uid, "name": get_nickname(uid),
+            "correct": r.get("correct", 0), "total": r.get("total", 0),
+            "duration": r.get("duration") or 0.0,
+        })
+    rows.sort(key=lambda r: (-r["correct"], r["duration"]))
+    return rows if limit is None else rows[:limit]
+
+def _event_leaderboard_text(ev: dict, page: int = 0, viewer: int | None = None) -> tuple:
+    """(text, page, pages) for one 0-based page of the event's board. When the
+    viewer is on the board their own rank is added at the bottom."""
+    ranked = _event_rank(ev, limit=None)
+    title = f"🏆 <b>Leaderboard — {html.escape(ev['name'])}</b>" + (" 🏁" if ev.get("ended") else "")
+    if not ranked:
+        return f"{title}\n\nمفيش حد خلص الـ Event لسه.", 0, 1
+    page, pages, p_start, p_end = _lb_pager(len(ranked), page, EVENT_LB_USER_ROWS)
+    if pages > 1:
+        title += f" (صفحة {page + 1}/{pages})"
+    medal = {0: "🥇", 1: "🥈", 2: "🥉"}
+    lines = [title, ""]
+    for i, r in enumerate(ranked[p_start:p_end], p_start):
+        lines.append(f"{medal.get(i, f'{i + 1}.')} {html.escape(r['name'])} — "
+                     f"{r['correct']}/{r['total']} ✅ · ⏱️ {_format_duration(r['duration'])}")
+    lines += ["", f"👥 {len(ranked)} خلصوه"]
+    if viewer is not None:
+        pos = next((i for i, r in enumerate(ranked, 1) if r["user_id"] == viewer), None)
+        if pos is not None:
+            lines.append(f"🏅 ترتيبك: <b>#{pos}</b>")
+    return "\n".join(lines), page, pages
+
 def _event_results_summary(ev: dict) -> str:
     res = ev.get("results") or {}
     if not res:
         return "👥 محدش حل الـ Event."
     pcts = [round(r["correct"] / r["total"] * 100) for r in res.values() if r.get("total")]
     avg = round(sum(pcts) / len(pcts)) if pcts else 0
-    top = sorted(res.values(), key=lambda r: (-r.get("correct", 0), r.get("total", 0)))[:3]
     lines = [f"👥 اتحل من <b>{len(res)}</b> يوزر — متوسط النتيجة <b>{avg}%</b>"]
-    for i, r in enumerate(top, 1):
-        lines.append(f"{i}. {html.escape(r.get('name') or '—')} — {r['correct']}/{r['total']}")
+    for i, r in enumerate(_event_rank(ev, limit=3), 1):
+        lines.append(f"{i}. {html.escape(r['name'] or '—')} — {r['correct']}/{r['total']} · {_format_duration(r['duration'])}")
     return "\n".join(lines)
 
 async def event_end_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin: /event_end — pick which of their events to close (drops it from
-    the sessions backup and removes the green button)."""
+    """Admin: /event_end — pick which of their events to close. A published
+    event that someone solved is archived (button gone, questions dropped,
+    leaderboard kept); a draft or an unplayed event is just removed."""
     if not is_admin(update):
         await update.message.reply_text(MSG_ADMIN_ONLY)
         return
     uid = update.effective_user.id
-    found = [(y, EVENTS[y]) for y in _event_admin_years(uid) if y in EVENTS]
+    years = _event_admin_years(uid)
+    found = [(eid, ev) for eid, ev in EVENTS.items() if ev.get("year") in years and not ev.get("ended")]
+    found.sort(key=lambda t: t[1].get("created_at") or 0)
     if not found:
         await update.message.reply_text("📭 مفيش Event شغال ليك دلوقتي.")
         return
     buttons = [[InlineKeyboardButton(
-        f"{UNIVERSITIES.get(year_university(y), '')} {year_label(y)} — {ev['name']} ({'🟢 live' if ev.get('live') else '📝 draft'})",
-        callback_data=f"evta_end:{y}",
-    )] for y, ev in found]
+        f"{UNIVERSITIES.get(year_university(ev['year']), '')} {year_label(ev['year'])} — {ev['name']} ({'🟢 live' if ev.get('live') else '📝 draft'})",
+        callback_data=f"evta_end:{eid}",
+    )] for eid, ev in found]
     await update.message.reply_text(
         "🏁 <b>Event End — اختار الـ Event:</b>", parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(buttons),
@@ -10126,11 +10362,12 @@ async def _event_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     if data == "evta_cancel":
+        PICKER.pop(uid, None)
         au = EVENT_AUTHORING.pop(uid, None)
         if not au:
             await send("⚠️ مفيش Event مفتوح دلوقتي.")
             return
-        ev = EVENTS.get(au["year"])
+        ev = EVENTS.get(au["eid"])
         if au.get("editing"):
             if ev:
                 added = set(au.get("added", []))
@@ -10139,21 +10376,23 @@ async def _event_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
             await send(f"❌ اتلغت الإضافة — اتشال {len(au.get('added', []))} سؤال كان اتضاف في الجلسة دي.")
             return
         if ev and not ev.get("live"):
-            EVENTS.pop(au["year"], None)
+            EVENTS.pop(au["eid"], None)
         await send("❌ اتلغى الـ Event واتشالت الأسئلة اللي اتسجلت.")
         return
 
     if data.startswith("evta_end:"):
-        year = data.split(":", 1)[1]
-        ev = EVENTS.get(year)
-        if not ev or year not in _event_admin_years(uid):
+        eid = data.split(":", 1)[1]
+        ev = EVENTS.get(eid)
+        if not ev or ev.get("ended") or ev.get("year") not in _event_admin_years(uid):
             await send("⚠️ الـ Event ده مش موجود أو مش في صلاحياتك.")
             return
+        note = ("الزرار هيختفي من عند اليوزرز والأسئلة هتتمسح، لكن الـ leaderboard هيفضل محفوظ."
+                if ev.get("live") and ev.get("results") else
+                "محدش حله لسه، فهيتمسح خالص.")
         await send(
-            f"🏁 تقفل <b>{html.escape(ev['name'])}</b> ({year_label(year)})؟\n"
-            "الزرار هيختفي من عند اليوزرز والأسئلة هتتمسح.",
+            f"🏁 تقفل <b>{html.escape(ev['name'])}</b> ({year_label(ev['year'])})؟\n{note}",
             InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ أيوه، اقفله", callback_data=f"evta_endok:{year}"),
+                InlineKeyboardButton("✅ أيوه، اقفله", callback_data=f"evta_endok:{eid}"),
                 InlineKeyboardButton("↩️ لأ", callback_data="evta_endno"),
             ]]),
         )
@@ -10164,23 +10403,34 @@ async def _event_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     if data.startswith("evta_endok:"):
-        year = data.split(":", 1)[1]
-        if year not in _event_admin_years(uid) or year not in EVENTS:
+        eid = data.split(":", 1)[1]
+        ev = EVENTS.get(eid)
+        if not ev or ev.get("ended") or ev.get("year") not in _event_admin_years(uid):
             await send("⚠️ الـ Event ده مش موجود أو مش في صلاحياتك.")
             return
-        ev = EVENTS.pop(year)
         for aid, au in list(EVENT_AUTHORING.items()):
-            if au.get("year") == year:
+            if au.get("eid") == eid:
                 EVENT_AUTHORING.pop(aid, None)
+        summary = _event_results_summary(ev)
+        archived = bool(ev.get("live") and ev.get("results"))
+        if archived:
+            ev["live"], ev["ended"], ev["ended_at"] = False, True, time.time()
+            ev["questions"] = []
+            ev.pop("written_end", None)
+        else:
+            EVENTS.pop(eid, None)
         await _flush_sessions_if_changed()
         await backup_sessions_to_channel(context, force=True)
-        await admin_log(context, "🏁 Event ended", f"{html.escape(ev['name'])} — {year_label(year)}\n{_event_results_summary(ev)}", uid)
-        await send(f"🏁 اتقفل <b>{html.escape(ev['name'])}</b>.\n\n{_event_results_summary(ev)}")
+        await admin_log(context, "🏁 Event ended", f"{html.escape(ev['name'])} — {year_label(ev['year'])}\n{summary}", uid)
+        await send(
+            f"🏁 اتقفل <b>{html.escape(ev['name'])}</b>.\n\n{summary}"
+            + ("\n\n🏆 الـ leaderboard اتحفظ — شوفه من /edit_event." if archived else "")
+        )
         return
 
 # ── User side ────────────────────────────────────────────────────
 async def _event_send_next(context, user_id: int, s: dict) -> bool:
-    ev = EVENTS.get(s["year"])
+    ev = _event_of(s)
     if not ev or not ev.get("live"):
         s["current_poll_id"] = None
         return False
@@ -10241,6 +10491,7 @@ async def _event_send_next(context, user_id: int, s: dict) -> bool:
             s["delivered"] -= 1
             continue
         s["written_header_sent"]  = False   # a poll ends any written run
+        s["q_sent_at"]            = time.time()   # per-question timer (see _event_advance)
         s["current_poll_id"]      = msg.poll.id
         s["current_correct_id"]   = ev_correct
         s["current_option_count"] = len(q["options"])
@@ -10250,10 +10501,13 @@ async def _event_send_next(context, user_id: int, s: dict) -> bool:
 
 async def _event_advance(context, user_id: int, s: dict, is_correct: bool) -> None:
     s["answered"] += 1
-    _stat_answer(user_id, "event", is_correct)
+    _t0 = s.pop("q_sent_at", None)
+    if _t0:   # run time = sum of the time spent on each poll (written questions / idling don't count)
+        s["duration"] = s.get("duration", 0.0) + max(0.0, time.time() - _t0)
+    _stat_answer(user_id, "custom" if s.get("custom") else "event", is_correct)
     if is_correct:
         s["correct"] += 1
-    ev = EVENTS.get(s["year"])
+    ev = _event_of(s)
     if not ev or not ev.get("live"):
         EVENT_SESSIONS.pop(user_id, None)
         try:
@@ -10264,29 +10518,74 @@ async def _event_advance(context, user_id: int, s: dict, is_correct: bool) -> No
     if await _event_send_next(context, user_id, s):
         if s.get("written_pending_msg") is not None and not _event_polls_left(s):
             _event_save_result(ev, user_id, s)   # all polls answered — only written ones left; summary waits for them
+            await _event_persist_safe(context)
         return
     await _event_finish(context, user_id, s, ev)
+
+def _event_of(s: dict):
+    """The event a run belongs to. A 🎯 Custom Quiz run carries its own private
+    event dict in s["ev"]; a normal event run looks it up by id."""
+    return s.get("ev") or EVENTS.get(s.get("eid"))
 
 def _event_polls_left(s: dict) -> bool:
     return any(not isinstance(x, dict) for x in s.get("queue", []))
 
+CUSTOM_QUIZ_HISTORY_LIMIT = 20   # runs kept per user (the totals are never trimmed)
+
+async def _custom_quiz_save(context, user_id: int, s: dict) -> None:
+    """Saves a finished Custom Quiz on the user's analytics entry
+    (entry["custom_quiz"]): lifetime totals — runs, questions answered, correct,
+    seconds spent — plus their last CUSTOM_QUIZ_HISTORY_LIMIT runs as
+    [unix_time, questions_asked, answered, correct, seconds, previous_year_pct].
+    Accuracy = correct/questions, speed = seconds/questions. It rides the
+    analytics backup, and the bot-wide counters go to the stats history."""
+    answered, correct = s.get("answered", 0), s.get("correct", 0)
+    if answered <= 0:
+        return
+    seconds = round(s.get("duration", 0.0), 1)
+    entry = _get_entry(user_id)
+    cq = entry.setdefault("custom_quiz", {})
+    for k, v in (("runs", 0), ("questions", 0), ("correct", 0), ("seconds", 0.0), ("history", [])):
+        cq.setdefault(k, v)
+    cq["runs"] += 1
+    cq["questions"] += answered
+    cq["correct"] += correct
+    cq["seconds"] = round(cq["seconds"] + seconds, 1)
+    cq["history"].append([int(time.time()), s.get("total", answered), answered, correct, seconds, s.get("prev_pct", 0)])
+    del cq["history"][:-CUSTOM_QUIZ_HISTORY_LIMIT]
+    _mark_analytics_dirty()
+    _stat_custom_finished(answered, correct, seconds)
+    try:
+        await backup_analytics_to_channel(context)
+    except Exception as e:
+        print("CUSTOM QUIZ BACKUP ERROR:", e)
+
+async def _event_persist_safe(context) -> None:
+    try:
+        await _event_persist(context)
+    except Exception as e:
+        print("EVENT PERSIST ERROR:", e)
+
 def _event_save_result(ev: dict, user_id: int, s: dict) -> None:
+    """Records this run on the event's leaderboard if it beats the user's
+    previous best (more correct, or equal correct in less time)."""
     if s.get("result_saved"):
         return
     s["result_saved"] = True
-    correct = s["correct"]
+    new = {
+        "user_id": user_id, "name": get_nickname(user_id), "correct": s["correct"],
+        "answered": s["answered"], "total": s["total"], "duration": round(s.get("duration", 0.0), 1),
+    }
     prev = ev.setdefault("results", {}).get(str(user_id))
-    if prev is None or correct > prev.get("correct", 0):
-        ev["results"][str(user_id)] = {
-            "correct": correct, "answered": s["answered"], "total": s["total"], "name": get_nickname(user_id),
-        }
+    if prev is None or (new["correct"], -new["duration"]) > (prev.get("correct", 0), -(prev.get("duration") or 0.0)):
+        ev["results"][str(user_id)] = new
 
 async def _event_proceed_after_written(context, user_id: int, s: dict) -> None:
     """❤️ on the written question an event run was waiting on."""
     s["written_pending_msg"] = None
     if await _event_send_next(context, user_id, s):
         return
-    ev = EVENTS.get(s["year"])
+    ev = _event_of(s)
     if not ev:
         EVENT_SESSIONS.pop(user_id, None)
         return
@@ -10294,21 +10593,39 @@ async def _event_proceed_after_written(context, user_id: int, s: dict) -> None:
 
 async def _event_finish(context, user_id: int, s: dict, ev: dict) -> None:
     EVENT_SESSIONS.pop(user_id, None)
+    custom = bool(s.get("custom"))
     total, correct = s["total"], s["correct"]
     pct = round(correct / s["answered"] * 100) if s["answered"] else 0
-    _event_save_result(ev, user_id, s)
+    if not custom:
+        _event_save_result(ev, user_id, s)
+    else:
+        await _custom_quiz_save(context, user_id, s)
+    rank_line = ""
+    if custom and s["answered"] and s.get("duration"):
+        rank_line = f"\n⚡ السرعة: {s['duration'] / s['answered']:.1f} ثانية/سؤال"
+    if not custom:
+        _ranked = _event_rank(ev, limit=None)
+        _pos = next((i for i, r in enumerate(_ranked, 1) if r["user_id"] == user_id), None)
+        if _pos:
+            rank_line = f"\n🏅 ترتيبك: <b>#{_pos}</b> من {len(_ranked)}"
+    buttons = [] if custom else [[InlineKeyboardButton("🏆 Leaderboard", callback_data=f"evtu_lb:{s['eid']}")]]
+    buttons.append([InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")])
     try:
         await context.bot.send_message(
             chat_id=user_id, parse_mode=ParseMode.HTML,
             text=(
                 f"<b>خلصت {html.escape(ev['name'])}!</b>\n\n"
                 f"✅ صح: {correct}\n❌ غلط: {s['answered'] - correct}\n"
-                f"📊 نسبة: {pct}%\n📝 عدد الأسئلة: {s['answered']}/{total}"
+                f"📊 نسبة: {pct}%\n📝 عدد الأسئلة: {s['answered']}/{total}\n"
+                f"⏱️ الوقت: {_format_duration(s.get('duration', 0.0))}"
+                + rank_line
             ),
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")]]),
+            reply_markup=InlineKeyboardMarkup(buttons),
         )
     except Exception:
         pass
+    if not custom:
+        await _event_persist_safe(context)
 
 def _event_uid(ev: dict) -> str:
     """Stable random id for one event (assigned lazily for older events) —
@@ -10319,19 +10636,27 @@ def _event_uid(ev: dict) -> str:
         uid = ev["uid"] = secrets.token_hex(4)
     return uid
 
-def _event_quicklink_payload(year: str, ev: dict) -> str:
-    return f"E_{year}_{_event_uid(ev)}"
+def _event_quicklink_payload(ev: dict) -> str:
+    return f"E_{ev['year']}_{_event_uid(ev)}"
 
-def _event_preview_view(year: str, user_id: int, uid: str | None = None):
+def _event_preview_view(eid: str, user_id: int, token: str | None = None):
     """The event preview screen (description + ▶️ Start / ❌ Cancel / 🔗 Quick
-    link), same layout as the lecture preview in /quiz. Shared by the main-menu
-    button and the quick-link /start deep link. `uid`, when given, must match
-    the live event's uid (quick links)."""
+    link / 🏆 Leaderboard), same layout as the lecture preview in /quiz. Shared
+    by the main-menu button and the quick-link /start deep link. `token`, when
+    given, must match the event's uid (quick links). An ended event shows only
+    its leaderboard."""
     home = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")]])
-    ev = EVENTS.get(year)
-    if (not ev or not ev.get("live") or not _event_has_items(ev) or get_year_class(user_id) != year
-            or (uid is not None and _event_uid(ev) != uid)):
-        return "⚠️ الـ Event ده خلص أو مش متاح ليك.", home
+    ev = EVENTS.get(eid)
+    unavailable = ("⚠️ الـ Event ده خلص أو مش متاح ليك.", home)
+    if (not ev or get_year_class(user_id) != ev.get("year")
+            or (token is not None and _event_uid(ev) != token)):
+        return unavailable
+    lb_row = [InlineKeyboardButton("🏆 Leaderboard", callback_data=f"evtu_lb:{eid}")]
+    if ev.get("ended"):
+        text = f"<b>{html.escape(ev['name'])}</b>\n\n🏁 الـ Event ده خلص."
+        return text, InlineKeyboardMarkup([lb_row, [InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")]])
+    if not ev.get("live") or not _event_has_items(ev):
+        return unavailable
     lines = [
         quizzy_block(QUIZZY_READY_ART, "CHALLENGE YOURSELF!"),
         "",
@@ -10342,9 +10667,10 @@ def _event_preview_view(year: str, user_id: int, uid: str | None = None):
     _n_w = _event_written_count(ev)
     lines += ["", f"📝 {len(ev['questions'])} سؤال" + (f" + ✍️ {_n_w} مكتوب" if _n_w else "")]
     buttons = [
-        [InlineKeyboardButton("▶️ ابدأ", callback_data=f"evtu_go:{year}")],
+        [InlineKeyboardButton("▶️ ابدأ", callback_data=f"evtu_go:{eid}")],
+        lb_row,
         [InlineKeyboardButton("❌ إلغاء", callback_data="back_home")],
-        [InlineKeyboardButton("🔗 لينك سريع", callback_data=f"evtu_link:{year}")],
+        [InlineKeyboardButton("🔗 لينك سريع", callback_data=f"evtu_link:{eid}")],
     ]
     return "\n".join(lines), InlineKeyboardMarkup(buttons)
 
@@ -10354,22 +10680,42 @@ def _event_quicklink_preview(payload: str, user_id: int):
     parts = (payload or "").split("_")
     if len(parts) != 3 or parts[0] != "E" or parts[1] not in YEARS or not parts[2].isalnum():
         return None
-    return _event_preview_view(parts[1], user_id, parts[2])
+    ev = EVENTS.get(parts[2])
+    if not ev or ev.get("year") != parts[1]:
+        return _event_preview_view("", user_id)   # unknown / closed -> the "ended" screen
+    return _event_preview_view(parts[2], user_id, parts[2])
 
 async def _event_user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, query) -> None:
     uid = query.from_user.id
-    action, _, year = query.data.partition(":")
+    action, _, _rest = query.data.partition(":")
+    eid, _, _pg = _rest.partition(":")   # evtu_lb carries a page: evtu_lb:<eid>:<page>
+    home = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")]])
     if action == "evtu_open":
-        text, markup = _event_preview_view(year, uid)
+        text, markup = _event_preview_view(eid, uid)
         await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
         return
+    if action == "evtu_lb":
+        ev = EVENTS.get(eid)
+        if not ev or get_year_class(uid) != ev.get("year"):
+            await query.edit_message_text("⚠️ الـ Event ده خلص أو مش متاح ليك.", reply_markup=home)
+            return
+        _text, _page, _pages = _event_leaderboard_text(ev, int(_pg) if _pg.isdigit() else 0, viewer=uid)
+        _nav = _lb_nav_row(f"evtu_lb:{eid}", _page, _pages)
+        await query.edit_message_text(
+            _text, parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(([_nav] if _nav else []) + [
+                [InlineKeyboardButton("🔙 رجوع", callback_data=f"evtu_open:{eid}")],
+                [InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")],
+            ]),
+        )
+        return
     if action == "evtu_link":
-        ev = EVENTS.get(year)
-        if not ev or not ev.get("live") or get_year_class(uid) != year:
+        ev = EVENTS.get(eid)
+        if not ev or not ev.get("live") or get_year_class(uid) != ev.get("year"):
             await context.bot.send_message(chat_id=uid, text="⚠️ الـ Event ده خلص أو مش متاح ليك.")
             return
         me = await context.bot.get_me()
-        link = f"https://t.me/{me.username}?start={_event_quicklink_payload(year, ev)}"
+        link = f"https://t.me/{me.username}?start={_event_quicklink_payload(ev)}"
         await _flush_sessions_if_changed()   # the uid may have just been assigned
         await context.bot.send_message(
             chat_id=uid,
@@ -10384,12 +10730,10 @@ async def _event_user_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     if action != "evtu_go":
         return
-    ev = EVENTS.get(year)
-    if not ev or not ev.get("live") or not _event_has_items(ev) or get_year_class(uid) != year:
-        await query.edit_message_text(
-            "⚠️ الـ Event ده خلص أو مش متاح ليك.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")]]),
-        )
+    ev = EVENTS.get(eid)
+    if (not ev or not ev.get("live") or not _event_has_items(ev)
+            or get_year_class(uid) != ev.get("year")):
+        await query.edit_message_text("⚠️ الـ Event ده خلص أو مش متاح ليك.", reply_markup=home)
         return
     _event_ensure_ids(ev)
     # Always authoring order (Randomize only shuffles choices). Written questions
@@ -10403,7 +10747,8 @@ async def _event_user_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         queue.append({"type": "written", "data": _w})
     n_polls = len(ev["questions"])
     s = {
-        "year": year, "queue": queue, "total": n_polls, "answered": 0, "correct": 0, "delivered": 0,
+        "eid": eid, "year": ev["year"], "queue": queue, "total": n_polls, "answered": 0, "correct": 0,
+        "delivered": 0, "duration": 0.0,
         "current_poll_id": None, "current_correct_id": None, "current_option_count": None,
     }
     EVENT_SESSIONS[uid] = s
@@ -10414,6 +10759,418 @@ async def _event_user_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     if not await _event_send_next(context, uid, s):
         EVENT_SESSIONS.pop(uid, None)
         await context.bot.send_message(chat_id=uid, text="⚠️ معرفتش أبعت أسئلة الـ Event دلوقتي — جرّب تاني بعد شوية.")
+
+# ═══════════════════════════════════════════════════════════════
+# LECTURE PICKER — "how many questions?" then "which lectures?"
+# Shared by /event_start (the admin fills a new event with random questions
+# from the lectures they tick) and the 🎯 Custom Quiz main-menu button (a
+# student runs a private quiz built the same way, through the same runner as
+# events but with no leaderboard). State is RAM-only: PICKER[uid]. Questions
+# come from each lecture's closed polls via _snapshot_from_mid, i.e. the same
+# self-contained copies the Daily Quiz uses.
+# ═══════════════════════════════════════════════════════════════
+PICKER: dict = {}   # uid -> {"purpose": "event"|"custom", "year", "count", "sel": {lecture keys}, "eid"?, "name"?}
+PICK_COUNT_CHOICES = (15, 30, 45, 60, 75)
+
+def _pick_closed_mids(year: str) -> set:
+    return {v["message_id"] for v in QUIZ_POLL_STATUS[year].values() if v["closed"]}
+
+def _pick_avail(year: str, key: str, closed: set) -> int:
+    """Questions a lecture can actually supply (its polls that are closed/ready)."""
+    return sum(1 for m in (QUIZ_INDEX[year].get(key) or {}).get("ids", []) if m in closed)
+
+def _pick_selected(st: dict) -> list:
+    return [k for k in st["sel"] if k in QUIZ_INDEX.get(st["year"], {})]
+
+def _pick_title(st: dict) -> str:
+    return "🎯 <b>Custom Quiz</b>" if st["purpose"] == "custom" else "🗓 <b>Event</b>"
+
+def _pick_count_text(st: dict, heading: str | None = None) -> str:
+    head = heading or _pick_title(st)
+    return f"{head}\n\n🔢 اختار <b>عدد الأسئلة</b> الأول:"
+
+def _pick_count_markup(st: dict) -> InlineKeyboardMarkup:
+    n = list(PICK_COUNT_CHOICES)
+    rows = [
+        [InlineKeyboardButton(str(c), callback_data=f"pk_c:{c}") for c in n[:3]],
+        [InlineKeyboardButton(str(c), callback_data=f"pk_c:{c}") for c in n[3:]],
+    ]
+    if st["purpose"] == "event":
+        rows.append([InlineKeyboardButton("✋ هفوروارد الأسئلة بإيدي", callback_data="pk_manual")])
+        rows.append([InlineKeyboardButton("❌ Cancel Event", callback_data="evta_cancel")])
+    else:
+        rows.append([InlineKeyboardButton("🏠 Back to Home", callback_data="pk_x")])
+    return InlineKeyboardMarkup(rows)
+
+def _pick_footer(st: dict, closed: set) -> list:
+    """Rows shared by every picker screen: build / clear / cancel."""
+    keys = _pick_selected(st)
+    rows = []
+    if keys:
+        avail = sum(_pick_avail(st["year"], k, closed) for k in keys)
+        verb = "كوّن الـ Event" if st["purpose"] == "event" else "ابدأ"
+        rows.append([InlineKeyboardButton(f"✅ {verb} ({len(keys)} محاضرة · {avail} سؤال)", callback_data="pk_go")])
+        rows.append([InlineKeyboardButton("🧹 مسح الاختيار", callback_data="pk_clr")])
+    if st["purpose"] == "event":
+        rows.append([InlineKeyboardButton("❌ Cancel Event", callback_data="evta_cancel")])
+    else:
+        rows.append([InlineKeyboardButton("🏠 Back to Home", callback_data="pk_x")])
+    return rows
+
+def _pick_head(st: dict, closed: set, where: str) -> str:
+    keys = _pick_selected(st)
+    avail = sum(_pick_avail(st["year"], k, closed) for k in keys)
+    return (
+        f"{_pick_title(st)} — {year_label(st['year'])}\n"
+        f"🔢 الأسئلة: <b>{st['count']}</b>\n\n{where}\n\n"
+        f"☑️ المختار: <b>{len(keys)}</b> محاضرة (≈ {avail} سؤال متاح)"
+    )
+
+def _pick_modules_view(st: dict):
+    year, closed = st["year"], _pick_closed_mids(st["year"])
+    modules = ready_modules(year)
+    sel = _pick_selected(st)
+    rows = []
+    for i, m in enumerate(modules):
+        n = sum(1 for k in sel if QUIZ_INDEX[year][k].get("module") == m)
+        rows.append([InlineKeyboardButton(module_label(m) + (f" ({n}☑️)" if n else ""), callback_data=f"pk_m:{i}")])
+    return _pick_head(st, closed, "📚 اختار الموديول:"), InlineKeyboardMarkup(rows + _pick_footer(st, closed))
+
+def _pick_subjects_view(st: dict, mi: int):
+    year, closed = st["year"], _pick_closed_mids(st["year"])
+    modules = ready_modules(year)
+    if not 0 <= mi < len(modules):
+        return _pick_modules_view(st)
+    module = modules[mi]
+    sel = _pick_selected(st)
+    rows = []
+    for i, s in enumerate(ready_subjects(year, module)):
+        n = sum(1 for k in sel if QUIZ_INDEX[year][k].get("module") == module and QUIZ_INDEX[year][k].get("subject") == s)
+        rows.append([InlineKeyboardButton(subject_label(s) + (f" ({n}☑️)" if n else ""), callback_data=f"pk_s:{mi}:{i}")])
+    keys_all = [k for s in ready_subjects(year, module) for k in ready_lecture_keys(year, module, s)]
+    if keys_all:
+        all_on = all(k in st["sel"] for k in keys_all)
+        rows.append([InlineKeyboardButton("⬜ شيل كل الموديول" if all_on else "☑️ اختار كل الموديول", callback_data=f"pk_am:{mi}")])
+    rows.append([InlineKeyboardButton("🔙 رجوع للموديولات", callback_data="pk_back")])
+    return _pick_head(st, closed, f"🎓 <b>{html.escape(module)}</b> — اختار المادة:"), InlineKeyboardMarkup(rows + _pick_footer(st, closed))
+
+def _pick_lectures_view(st: dict, mi: int, si: int):
+    year, closed = st["year"], _pick_closed_mids(st["year"])
+    modules = ready_modules(year)
+    if not 0 <= mi < len(modules):
+        return _pick_modules_view(st)
+    module = modules[mi]
+    subjects = ready_subjects(year, module)
+    if not 0 <= si < len(subjects):
+        return _pick_subjects_view(st, mi)
+    subject = subjects[si]
+    names = ready_lecture_keys(year, module, subject)
+    rows = []
+    for li, key in enumerate(names):
+        e = QUIZ_INDEX[year][key]
+        mark = "☑️" if key in st["sel"] else "⬜"
+        rows.append([InlineKeyboardButton(
+            f"{mark} Lecture {e.get('lecture_number') or (li + 1)}: {e.get('name')} · {_pick_avail(year, key, closed)}",
+            callback_data=f"pk_t:{mi}:{si}:{li}",
+        )])
+    if names:
+        all_on = all(k in st["sel"] for k in names)
+        rows.append([InlineKeyboardButton("⬜ شيل الكل" if all_on else "☑️ اختار الكل", callback_data=f"pk_as:{mi}:{si}")])
+    rows.append([InlineKeyboardButton("🔙 رجوع للمواد", callback_data=f"pk_m:{mi}")])
+    where = f"🎓 <b>{html.escape(module)} - {html.escape(subject)}</b>"
+    if not names:
+        where += "\n\n📭 لسه مفيش محاضرات هنا."
+    else:
+        where += "\nدوس على المحاضرات اللي عايز تجيب منها أسئلة (الرقم = الأسئلة المتاحة):"
+    return _pick_head(st, closed, where), InlineKeyboardMarkup(rows + _pick_footer(st, closed))
+
+def _event_q_from_snap(snap: dict) -> dict:
+    """A lecture-question snapshot (see _snapshot_from_mid) in the event question shape."""
+    q = {
+        "question": snap["question"], "options": list(snap["options"]), "correct": snap["correct_option_id"],
+        "explanation": snap.get("explanation"), "description": snap.get("description"),
+        "image": {"file_id": snap["image_file_id"], "spoiler": False} if snap.get("image_file_id") else None,
+        "case": snap.get("case_study"), "source_mid": snap.get("source_mid"),
+    }
+    if snap.get("case_study_entities"):
+        q["case_entities"] = snap["case_study_entities"]
+    if snap.get("case_group") is not None:
+        q["case_group"] = snap["case_group"]
+    return q
+
+# A question counts as a "previous year" one when its question text or case study
+# contains the word End or Final (any capitalisation) followed by a two-digit
+# number — "End 23", "FINAL-22", "final (21)", "End23" match. A year written in
+# full ("End 2023"), a bare "end"/"final", and words like "Endocrine"/"finally"
+# don't.
+PICK_PREV_CHOICES = (0, 25, 50, 75, 100)
+_PREV_YEAR_RE = re.compile(r"(?<![A-Za-z])(?:end|finals?)[^A-Za-z0-9]{0,3}\d{2}(?!\d)", re.IGNORECASE)
+
+def _pick_pools(year: str, keys: list) -> tuple:
+    """(labeled, other): the ready questions of the given lectures split by the
+    End/Final label, each a (mid, module, subject) tuple."""
+    closed = _pick_closed_mids(year)
+    status_by_mid = _poll_status_index(year)
+    labeled, other = [], []
+    for key in keys:
+        e = QUIZ_INDEX[year].get(key) or {}
+        cases = {c.get("mid"): (c.get("content") or "") for c in (e.get("poll_case_studies") or [])}
+        for mid in e.get("ids", []):
+            if mid not in closed:
+                continue
+            text = f"{(status_by_mid.get(mid) or {}).get('question') or ''}\n{cases.get(mid, '')}"
+            (labeled if _PREV_YEAR_RE.search(text) else other).append((mid, e.get("module"), e.get("subject")))
+    return labeled, other
+
+def _pick_split(count: int, prev_pct: int, n_labeled: int, n_other: int) -> tuple:
+    """(labeled to take, other to take). prev_pct is the share of previous-year
+    questions: 0 = none of them, 100 = only them (both absolute, so the quiz may
+    come out shorter than `count`); in between, if one side runs short the other
+    fills in so the quiz keeps its size."""
+    want_l = round(count * prev_pct / 100)
+    want_o = count - want_l
+    take_l, take_o = min(want_l, n_labeled), min(want_o, n_other)
+    if 0 < prev_pct < 100:
+        short_l, short_o = want_l - take_l, want_o - take_o
+        take_o = min(n_other, take_o + short_l)
+        take_l = min(n_labeled, take_l + short_o)
+    return take_l, take_o
+
+async def _pick_draw_questions(context, year: str, keys: list, count: int, prev_pct: int = 0) -> tuple:
+    """(questions, n_previous_year): `count` random questions from the given
+    lectures with `prev_pct`% of them previous-year ones (see _pick_split),
+    as event-shaped dicts without ids."""
+    labeled, other = _pick_pools(year, keys)
+    random.shuffle(labeled)
+    random.shuffle(other)
+    take_l, take_o = _pick_split(count, prev_pct, len(labeled), len(other))
+    chosen = [(m, True) for m in labeled[:take_l]] + [(m, False) for m in other[:take_o]]
+    random.shuffle(chosen)
+    status_by_mid = _poll_status_index(year)
+    out, n_prev = [], 0
+    for (mid, module, subject), is_prev in chosen:
+        snap = await _snapshot_from_mid(context, year, mid, module, subject, status_by_mid)
+        if snap:
+            out.append(_event_q_from_snap(snap))
+            n_prev += is_prev
+    return out, n_prev
+
+async def custom_quiz_start(context: ContextTypes.DEFAULT_TYPE, user_id: int, message=None) -> None:
+    """🎯 Custom Quiz main-menu button: count -> lectures -> private run."""
+    year = get_year_class(user_id)
+    if year not in YEAR_CLASS_NUMBER:
+        await _prompt_daily_quiz_year_class(context, user_id, message)
+        return
+    if year not in configured_years() or not ready_modules(year):
+        text = "⚠️ مفيش محاضرات متاحة للـ Custom Quiz لسنتك دلوقتي."
+        if message:
+            await message.edit_text(text)
+        else:
+            await context.bot.send_message(chat_id=user_id, text=text)
+        return
+    PICKER[user_id] = {"purpose": "custom", "year": year, "count": None, "sel": set()}
+    text, markup = _pick_count_text(PICKER[user_id]), _pick_count_markup(PICKER[user_id])
+    if message:
+        await message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+    else:
+        await context.bot.send_message(chat_id=user_id, text=text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+async def _picker_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, query) -> None:
+    uid, data = query.from_user.id, query.data
+    home = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")]])
+
+    async def show(text, markup=None):
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+    st = PICKER.get(uid)
+    if not st:
+        await show("⚠️ الجلسة انتهت — ابدأ من الأول.", home)
+        return
+    if st["purpose"] == "event":
+        au = EVENT_AUTHORING.get(uid)
+        if (not is_admin(update) or not EVENTS.get(st.get("eid")) or not au or au.get("eid") != st["eid"]
+                or st["year"] not in _event_admin_years(uid)):
+            PICKER.pop(uid, None)
+            await show("⚠️ الجلسة انتهت — ابدأ من /event_start تاني.")
+            return
+    cmd, _, rest = data.partition(":")
+    args = rest.split(":") if rest else []
+
+    def arg(i):
+        try:
+            return int(args[i])
+        except (ValueError, IndexError):
+            return None
+
+    year = st["year"]
+
+    if cmd == "pk_x":   # custom quiz: leave
+        PICKER.pop(uid, None)
+        await show("تمام، اتلغى الـ Custom Quiz.", home)
+        return
+
+    if cmd == "pk_manual" and st["purpose"] == "event":
+        PICKER.pop(uid, None)
+        await show(
+            f"<b>{html.escape(st.get('name', ''))}</b> — {UNIVERSITIES.get(year_university(year), '')} {year_label(year)}\n\n"
+            "دلوقتي فوروارد الأسئلة (Quiz polls) واحد واحد بعد ما تشيل اسم المرسل (Hide Sender's Name).\n"
+            "لو عايز صورة أو Case study (نص) لسؤال، ابعتها الأول وبعدين فوروارد السؤال.\n"
+            "أي رسالة فيها Spoiler بتتسجل كسؤال مكتوب زي ما هي، والباقي (من غير Spoiler) بيتسجل Case study.\n"
+            "لما تخلص دوس 🚀 Publish Event (أو ابعت -END) وهيظهر للطلبة."
+        )
+        return
+
+    if cmd == "pk_c":
+        n = arg(0)
+        if n not in PICK_COUNT_CHOICES:
+            return
+        st["count"] = n
+        await show(*_pick_modules_view(st))
+        return
+
+    if st["count"] is None:   # a stale button from before the count was chosen
+        await show(_pick_count_text(st), _pick_count_markup(st))
+        return
+
+    if cmd == "pk_back":
+        await show(*_pick_modules_view(st))
+        return
+    if cmd == "pk_m":
+        await show(*_pick_subjects_view(st, arg(0) if arg(0) is not None else -1))
+        return
+    if cmd == "pk_s":
+        await show(*_pick_lectures_view(st, arg(0) if arg(0) is not None else -1, arg(1) if arg(1) is not None else -1))
+        return
+    if cmd == "pk_clr":
+        st["sel"].clear()
+        await show(*_pick_modules_view(st))
+        return
+
+    modules = ready_modules(year)
+    if cmd in ("pk_t", "pk_as", "pk_am"):
+        mi = arg(0)
+        if mi is None or not 0 <= mi < len(modules):
+            await show(*_pick_modules_view(st))
+            return
+        module = modules[mi]
+        subjects = ready_subjects(year, module)
+        if cmd == "pk_am":
+            keys = [k for s_ in subjects for k in ready_lecture_keys(year, module, s_)]
+            _toggle_many(st, keys)
+            await show(*_pick_subjects_view(st, mi))
+            return
+        si = arg(1)
+        if si is None or not 0 <= si < len(subjects):
+            await show(*_pick_subjects_view(st, mi))
+            return
+        names = ready_lecture_keys(year, module, subjects[si])
+        if cmd == "pk_as":
+            _toggle_many(st, names)
+        else:
+            li = arg(2)
+            if li is not None and 0 <= li < len(names):
+                st["sel"].symmetric_difference_update({names[li]})
+        await show(*_pick_lectures_view(st, mi, si))
+        return
+
+    if cmd == "pk_go":
+        keys = _pick_selected(st)
+        if not keys:
+            await show(*_pick_modules_view(st))
+            return
+        labeled, other = _pick_pools(year, keys)
+        if not labeled:   # no previous-year questions in these lectures — nothing to ask
+            st["prev_pct"] = 0
+            await _pick_build(context, uid, st, show, query.message.message_id)
+        else:
+            await show(*_pick_prev_view(st, len(labeled), len(other)))
+        return
+
+    if cmd == "pk_p":
+        if arg(0) not in PICK_PREV_CHOICES or not _pick_selected(st):
+            return
+        st["prev_pct"] = arg(0)
+        await _pick_build(context, uid, st, show, query.message.message_id)
+        return
+
+def _pick_prev_view(st: dict, n_labeled: int, n_other: int):
+    rows = [
+        [InlineKeyboardButton(f"{p}%", callback_data=f"pk_p:{p}") for p in PICK_PREV_CHOICES[:3]],
+        [InlineKeyboardButton(f"{p}%", callback_data=f"pk_p:{p}") for p in PICK_PREV_CHOICES[3:]],
+        [InlineKeyboardButton("🔙 رجوع للمحاضرات", callback_data="pk_back")],
+    ]
+    if st["purpose"] == "event":
+        rows.append([InlineKeyboardButton("❌ Cancel Event", callback_data="evta_cancel")])
+    else:
+        rows.append([InlineKeyboardButton("🏠 Back to Home", callback_data="pk_x")])
+    text = (
+        f"{_pick_title(st)} — {year_label(st['year'])}\n"
+        f"🔢 الأسئلة: <b>{st['count']}</b> · 📚 {len(_pick_selected(st))} محاضرة\n\n"
+        "📜 <b>نسبة أسئلة السنين اللي فاتت</b> (اللي فيها End أو Final وبعدها رقم من خانتين، زي End 23)؟\n"
+        "0% = ولا سؤال منهم · 100% = كلها منهم\n\n"
+        f"المتاح في المحاضرات دي: <b>{n_labeled}</b> من السنين اللي فاتت و<b>{n_other}</b> عادي."
+    )
+    return text, InlineKeyboardMarkup(rows)
+
+async def _pick_build(context, uid: int, st: dict, show, msg_id: int) -> None:
+    """Draws the questions for the finished picker and starts the quiz / fills the event."""
+    year, keys, prev_pct = st["year"], _pick_selected(st), st.get("prev_pct", 0)
+    await show("⏳ بجهّز الأسئلة...")
+    qs, n_prev = await _pick_draw_questions(context, year, keys, st["count"], prev_pct)
+    if not qs:
+        await show("⚠️ مفيش أسئلة جاهزة بالشروط دي — جرّب محاضرات أو نسبة تانية.",
+                   InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="pk_back")]]))
+        return
+    PICKER.pop(uid, None)
+    short = f"\n⚠️ المتاح كان {len(qs)} بس من {st['count']} المطلوبين." if len(qs) < st["count"] else ""
+    if prev_pct:
+        short += f"\n📜 أسئلة السنين اللي فاتت: {n_prev}/{len(qs)} (المطلوب {prev_pct}%)"
+    if st["purpose"] == "custom":
+        await _custom_quiz_run(context, uid, st, qs, len(keys), short, show)
+    else:
+        await _event_fill_from_picker(context, uid, st, qs, len(keys), short, show, msg_id)
+
+def _toggle_many(st: dict, keys: list) -> None:
+    """Select all of `keys`, or clear them if they were all already selected."""
+    if keys and all(k in st["sel"] for k in keys):
+        st["sel"].difference_update(keys)
+    else:
+        st["sel"].update(keys)
+
+async def _event_fill_from_picker(context, uid: int, st: dict, qs: list, n_lectures: int, short: str, show, msg_id: int) -> None:
+    ev = EVENTS.get(st["eid"])
+    au = EVENT_AUTHORING.get(uid)
+    _event_ensure_ids(ev)
+    for q in qs:
+        q["id"] = _event_new_qid(ev)
+        ev["questions"].append(q)
+    if au is not None:
+        au["status_message_id"] = msg_id   # the next status refresh replaces this message
+    await _flush_sessions_if_changed()
+    await show(
+        f"<b>{html.escape(ev['name'])}</b>\n✅ اتضاف <b>{len(qs)}</b> سؤال عشوائي من {n_lectures} محاضرة.{short}\n\n"
+        "لسه تقدر تفوروارد أسئلة زيادة (Quiz polls) — بتتضاف بعدهم. لما تخلص دوس 🚀 Publish Event (أو ابعت -END).",
+        _event_status_markup(au),
+    )
+
+async def _custom_quiz_run(context, uid: int, st: dict, qs: list, n_lectures: int, short: str, show) -> None:
+    """Starts a student's private run through the event runner. The event dict
+    lives only on the session (s["ev"]) — nothing is saved to EVENTS."""
+    for i, q in enumerate(qs, 1):
+        q["id"] = i
+    ev = {"name": "🎯 Custom Quiz", "year": st["year"], "live": True, "questions": qs,
+          "next_qid": len(qs) + 1, "results": {}}
+    s = {
+        "eid": None, "ev": ev, "custom": True, "year": st["year"], "prev_pct": st.get("prev_pct", 0),
+        "queue": [q["id"] for q in qs],
+        "total": len(qs), "answered": 0, "correct": 0, "delivered": 0, "duration": 0.0,
+        "current_poll_id": None, "current_correct_id": None, "current_option_count": None,
+    }
+    EVENT_SESSIONS[uid] = s
+    await show(f"🎯 <b>Custom Quiz</b> — {len(qs)} سؤال من {n_lectures} محاضرة، هيتبعتولك واحد واحد 👇{short}")
+    if not await _event_send_next(context, uid, s):
+        EVENT_SESSIONS.pop(uid, None)
+        await context.bot.send_message(chat_id=uid, text="⚠️ معرفتش أبعت الأسئلة دلوقتي — جرّب تاني بعد شوية.")
 
 # ═══════════════════════════════════════════════════════════════
 # EVENTS — /edit_event (browse / edit / add / delete, like /edit_quiz)
@@ -10476,45 +11233,55 @@ def _event_q_text(ev: dict, q: dict, pos: int) -> str:
         + "\n\nاختار الإجراء:"
     )
 
-def _event_q_markup(year: str, q: dict) -> InlineKeyboardMarkup:
+def _event_q_markup(eid: str, q: dict) -> InlineKeyboardMarkup:
     qid = q["id"]
     rows = [
-        [InlineKeyboardButton("✏️ Question", callback_data=f"evta_ed:q:{year}:{qid}"),
-         InlineKeyboardButton("🔤 Options", callback_data=f"evta_ed:o:{year}:{qid}")],
-        [InlineKeyboardButton("💬 Explanation", callback_data=f"evta_ed:x:{year}:{qid}"),
-         InlineKeyboardButton("✅ Correct choice", callback_data=f"evta_edc:{year}:{qid}")],
-        [InlineKeyboardButton("📝 Case study", callback_data=f"evta_ed:c:{year}:{qid}"),
-         InlineKeyboardButton("🖼 Image", callback_data=f"evta_ed:i:{year}:{qid}")],
+        [InlineKeyboardButton("✏️ Question", callback_data=f"evta_ed:q:{eid}:{qid}"),
+         InlineKeyboardButton("🔤 Options", callback_data=f"evta_ed:o:{eid}:{qid}")],
+        [InlineKeyboardButton("💬 Explanation", callback_data=f"evta_ed:x:{eid}:{qid}"),
+         InlineKeyboardButton("✅ Correct choice", callback_data=f"evta_edc:{eid}:{qid}")],
+        [InlineKeyboardButton("📝 Case study", callback_data=f"evta_ed:c:{eid}:{qid}"),
+         InlineKeyboardButton("🖼 Image", callback_data=f"evta_ed:i:{eid}:{qid}")],
     ]
     if q.get("case") or q.get("image"):
-        rows.append([InlineKeyboardButton("🧹 Remove case / image", callback_data=f"evta_rm:{year}:{qid}")])
-    rows.append([InlineKeyboardButton("➕ Insert new poll after", callback_data=f"evta_ins:{year}:{qid}"),
-                 InlineKeyboardButton("🗑 Delete", callback_data=f"evta_qd:{year}:{qid}")])
-    rows.append([InlineKeyboardButton("🔙 رجوع للأسئلة", callback_data=f"evta_ql:{year}:0:a")])
+        rows.append([InlineKeyboardButton("🧹 Remove case / image", callback_data=f"evta_rm:{eid}:{qid}")])
+    rows.append([InlineKeyboardButton("➕ Insert new poll after", callback_data=f"evta_ins:{eid}:{qid}"),
+                 InlineKeyboardButton("🗑 Delete", callback_data=f"evta_qd:{eid}:{qid}")])
+    rows.append([InlineKeyboardButton("🔙 رجوع للأسئلة", callback_data=f"evta_ql:{eid}:0:a")])
     return InlineKeyboardMarkup(rows)
 
-def _event_menu_view(year: str, ev: dict):
-    n = len(ev["questions"])
-    state = "🟢 live" if ev.get("live") else "📝 draft (لسه مش منشور)"
+def _event_menu_view(eid: str, ev: dict):
+    year = ev.get("year")
+    n = len(ev.get("questions", []))
     taken = len(ev.get("results") or {})
+    head = f"{UNIVERSITIES.get(year_university(year), '')} {year_label(year)}"
+    if ev.get("ended"):
+        rows = [
+            [InlineKeyboardButton("🏆 Leaderboard", callback_data=f"evta_lb:{eid}")],
+            [InlineKeyboardButton("🗑 مسح نهائي", callback_data=f"evta_purge:{eid}")],
+            [InlineKeyboardButton("🔙 رجوع للـ Events", callback_data="evta_el")],
+        ]
+        return f"<b>{html.escape(ev['name'])}</b>\n{head} · 🏁 خلص\n👥 {taken} حلّوه", InlineKeyboardMarkup(rows)
+    state = "🟢 live" if ev.get("live") else "📝 draft (لسه مش منشور)"
     rows = [
-        [InlineKeyboardButton(f"📋 الأسئلة ({n})", callback_data=f"evta_ql:{year}:0:a"),
-         InlineKeyboardButton("🔎 Search", callback_data=f"evta_srch:{year}")],
-        [InlineKeyboardButton("➕ Add questions", callback_data=f"evta_add:{year}"),
-         InlineKeyboardButton("✏️ Rename", callback_data=f"evta_ren:{year}")],
-        [InlineKeyboardButton("📝 Description", callback_data=f"evta_dsc:{year}")],
+        [InlineKeyboardButton(f"📋 الأسئلة ({n})", callback_data=f"evta_ql:{eid}:0:a"),
+         InlineKeyboardButton("🔎 Search", callback_data=f"evta_srch:{eid}")],
+        [InlineKeyboardButton("➕ Add questions", callback_data=f"evta_add:{eid}"),
+         InlineKeyboardButton("✏️ Rename", callback_data=f"evta_ren:{eid}")],
+        [InlineKeyboardButton("📝 Description", callback_data=f"evta_dsc:{eid}"),
+         InlineKeyboardButton("🏆 Leaderboard", callback_data=f"evta_lb:{eid}")],
     ]
     if not ev.get("live") and _event_has_items(ev):
-        rows.append([InlineKeyboardButton("🚀 Publish", callback_data=f"evta_pubd:{year}")])
+        rows.append([InlineKeyboardButton("🚀 Publish", callback_data=f"evta_pubd:{eid}")])
     rows.append([InlineKeyboardButton("🔙 رجوع للـ Events", callback_data="evta_el")])
     text = (
         f"<b>{html.escape(ev['name'])}</b>\n"
-        f"{UNIVERSITIES.get(year_university(year), '')} {year_label(year)} · {state}\n"
+        f"{head} · {state}\n"
         f"📝 {n} سؤال" + (f" + ✍️ {_event_written_count(ev)} مكتوب" if _event_written_count(ev) else "") + f" · 👥 {taken} حلّوه"
     )
     return text, InlineKeyboardMarkup(rows)
 
-def _event_list_view(uid: int, year: str, ev: dict, page: int, mode: str):
+def _event_list_view(uid: int, eid: str, ev: dict, page: int, mode: str):
     qs = ev["questions"]
     items = list(enumerate(qs))
     title = "📋 الأسئلة"
@@ -10526,15 +11293,15 @@ def _event_list_view(uid: int, year: str, ev: dict, page: int, mode: str):
     pages = max(1, -(-len(items) // EVENT_PAGE_SIZE))
     page = max(0, min(page, pages - 1))
     chunk = items[page * EVENT_PAGE_SIZE:(page + 1) * EVENT_PAGE_SIZE]
-    rows = [[InlineKeyboardButton(f"{i + 1}. {q['question'][:45]}", callback_data=f"evta_qs:{year}:{q['id']}")] for i, q in chunk]
+    rows = [[InlineKeyboardButton(f"{i + 1}. {q['question'][:45]}", callback_data=f"evta_qs:{eid}:{q['id']}")] for i, q in chunk]
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton("⬅️", callback_data=f"evta_ql:{year}:{page - 1}:{mode}"))
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"evta_ql:{eid}:{page - 1}:{mode}"))
     if page < pages - 1:
-        nav.append(InlineKeyboardButton("➡️", callback_data=f"evta_ql:{year}:{page + 1}:{mode}"))
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"evta_ql:{eid}:{page + 1}:{mode}"))
     if nav:
         rows.append(nav)
-    rows.append([InlineKeyboardButton("🔙 رجوع", callback_data=f"evta_ev:{year}")])
+    rows.append([InlineKeyboardButton("🔙 رجوع", callback_data=f"evta_ev:{eid}")])
     text = f"{title} — <b>{html.escape(ev['name'])}</b> ({len(items)})"
     if pages > 1:
         text += f"\nصفحة {page + 1}/{pages}"
@@ -10554,13 +11321,16 @@ async def edit_event_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
 
 def _event_root_view(uid: int):
-    found = [(y, EVENTS[y]) for y in _event_admin_years(uid) if y in EVENTS]
+    years = _event_admin_years(uid)
+    found = [(eid, ev) for eid, ev in EVENTS.items() if ev.get("year") in years]
+    found.sort(key=lambda t: (t[1].get("year") or "", t[1].get("created_at") or 0))
     if not found:
         return "📭 مفيش Events متاحة ليك دلوقتي. ابدأ واحد بـ /event_start.", None
     rows = [[InlineKeyboardButton(
-        f"{UNIVERSITIES.get(year_university(y), '')} {year_label(y)} — {ev['name']} ({'🟢' if ev.get('live') else '📝'})",
-        callback_data=f"evta_ev:{y}",
-    )] for y, ev in found]
+        f"{UNIVERSITIES.get(year_university(ev['year']), '')} {year_label(ev['year'])} — {ev['name']} "
+        f"({'🏁' if ev.get('ended') else '🟢' if ev.get('live') else '📝'})",
+        callback_data=f"evta_ev:{eid}",
+    )] for eid, ev in found]
     return "✏️ <b>Edit Event — اختار الـ Event:</b>", InlineKeyboardMarkup(rows)
 
 async def _event_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, query) -> bool:
@@ -10571,6 +11341,7 @@ async def _event_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     if cmd not in {
         "evta_el", "evta_ev", "evta_ql", "evta_qs", "evta_ed", "evta_edc", "evta_edp", "evta_rm",
         "evta_qd", "evta_qdok", "evta_ins", "evta_add", "evta_ren", "evta_dsc", "evta_srch", "evta_pubd",
+        "evta_lb", "evta_purge", "evta_purgeok",
     }:
         return False
 
@@ -10583,13 +11354,13 @@ async def _event_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await send(text, markup)
         return True
 
-    year = next((p for p in parts[1:] if p in YEARS), None)
-    if year is None or year not in _event_admin_years(uid):
-        await send("⚠️ السنة دي مش في صلاحياتك.")
-        return True
-    ev = EVENTS.get(year)
-    if not ev:
+    eid = next((p for p in parts[1:] if p in EVENTS), None)
+    ev = EVENTS.get(eid) if eid else None
+    if ev is None:
         await send("⚠️ الـ Event ده اتقفل أو اتشال.")
+        return True
+    if ev.get("year") not in _event_admin_years(uid):
+        await send("⚠️ السنة دي مش في صلاحياتك.")
         return True
     _event_ensure_ids(ev)
 
@@ -10603,23 +11374,23 @@ async def _event_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         pos, q = _event_find(ev, qid)
         if q is None:
             await send("⚠️ السؤال ده مش موجود دلوقتي — يمكن اتعدل من حتة تانية.",
-                       InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع للأسئلة", callback_data=f"evta_ql:{year}:0:a")]]))
+                       InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع للأسئلة", callback_data=f"evta_ql:{eid}:0:a")]]))
             return
-        await send(_event_q_text(ev, q, pos), _event_q_markup(year, q))
+        await send(_event_q_text(ev, q, pos), _event_q_markup(eid, q))
 
     # navigation always drops any pending typed-edit
     if cmd in ("evta_ev", "evta_ql", "evta_qs"):
         AWAITING_EVENT_EDIT.pop(uid, None)
 
     if cmd == "evta_ev":
-        text, markup = _event_menu_view(year, ev)
+        text, markup = _event_menu_view(eid, ev)
         await send(text, markup)
         return True
 
     if cmd == "evta_ql":
         page = qid_of(2) or 0
         mode = parts[3] if len(parts) > 3 else "a"
-        text, markup = _event_list_view(uid, year, ev, page, mode)
+        text, markup = _event_list_view(uid, eid, ev, page, mode)
         await send(text, markup)
         return True
 
@@ -10627,13 +11398,13 @@ async def _event_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await show_q(qid_of(2))
         return True
 
-    if cmd == "evta_ed":   # evta_ed:<kind>:<year>:<qid>
+    if cmd == "evta_ed":   # evta_ed:<kind>:<eid>:<qid>
         kind, qid = parts[1], qid_of(3)
         _, q = _event_find(ev, qid)
         if q is None or kind not in ("q", "o", "x", "c", "i"):
             await show_q(qid)
             return True
-        AWAITING_EVENT_EDIT[uid] = {"kind": kind, "year": year, "qid": qid}
+        AWAITING_EVENT_EDIT[uid] = {"kind": kind, "eid": eid, "qid": qid}
         prompts = {
             "q": "✏️ ابعت نص السؤال الجديد:",
             "o": ("🔤 ابعت الاختيارات الجديدة، سطر لكل اختيار (من غير حروف A)/B)).\n"
@@ -10643,7 +11414,7 @@ async def _event_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             "i": "🖼 ابعت الصورة اللي هتتربط بالسؤال ده:",
         }
         await send(prompts[kind], InlineKeyboardMarkup([[
-            InlineKeyboardButton("❌ Cancel", callback_data=f"evta_qs:{year}:{qid}")]]))
+            InlineKeyboardButton("❌ Cancel", callback_data=f"evta_qs:{eid}:{qid}")]]))
         return True
 
     if cmd == "evta_edc":
@@ -10654,8 +11425,8 @@ async def _event_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             return True
         rows = [[InlineKeyboardButton(
             f"{'✅ ' if i == q['correct'] else ''}{string.ascii_uppercase[i]}) {o[:40]}",
-            callback_data=f"evta_edp:{year}:{qid}:{i}")] for i, o in enumerate(q["options"])]
-        rows.append([InlineKeyboardButton("🔙 رجوع", callback_data=f"evta_qs:{year}:{qid}")])
+            callback_data=f"evta_edp:{eid}:{qid}:{i}")] for i, o in enumerate(q["options"])]
+        rows.append([InlineKeyboardButton("🔙 رجوع", callback_data=f"evta_qs:{eid}:{qid}")])
         await send("✅ اختار الإجابة الصح الجديدة:", InlineKeyboardMarkup(rows))
         return True
 
@@ -10687,8 +11458,8 @@ async def _event_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await send(
             f"🗑 تمسح السؤال ده؟\n\n❓ {html.escape(q['question'])}",
             InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ أيوه، امسحه", callback_data=f"evta_qdok:{year}:{qid}"),
-                InlineKeyboardButton("↩️ لأ", callback_data=f"evta_qs:{year}:{qid}"),
+                InlineKeyboardButton("✅ أيوه، امسحه", callback_data=f"evta_qdok:{eid}:{qid}"),
+                InlineKeyboardButton("↩️ لأ", callback_data=f"evta_qs:{eid}:{qid}"),
             ]]),
         )
         return True
@@ -10701,11 +11472,11 @@ async def _event_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             return True
         if ev.get("live") and len(ev["questions"]) <= 1:
             await send("⚠️ ده آخر سؤال في Event شغال — مينفعش يفضل فاضي. ضيف سؤال تاني الأول أو اقفله بـ /event_end.",
-                       InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data=f"evta_qs:{year}:{qid}")]]))
+                       InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data=f"evta_qs:{eid}:{qid}")]]))
             return True
         ev["questions"].pop(pos)
         await _event_persist(context)
-        text, markup = _event_list_view(uid, year, ev, pos // EVENT_PAGE_SIZE, "a")
+        text, markup = _event_list_view(uid, eid, ev, pos // EVENT_PAGE_SIZE, "a")
         await send("🗑 اتمسح السؤال.\n\n" + text, markup)
         return True
 
@@ -10715,7 +11486,7 @@ async def _event_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             return True
         after = qid_of(2) if cmd == "evta_ins" else None
         EVENT_AUTHORING[uid] = {
-            "year": year, "pending_image": None, "pending_case_study": None, "status_message_id": None,
+            "eid": eid, "year": ev["year"], "pending_image": None, "pending_case_study": None, "status_message_id": None,
             "editing": True, "added": [], "insert_after": after,
         }
         where = "بعد السؤال ده" if after is not None else "في آخر الـ Event"
@@ -10728,33 +11499,62 @@ async def _event_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return True
 
     if cmd == "evta_ren":
-        AWAITING_EVENT_EDIT[uid] = {"kind": "name", "year": year, "qid": None}
+        AWAITING_EVENT_EDIT[uid] = {"kind": "name", "eid": eid, "qid": None}
         await send(f"✏️ ابعت الاسم الجديد (لحد {EVENT_NAME_MAX_LEN} حرف):",
-                   InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"evta_ev:{year}")]]))
+                   InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"evta_ev:{eid}")]]))
         return True
 
     if cmd == "evta_dsc":
-        AWAITING_EVENT_EDIT[uid] = {"kind": "desc", "year": year, "qid": None}
+        AWAITING_EVENT_EDIT[uid] = {"kind": "desc", "eid": eid, "qid": None}
         await send(f"📝 ابعت الوصف الجديد (لحد {EVENT_DESC_MAX_LEN} حرف) — التنسيق هيتحفظ:",
-                   InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"evta_ev:{year}")]]))
+                   InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"evta_ev:{eid}")]]))
         return True
 
     if cmd == "evta_srch":
-        AWAITING_EVENT_EDIT[uid] = {"kind": "search", "year": year, "qid": None}
+        AWAITING_EVENT_EDIT[uid] = {"kind": "search", "eid": eid, "qid": None}
         await send("🔎 ابعت كلمة أدور بيها في الأسئلة والاختيارات:",
-                   InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"evta_ev:{year}")]]))
+                   InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"evta_ev:{eid}")]]))
+        return True
+
+    if cmd == "evta_lb":
+        _text, _page, _pages = _event_leaderboard_text(ev, qid_of(2) or 0)
+        _nav = _lb_nav_row(f"evta_lb:{eid}", _page, _pages)
+        await send(
+            _text,
+            InlineKeyboardMarkup(([_nav] if _nav else []) + [[InlineKeyboardButton("🔙 رجوع", callback_data=f"evta_ev:{eid}")]]),
+        )
+        return True
+
+    if cmd == "evta_purge":
+        await send(
+            f"🗑 تمسح <b>{html.escape(ev['name'])}</b> نهائي؟\nالـ leaderboard بتاعه هيتمسح معاه.",
+            InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ أيوه، امسحه", callback_data=f"evta_purgeok:{eid}"),
+                InlineKeyboardButton("↩️ لأ", callback_data=f"evta_ev:{eid}"),
+            ]]),
+        )
+        return True
+
+    if cmd == "evta_purgeok":
+        EVENTS.pop(eid, None)
+        for aid, au in list(EVENT_AUTHORING.items()):
+            if au.get("eid") == eid:
+                EVENT_AUTHORING.pop(aid, None)
+        await _event_persist(context)
+        text, markup = _event_root_view(uid)
+        await send("🗑 اتمسح.\n\n" + text, markup)
         return True
 
     if cmd == "evta_pubd":
         if ev.get("live") or not _event_has_items(ev):
-            text, markup = _event_menu_view(year, ev)
+            text, markup = _event_menu_view(eid, ev)
             await send(text, markup)
             return True
         ev["live"], ev["published_at"] = True, time.time()
         await _flush_sessions_if_changed()
         await backup_sessions_to_channel(context, force=True)
-        await admin_log(context, "🚀 Event published", f"{html.escape(ev['name'])} — {year_label(year)} · {len(ev['questions'])} سؤال", uid)
-        text, markup = _event_menu_view(year, ev)
+        await admin_log(context, "🚀 Event published", f"{html.escape(ev['name'])} — {year_label(ev['year'])} · {len(ev['questions'])} سؤال", uid)
+        text, markup = _event_menu_view(eid, ev)
         await send("🚀 اتنشر!\n\n" + text, markup)
         return True
 
@@ -10762,16 +11562,16 @@ async def _event_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def _event_apply_text_edit(update: Update, context: ContextTypes.DEFAULT_TYPE, ee: dict, text: str) -> None:
     """Consumes the admin's typed reply for a pending AWAITING_EVENT_EDIT."""
-    uid, year, kind = update.effective_user.id, ee["year"], ee["kind"]
-    ev = EVENTS.get(year)
+    uid, eid, kind = update.effective_user.id, ee["eid"], ee["kind"]
+    ev = EVENTS.get(eid)
     reply = update.message.reply_text
-    if not ev or year not in _event_admin_years(uid):
+    if not ev or ev.get("year") not in _event_admin_years(uid):
         await reply("⚠️ الـ Event ده اتقفل أو مش في صلاحياتك.")
         return
     _event_ensure_ids(ev)
 
     async def back_to_event():
-        t, m = _event_menu_view(year, ev)
+        t, m = _event_menu_view(eid, ev)
         await reply(t, parse_mode=ParseMode.HTML, reply_markup=m)
 
     if kind == "name":
@@ -10802,8 +11602,8 @@ async def _event_apply_text_edit(update: Update, context: ContextTypes.DEFAULT_T
             q["id"] for q in ev["questions"]
             if needle and needle in " ".join([q["question"], *q["options"], q.get("explanation") or ""]).lower()
         ]
-        EVENT_SEARCH[uid] = {"year": year, "query": text.strip()[:40], "qids": hits}
-        t, m = _event_list_view(uid, year, ev, 0, "s")
+        EVENT_SEARCH[uid] = {"eid": eid, "query": text.strip()[:40], "qids": hits}
+        t, m = _event_list_view(uid, eid, ev, 0, "s")
         await reply(t, parse_mode=ParseMode.HTML, reply_markup=m)
         return
 
@@ -10853,13 +11653,13 @@ async def _event_apply_text_edit(update: Update, context: ContextTypes.DEFAULT_T
     await _event_persist(context)
     await reply(
         "✅ اتعدل." + warn + "\n\n" + _event_q_text(ev, q, pos),
-        parse_mode=ParseMode.HTML, reply_markup=_event_q_markup(year, q),
+        parse_mode=ParseMode.HTML, reply_markup=_event_q_markup(eid, q),
     )
 
 async def _event_apply_image_edit(update: Update, context: ContextTypes.DEFAULT_TYPE, ee: dict) -> None:
-    uid, year = update.effective_user.id, ee["year"]
-    ev = EVENTS.get(year)
-    if not ev or year not in _event_admin_years(uid):
+    uid, eid = update.effective_user.id, ee["eid"]
+    ev = EVENTS.get(eid)
+    if not ev or ev.get("year") not in _event_admin_years(uid):
         await update.message.reply_text("⚠️ الـ Event ده اتقفل أو مش في صلاحياتك.")
         return
     _event_ensure_ids(ev)
@@ -10872,7 +11672,7 @@ async def _event_apply_image_edit(update: Update, context: ContextTypes.DEFAULT_
     await _event_persist(context)
     await update.message.reply_text(
         "✅ اتربطت الصورة.\n\n" + _event_q_text(ev, q, pos),
-        parse_mode=ParseMode.HTML, reply_markup=_event_q_markup(year, q),
+        parse_mode=ParseMode.HTML, reply_markup=_event_q_markup(eid, q),
     )
 
 # ═══════════════════════════════════════════════════════════════
@@ -11264,7 +12064,7 @@ async def _re_daily_callback(update: Update, context: ContextTypes.DEFAULT_TYPE,
 # edits made before then change who gets them.
 # ═══════════════════════════════════════════════════════════════
 AWAITING_LB_EDIT: dict = {}   # admin uid -> {"step": "user"|"data", "year", "target"?}
-LB_EDIT_MAX_ROWS = 40
+LB_EDIT_PAGE_SIZE = 20   # rows (each with a 🗑 button) per page of the admin editor
 
 def _lb_name(user_id: int) -> str:
     return get_nickname(user_id) or f"مستخدم #{user_id % 10000}"
@@ -11277,21 +12077,23 @@ def _lb_year_view(uid: int):
         f"{UNIVERSITIES.get(year_university(y), '')} {year_label(y)}", callback_data=f"lbe_y:{y}")] for y in years]
     return "🏆 <b>Leaderboard Edit — اختار السنة:</b>", InlineKeyboardMarkup(rows)
 
-def _lb_board_view(year: str):
+def _lb_board_view(year: str, page: int = 0):
     _ensure_daily_leaderboard_fresh()
-    ranked = _rank_daily_leaderboard(year, limit=LB_EDIT_MAX_ROWS)
-    total_rows = len(DAILY_QUIZ_LEADERBOARD.get(year, {}))
-    lines = [f"🏆 <b>Daily Quiz Leaderboard — {year_label(year)} — النهاردة</b>", ""]
+    ranked = _rank_daily_leaderboard(year, limit=None)
+    page, pages, p_start, p_end = _lb_pager(len(ranked), page, LB_EDIT_PAGE_SIZE)
+    lines = [f"🏆 <b>Daily Quiz Leaderboard — {year_label(year)} — النهاردة</b>"
+             + (f" (صفحة {page + 1}/{pages})" if pages > 1 else ""), ""]
     buttons = []
     if not ranked:
         lines.append("مفيش حد على اللوحة لسه.")
-    for i, r in enumerate(ranked):
+    for i, r in enumerate(ranked[p_start:p_end], p_start):
         label = f"{i + 1}. {r['name']} — {r['correct']}/{r['total']} ✅ · ⏱️ {_format_duration(r['duration'])}"
         lines.append(html.escape(label))
         buttons.append([InlineKeyboardButton(f"🗑 {label}"[:60], callback_data=f"lbe_r:{year}:{r['user_id']}")])
-    if total_rows > len(ranked):
-        lines.append(f"\n(بيظهر أول {len(ranked)} من {total_rows})")
     lines.append("\nدوس على اسم عشان تمسحه، أو ➕ عشان تضيف.")
+    nav = _lb_nav_row(f"lbe_p:{year}", page, pages)
+    if nav:
+        buttons.append(nav)
     buttons.append([InlineKeyboardButton("➕ Add entry", callback_data=f"lbe_a:{year}")])
     buttons.append([InlineKeyboardButton("🔙 رجوع", callback_data="lbe_root")])
     return "\n".join(lines), InlineKeyboardMarkup(buttons)
@@ -11410,6 +12212,16 @@ async def _lb_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     if cmd == "lbe_y":
         AWAITING_LB_EDIT.pop(uid, None)
         text, markup = _lb_board_view(year)
+        await send(text, markup)
+        return
+
+    if cmd == "lbe_p":   # Next / Back: lbe_p:<year>:<page>
+        AWAITING_LB_EDIT.pop(uid, None)
+        try:
+            _pg = int(parts[2])
+        except (ValueError, IndexError):
+            _pg = 0
+        text, markup = _lb_board_view(year, _pg)
         await send(text, markup)
         return
 
@@ -12697,10 +13509,6 @@ def _tap_toast(callback_data: str | None, user_id: int) -> str | None:
             cleared = len(_scoped_mistakes_bank(user_id))
             return f"✅ اتمسح {cleared} سؤال من بنك الأخطاء بتاعك."
 
-        # ── Main menu: 🔥COMING SOON🔥 (toast only, nothing else happens) ──
-        if data == "coming_soon":
-            return TOAST_COMING_SOON
-
         # ── Bookmarks: Clear Bookmarks ──
         if data == "clear_bookmarks_ask":
             return TOAST_BOOKMARKS_ALREADY_EMPTY if not _bookmark_entries(user_id) else None
@@ -13434,7 +14242,7 @@ async def _freeze_legacy_lecture_links(app) -> None:
             await backup_quiz_to_channel(ctx, year)
 
 def _lecture_preview_view(
-    year: str, mod_idx: int, subj_idx: int, lec_idx: int, user_id: int,
+    year: str, mod_idx: int, subj_idx: int, lec_idx: int, user_id: int, page: int = 0,
 ) -> tuple[str, InlineKeyboardMarkup | None]:
     """Builds the lecture preview screen (leaderboard + your best result,
     ▶️ Start / ❌ Cancel buttons) for one year/mod_idx/subj_idx/lec_idx —
@@ -13460,7 +14268,8 @@ def _lecture_preview_view(
     entry = QUIZ_INDEX[year][lecture_key]
     lr_key = _lr_key(year, lecture_key)
 
-    board = _lecture_leaderboard(lr_key)
+    board = _lecture_leaderboard(lr_key, limit=None)
+    page, pages, p_start, p_end = _lb_pager(len(board), page)
     lines = [
         quizzy_block(QUIZZY_READY_ART, "CHALLENGE YOURSELF!"),
         "",
@@ -13468,8 +14277,8 @@ def _lecture_preview_view(
     ]
     if board:
         medals = ["🥇", "🥈", "🥉"]
-        lines.append("🏆 <b>أفضل النتائج:</b>")
-        for i, row in enumerate(board):
+        lines.append("🏆 <b>أفضل النتائج:</b>" + (f" (صفحة {page + 1}/{pages})" if pages > 1 else ""))
+        for i, row in enumerate(board[p_start:p_end], p_start):
             medal = medals[i] if i < len(medals) else f"{i + 1}."
             lines.append(
                 f"{medal} {html.escape(row['nickname'])} — "
@@ -13480,12 +14289,14 @@ def _lecture_preview_view(
 
     my_result = _get_lecture_results(lr_key).get(str(user_id))
     if my_result:
+        _mc, _mt, _mp = _lecture_live_score(_lecture_live_ids(lr_key), my_result)
         lines.append(
-            f"\n📌 أحسن نتيجة ليك: {my_result['best_correct']}/{my_result['best_total']} "
-            f"({my_result['best_pct']}%) — حاولت {my_result['attempts']} مرة"
+            f"\n📌 أحسن نتيجة ليك: {_mc}/{_mt} "
+            f"({_mp}%) — حاولت {my_result['attempts']} مرة"
         )
 
-    buttons = [
+    nav = _lb_nav_row(f"lecture:{year}:{mod_idx}:{subj_idx}:{lec_idx}", page, pages)
+    buttons = ([nav] if nav else []) + [
         [InlineKeyboardButton("▶️ ابدأ المحاضرة", callback_data=f"lecturego:{year}:{mod_idx}:{subj_idx}:{lec_idx}")],
         [InlineKeyboardButton("❌ إلغاء", callback_data=f"subject:{year}:{mod_idx}:{subj_idx}")],
         [InlineKeyboardButton("🔗 لينك سريع للمحاضرة", callback_data=f"lecturelink:{year}:{mod_idx}:{subj_idx}:{lec_idx}")],
@@ -13511,8 +14322,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         toast_chat = query.message.chat_id if query.message else user_id
         await _send_toast_message(context, toast_chat, toast_text)
 
-    # 🔥COMING SOON🔥 — the toast above is the whole feature; leave the menu as is.
-    if query.data == "coming_soon":
+    # 🎯 Custom Quiz (was 🔥COMING SOON🔥 — old menus still send "coming_soon") and its picker screens.
+    if query.data in ("custom_quiz", "coming_soon"):
+        await custom_quiz_start(context, user_id, query.message)
+        return
+    if query.data.startswith("pk_"):
+        await _picker_callback(update, context, query)
         return
 
     # ── /leaderboard_edit — see the /leaderboard_edit section ──
@@ -14320,9 +15135,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── LECTURE: show a preview (leaderboard + your stats) before starting ──
     if query.data.startswith("lecture:"):
-        _, year, mod_idx_str, subj_idx_str, lec_idx_str = query.data.split(":")
+        _parts = query.data.split(":")
+        _, year, mod_idx_str, subj_idx_str, lec_idx_str = _parts[:5]
         mod_idx, subj_idx, lec_idx = int(mod_idx_str), int(subj_idx_str), int(lec_idx_str)
-        text, markup = _lecture_preview_view(year, mod_idx, subj_idx, lec_idx, user_id)
+        _lb_pg = int(_parts[5]) if len(_parts) > 5 and _parts[5].isdigit() else 0   # leaderboard page (Next / Back)
+        text, markup = _lecture_preview_view(year, mod_idx, subj_idx, lec_idx, user_id, _lb_pg)
         await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
         return
 
@@ -14448,6 +15265,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "year": year, "module": module, "subject": subject, "lecture_key": lecture_key,
             "queue": queue, "current_poll_id": None, "current_correct_id": None,
             "total": len(ready_ids), "answered": 0, "correct": 0,
+            "served_upto": max(ready_ids) if ready_ids else None,   # stored with the best result — see _lecture_live_score
             "mode": "auto" if auto_next else "batch",
             "pending_polls": {},
             "award_xp": not already_attempted,   # no XP farming on repeat attempts
@@ -15542,7 +16360,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if query.data.startswith("weekly_leaderboard:"):
             page = int(query.data.split(":")[1])
         year_class = get_year_class(user_id)
-        rows = _weekly_leaderboard(year_class)
+        rows = _weekly_leaderboard(year_class, limit=None)   # every ranked user, paged below
         title = f"📅 <b>Weekly Leaderboard — {year_class_label(year_class)}</b>"
         reset_line = f"⏳ بيتصفّر كل جمعة 12 بالليل — فاضل {_weekly_reset_countdown()}"
         if not rows:
@@ -15583,13 +16401,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == "year_leaderboard" or query.data.startswith("year_leaderboard:"):
         # year_class is guaranteed set by this point — mandatory onboarding
         # (see _onboarding_gate) means no update reaches here otherwise.
-        # Global leaderboard: top 100 overall, paged YEAR_LEADERBOARD_PAGE_SIZE
+        # Global leaderboard: everyone ranked, paged YEAR_LEADERBOARD_PAGE_SIZE
         # (20) at a time via Next/Back buttons — see year_leaderboard: callback.
         page = 1
         if query.data.startswith("year_leaderboard:"):
             page = int(query.data.split(":")[1])
         year_class = get_year_class(user_id)
-        rows = _year_leaderboard(year_class)   # top 100, already sorted
+        rows = _year_leaderboard(year_class, limit=None)   # every ranked user, already sorted; paged below
         title = f"🏆 <b>Leaderboard — {year_class_label(year_class)}</b>"
         if not rows:
             text = f"{title}\n\nمفيش حد جاوب أسئلة محاضرات في السنة دي لسه."
@@ -15944,7 +16762,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── /quiz_list + /quiz_delete button flow (see the QB section) ──
-    if query.data.startswith(("qbyr:", "qbyr_root:", "qbmod:", "qbsub:", "qbdel:")):
+    if query.data.startswith(("qbyr:", "qbyr_root:", "qbmod:", "qbsub:", "qbdel:", "qbswp:")):
         if not is_admin(update):
             await query.answer("🚫 للأدمن فقط", show_alert=True)
             return
@@ -16043,6 +16861,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "daily_quiz":
         await show_daily_quiz_menu(context, user_id, message=query.message)
+        return
+
+    if query.data.startswith("daily_lb:"):   # Next / Back on the daily board
+        _pg = query.data.split(":", 1)[1]
+        await show_daily_quiz_menu(context, user_id, message=query.message, page=int(_pg) if _pg.isdigit() else 0)
         return
 
     if query.data == "daily_quiz_begin":
@@ -16788,7 +17611,7 @@ def _build_previewtxt_sections() -> list[str]:
     out.append(
         "── MAIN MENU / SETTINGS BUTTON LABELS ──\n\n"
         "Main menu: 🦦 How To Use · Quizzes ⁉️ · 📊 My Stats · ⚙️ Settings · "
-        "💥Daily Quiz💥 · 🧠 Mistakes Bank · 🏆 Leaderboard (→ 📅 Weekly / 🌍 Global) · 🔥COMING SOON🔥\n\n"
+        "💥Daily Quiz💥 · 🧠 Mistakes Bank · 🏆 Leaderboard (→ 📅 Weekly / 🌍 Global) · 🎯 Custom Quiz\n\n"
         "Settings (page 1): ⏭️ Auto-Next · 🔀 Randomize · "
         "🔀 Mix Written · 🔁 Spaced Repetition · ⏱️ Question Timer · "
         "➡️ More Settings · 🏠 Back to Home\n\n"
@@ -16959,6 +17782,8 @@ ADMIN_TUTORIAL_CREATOR_SECTION = (
     "Dashboard: is the bot up, user and lecture counts, today / yesterday / this week / last week analytics (answers, accuracy, active users, sources, years, peak hour, XP), backups, live sessions, errors, uptime.\n\n"
     "<b>/stats</b>\n"
     "Permanent analytics history: last 14 days, <code>/stats weeks</code>, <code>/stats YYYY-MM-DD</code>, or <code>/stats export</code> to get stats_history.json.\n\n"
+    "<b>/report</b>\n"
+    "Builds one self-contained HTML analytics report (charts, growth rates, engagement, Custom Quiz, learners, content, events) and sends it as a file.\n\n"
     "<b>/backup_now</b>\n"
     "Forces the pinned channel backups to refresh right now.\n\n"
     "<b>/restore</b>\n"
@@ -17019,6 +17844,7 @@ async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append("/previewtxt — text dump of every static message a normal user can see")
         lines.append("/health")
         lines.append("/stats — permanent daily/weekly analytics history — Creator only")
+        lines.append("/report — full HTML analytics report with charts — Creator only")
         lines.append("/restore")
         lines.append("/broadcast &lt;message&gt;  (or attach a file/photo/video with /broadcast as its caption)")
         lines.append("/ban &lt;ID&gt; &lt;hours&gt; &lt;reason&gt;")
@@ -17417,6 +18243,23 @@ def _fmt_day(day: str) -> str:
 def _add_days(day: str, n: int) -> str:
     return (datetime.strptime(day, "%Y-%m-%d") + timedelta(days=n)).strftime("%Y-%m-%d")
 
+def _stats_all_time_block() -> str:
+    """Everything saved in STATS_HISTORY, summed. Day records are kept forever
+    (only their per-day user id lists are dropped once a week is rolled), so
+    this is exact for answers, lectures, quizzes, XP, … from the day tracking
+    began. Unique-user counts can't be summed across days, so it shows the
+    registered-user total instead of an 'active users' figure."""
+    days = STATS_HISTORY["days"]
+    if not days:
+        return "<b>♾️ All time</b>\nNo activity recorded yet."
+    agg = _agg_stats(list(days.values()))
+    agg["active"] = 0   # no exact all-time unique-user count (see docstring); hides the per-user time figure
+    first = min(days)
+    return _stats_block(
+        f"♾️ All time — since {_fmt_day(first)} ({len(days)} day(s) saved)", agg,
+        users_line=f"👥 Registered users: {_count_registered_users():,}",
+    )
+
 def _stats_year_name(y: str) -> str:
     try:
         return year_label(y) if y != "unknown" else "No year"
@@ -17427,7 +18270,8 @@ def _stats_one_liner(title: str, rec: dict) -> str:
     return (f"{title}: ❓ {rec['answered']:,} ({_pct_str(rec['correct'], rec['answered'])}) · "
             f"👤 {rec['active']:,} · 🎓 {rec['lectures']:,} · 💥 {rec['daily_done']:,}")
 
-def _stats_block(title: str, agg: dict | None, lectures_all_time: int | None = None, registered: bool = False) -> str:
+def _stats_block(title: str, agg: dict | None, lectures_all_time: int | None = None, registered: bool = False,
+                 users_line: str | None = None) -> str:
     """One analytics block for /health (a day, or a week)."""
     if not agg or not agg.get("answered") and not agg.get("lectures") and not agg.get("daily_done"):
         return f"<b>{title}</b>\nNo activity recorded yet."
@@ -17439,13 +18283,18 @@ def _stats_block(title: str, agg: dict | None, lectures_all_time: int | None = N
     users = f"👤 Active users: {agg['active']:,}"
     if registered and agg.get("users_total"):
         users += f" of {agg['users_total']:,} registered ({round(agg['active'] / agg['users_total'] * 100)}%)"
-    lines.append(users)
+    lines.append(users if users_line is None else users_line)
     lec = f"🎓 Lectures finished: {agg['lectures']:,}"
     if lectures_all_time is not None:
         lec += f" (all-time: {lectures_all_time:,})"
     lines.append(lec)
     if agg["daily_done"]:
         lines.append(f"💥 Daily Quiz completed: {agg['daily_done']:,} · avg {_pct_str(agg['daily_correct'], agg['daily_total'])}")
+    if agg.get("custom_runs"):
+        _cq = agg.get("custom_questions", 0)
+        _speed = f" · {agg['custom_time'] / _cq:.1f}s/question" if _cq and agg.get("custom_time") else ""
+        lines.append(f"🎯 Custom Quizzes: {agg['custom_runs']:,} run(s) · {_cq:,} questions · "
+                     f"{_pct_str(agg.get('custom_correct', 0), _cq)}{_speed}")
     src = [f"{STATS_SOURCE_LABELS.get(k, k)} {v[0]:,}" for k, v in agg["src"].items() if v[0]]
     if src:
         lines.append("📊 By source: " + " · ".join(src))
@@ -17466,7 +18315,8 @@ def _stats_block(title: str, agg: dict | None, lectures_all_time: int | None = N
 
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Creator-only: /stats (last 14 days), /stats weeks (last 12 weeks),
-    /stats <YYYY-MM-DD> (one full day), /stats export (stats_history.json)."""
+    /stats all (everything saved, all time), /stats <YYYY-MM-DD> (one full day),
+    /stats export (stats_history.json)."""
     if not is_creator(update):
         await update.message.reply_text(MSG_ADMIN_ONLY)
         return
@@ -17486,6 +18336,10 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("No record for that day.")
             return
         await update.message.reply_text(_stats_block(f"📅 {arg}", _agg_stats([rec]), registered=True), parse_mode=ParseMode.HTML)
+        return
+    if arg in ("all", "alltime", "all-time", "total"):
+        await _stats_flush()
+        await update.message.reply_text(_stats_all_time_block(), parse_mode=ParseMode.HTML)
         return
     if arg in ("weeks", "week", "w"):
         await _stats_flush()
@@ -17507,7 +18361,526 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"{r['active']:>6,} {r['lectures']:>5,} {r['daily_done']:>6,}")
     await update.message.reply_text(
         "📈 <b>Daily analytics</b> (last 14 days)\n<code>" + "\n".join(rows) + "</code>\n\n"
-        "<i>/stats weeks · /stats YYYY-MM-DD · /stats export</i>", parse_mode=ParseMode.HTML)
+        "<i>/stats all · /stats weeks · /stats YYYY-MM-DD · /stats export</i>", parse_mode=ParseMode.HTML)
+
+# ═══════════════════════════════════════════════════════════════
+# /report — one self-contained HTML analytics report (creator-only)
+#
+# Everything comes from data the bot already keeps: STATS_HISTORY (days/weeks),
+# ANALYTICS (per-user), SETTINGS (registered users + year), QUIZ_INDEX
+# (content), EVENTS and LECTURE_RESULTS. The file has no external requests —
+# charts are inline SVG, so it opens offline on any phone or laptop, follows
+# the device's light/dark mode, and prints cleanly. Hover a bar/point for the
+# exact numbers.
+# ═══════════════════════════════════════════════════════════════
+import math
+from collections import Counter
+
+_RP_SRC_COLORS = {"lecture": "#6366f1", "daily": "#f59e0b", "mistakes": "#ef4444",
+                  "bookmarks": "#14b8a6", "event": "#8b5cf6", "custom": "#ec4899"}
+_RP_BLUE, _RP_GREEN, _RP_RED, _RP_AMBER, _RP_TEAL = "#4f8cff", "#22c55e", "#ef4444", "#f59e0b", "#14b8a6"
+_RP_DAILY_CHART_DAYS = 120   # daily charts show the most recent N days; weekly ones cover everything
+
+def _rp_e(x) -> str:
+    return html.escape(str(x))
+
+def _rp_fmt(v: float) -> str:
+    a = abs(v)
+    if a >= 1_000_000:
+        return f"{v / 1_000_000:.1f}M"
+    if a >= 10_000:
+        return f"{v / 1000:.1f}k"
+    if float(v).is_integer() or a >= 100:
+        return f"{v:,.0f}"
+    return f"{v:,.1f}"
+
+def _rp_pct(c: float, a: float) -> float:
+    return (c / a * 100) if a else 0.0
+
+def _rp_change(cur: float, prev: float) -> float | None:
+    return None if not prev else (cur - prev) / prev * 100
+
+def _rp_nice(v: float) -> float:
+    if v <= 0:
+        return 1.0
+    exp = math.floor(math.log10(v))
+    f = v / 10 ** exp
+    for n in (1, 2, 2.5, 5, 10):
+        if f <= n:
+            return n * 10 ** exp
+    return 10 ** (exp + 1)
+
+def _rp_dur(seconds: float) -> str:
+    s = int(seconds)
+    if s >= 3600:
+        return f"{s // 3600}h {s % 3600 // 60}m"
+    return f"{s // 60}m {s % 60}s" if s >= 60 else f"{s}s"
+
+def _rp_chart(labels: list, series: list, kind: str = "line", wide: bool = False, h: int | None = None,
+              yfmt=_rp_fmt, suffix: str = "") -> str:
+    """Inline-SVG chart. kind: 'line' (series may set area=True), 'bar' (grouped)
+    or 'stack'. A series is {name, color, values[, colors, area]}; `colors` is a
+    per-value override (used to paint growth bars green/red). Every bucket has
+    a transparent hover strip whose tooltip lists all series. Wide charts (full
+    row) and normal ones (a third of a row) get different coordinate systems so
+    axis text stays readable at either size; on a phone the chart scrolls
+    sideways rather than shrinking (see .cw in the CSS)."""
+    w = 760 if wide else 420
+    h = h or (250 if wide else 235)
+    n = len(labels)
+    if n == 0 or not any(v is not None for s in series for v in s["values"]):
+        return '<div class="empty">No data yet</div>'
+    ml, mr, mt, mb = 50, 12, 12, 28
+    W, H = w - ml - mr, h - mt - mb
+    if kind == "stack":
+        hi, lo = max(sum((s["values"][i] or 0) for s in series) for i in range(n)), 0
+    else:
+        vals = [v for s in series for v in s["values"] if v is not None]
+        hi, lo = max(vals + [0]), min(vals + [0])
+    top = _rp_nice(hi) if hi > 0 else 0
+    bot = -_rp_nice(-lo) if lo < 0 else 0
+    if top == bot:
+        top = 1
+    rng = top - bot
+    step = W / n
+
+    def Y(v):
+        return mt + H * (1 - (v - bot) / rng)
+
+    def X(i):
+        return ml + step * (i + 0.5)
+
+    o = [f'<div class="cw"><svg viewBox="0 0 {w} {h}" role="img" class="{"wide" if wide else "half"}" xmlns="http://www.w3.org/2000/svg">']
+    for k in range(5):   # grid + y labels
+        v = bot + rng * k / 4
+        y = Y(v)
+        o.append(f'<line x1="{ml}" x2="{w - mr}" y1="{y:.1f}" y2="{y:.1f}" class="{"zero" if abs(v) < 1e-9 else "gl"}"/>')
+        o.append(f'<text x="{ml - 6}" y="{y + 3.5:.1f}" text-anchor="end" class="ax">{_rp_e(yfmt(v))}{suffix}</text>')
+    every = max(1, math.ceil(n / 8))
+    for i in range(0, n, every):
+        o.append(f'<text x="{X(i):.1f}" y="{h - 8}" text-anchor="middle" class="ax">{_rp_e(labels[i])}</text>')
+    m = len(series)
+    if kind == "line":
+        for s in series:
+            pts = [(X(i), Y(v)) for i, v in enumerate(s["values"]) if v is not None]
+            if len(pts) > 1:
+                if s.get("area"):
+                    path = f'M{pts[0][0]:.1f},{Y(0):.1f} ' + " ".join(f"L{x:.1f},{y:.1f}" for x, y in pts) + f' L{pts[-1][0]:.1f},{Y(0):.1f}Z'
+                    o.append(f'<path d="{path}" fill="{s["color"]}" fill-opacity=".14"/>')
+                o.append(f'<polyline points="{" ".join(f"{x:.1f},{y:.1f}" for x, y in pts)}" fill="none" '
+                         f'stroke="{s["color"]}" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round"'
+                         + (' stroke-dasharray="5 4"' if s.get("dash") else "") + '/>')
+            if len(pts) == 1 or n <= 40:
+                for x, y in pts:
+                    o.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="2.6" fill="{s["color"]}"/>')
+    else:
+        base = [0.0] * n
+        bw = max(1.2, step * 0.74 / (1 if kind == "stack" else m))
+        for j, s in enumerate(series):
+            for i, v in enumerate(s["values"]):
+                if not v:
+                    continue
+                color = (s.get("colors") or [s["color"]] * n)[i]
+                if kind == "stack":
+                    y1, y2 = Y(base[i] + v), Y(base[i])
+                    base[i] += v
+                    x = X(i) - bw / 2
+                else:
+                    y1, y2 = sorted((Y(v), Y(0)))
+                    x = X(i) - step * 0.37 + j * bw
+                o.append(f'<rect x="{x:.1f}" y="{y1:.1f}" width="{bw:.1f}" height="{max(y2 - y1, .8):.1f}" '
+                         f'fill="{color}" rx="{1.6 if bw > 4 else 0}"/>')
+    for i in range(n):   # hover strips with tooltips
+        tip = labels[i] + "".join(
+            f"\n{s['name']}: {_rp_fmt(s['values'][i])}{suffix}" for s in series if s["values"][i] is not None)
+        o.append(f'<rect x="{ml + step * i:.1f}" y="{mt}" width="{step:.1f}" height="{H}" fill="transparent">'
+                 f'<title>{_rp_e(tip)}</title></rect>')
+    o.append("</svg></div>")
+    return "".join(o)
+
+def _rp_donut(items: list, center: str, sub: str) -> str:
+    items = [(n, v, c) for n, v, c in items if v > 0]
+    total = sum(v for _n, v, _c in items)
+    if not total:
+        return '<div class="empty">No data yet</div>'
+    R, SW, C = 70, 26, 2 * math.pi * 70
+    o = ['<svg viewBox="0 0 180 180" role="img" xmlns="http://www.w3.org/2000/svg" class="donut">']
+    off = 0.0
+    for name, v, color in items:
+        ln = v / total * C
+        o.append(f'<circle cx="90" cy="90" r="{R}" fill="none" stroke="{color}" stroke-width="{SW}" '
+                 f'stroke-dasharray="{ln:.2f} {C - ln:.2f}" stroke-dashoffset="{-off:.2f}" transform="rotate(-90 90 90)">'
+                 f'<title>{_rp_e(name)}: {_rp_fmt(v)} ({v / total * 100:.1f}%)</title></circle>')
+        off += ln
+    o.append(f'<text x="90" y="88" text-anchor="middle" class="dc">{_rp_e(center)}</text>'
+             f'<text x="90" y="106" text-anchor="middle" class="ds">{_rp_e(sub)}</text></svg>')
+    return "".join(o)
+
+def _rp_legend(items: list) -> str:
+    return '<div class="legend">' + "".join(
+        f'<span><i style="background:{c}"></i>{_rp_e(n)}</span>' for n, c in items) + "</div>"
+
+def _rp_hbars(items: list, color: str = _RP_BLUE, suffix: str = "") -> str:
+    """items: (label, value[, display text])."""
+    if not items:
+        return '<div class="empty">No data yet</div>'
+    top = max(i[1] for i in items) or 1
+    rows = []
+    for it in items:
+        shown = it[2] if len(it) > 2 else f"{_rp_fmt(it[1])}{suffix}"
+        rows.append(f'<div class="hb"><span dir="auto">{_rp_e(it[0])}</span>'
+                    f'<div class="bar"><i style="width:{it[1] / top * 100:.1f}%;background:{color}"></i></div>'
+                    f'<b>{_rp_e(shown)}</b></div>')
+    return "".join(rows)
+
+def _rp_table(headers: list, rows: list, num_from: int = 1) -> str:
+    if not rows:
+        return '<div class="empty">No data yet</div>'
+    th = "".join(f'<th class="{"n" if i >= num_from else ""}">{_rp_e(h)}</th>' for i, h in enumerate(headers))
+    body = "".join(
+        "<tr>" + "".join(f'<td class="{"n" if i >= num_from else ""}" dir="auto">{c}</td>' for i, c in enumerate(r)) + "</tr>"
+        for r in rows)
+    return f'<div class="tw"><table><thead><tr>{th}</tr></thead><tbody>{body}</tbody></table></div>'
+
+def _rp_card(title: str, body: str, sub: str = "", legend: str = "", wide: bool = False) -> str:
+    return (f'<section class="card{" wide" if wide else ""}"><h3>{_rp_e(title)}</h3>'
+            + (f'<p class="sub">{sub}</p>' if sub else "") + legend + body + "</section>")
+
+def _rp_chip(change: float | None, suffix: str = "% vs prev 7d") -> str:
+    if change is None:
+        return '<span class="chip flat">no baseline yet</span>'
+    cls = "up" if change > 0.05 else ("down" if change < -0.05 else "flat")
+    arrow = "▲" if change > 0.05 else ("▼" if change < -0.05 else "■")
+    return f'<span class="chip {cls}">{arrow} {abs(change):.1f}{suffix}</span>'
+
+def _rp_kpi(icon: str, label: str, value: str, chip: str = "", note: str = "") -> str:
+    return (f'<div class="kpi"><div class="ki">{icon}</div><div class="kv">{_rp_e(value)}</div>'
+            f'<div class="kl">{_rp_e(label)}</div>{chip}' + (f'<div class="kn">{_rp_e(note)}</div>' if note else "") + "</div>")
+
+_RP_CSS = """
+:root{--bg:#f4f6fb;--card:#fff;--ink:#0f172a;--muted:#64748b;--grid:#e2e8f0;--line:#cbd5e1;--accent:#4f8cff;--accent2:#8b5cf6;
+--up:#16a34a;--down:#dc2626;--upbg:#dcfce7;--downbg:#fee2e2;--flatbg:#e2e8f0;--shadow:0 1px 2px rgba(15,23,42,.06),0 8px 24px rgba(15,23,42,.06)}
+@media (prefers-color-scheme:dark){:root{--bg:#0b1020;--card:#131a2e;--ink:#e6ebf7;--muted:#93a0bd;--grid:#26304d;--line:#34405f;
+--up:#4ade80;--down:#f87171;--upbg:#12301f;--downbg:#3a1618;--flatbg:#222c47;--shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px rgba(0,0,0,.35)}}
+*{box-sizing:border-box}html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans Arabic",sans-serif}
+.hero{background:linear-gradient(135deg,#4f8cff 0%,#8b5cf6 55%,#ec4899 100%);color:#fff;padding:34px 20px 70px}
+.wrap{max-width:1120px;margin:0 auto;padding:0 16px}
+.hero .wrap{padding:0}.hero h1{margin:0 0 4px;font-size:clamp(24px,5vw,36px);letter-spacing:-.02em}
+.hero p{margin:0;opacity:.9}.hero .meta{margin-top:12px;display:flex;flex-wrap:wrap;gap:8px}
+.pill{background:rgba(255,255,255,.18);border:1px solid rgba(255,255,255,.28);border-radius:999px;padding:3px 12px;font-size:13px}
+main{margin-top:-46px;padding-bottom:40px}
+h2{font-size:20px;margin:34px 0 12px;letter-spacing:-.01em;display:flex;align-items:center;gap:8px}
+h2 small{font-weight:400;color:var(--muted);font-size:13px}
+.grid{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(330px,1fr))}
+.kpis{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(170px,1fr))}
+.card,.kpi{background:var(--card);border-radius:16px;box-shadow:var(--shadow);padding:16px 18px;min-width:0}
+.card.wide{grid-column:1/-1}.card h3{margin:0 0 2px;font-size:15px}.sub{margin:0 0 8px;color:var(--muted);font-size:13px}
+.kpi .ki{font-size:20px}.kpi .kv{font-size:clamp(22px,4vw,28px);font-weight:700;letter-spacing:-.02em;line-height:1.2}
+.kpi .kl{color:var(--muted);font-size:13px;margin-bottom:6px}.kpi .kn{color:var(--muted);font-size:12px;margin-top:4px}
+.chip{display:inline-block;border-radius:999px;padding:1px 9px;font-size:12px;font-weight:600}
+.chip.up{background:var(--upbg);color:var(--up)}.chip.down{background:var(--downbg);color:var(--down)}.chip.flat{background:var(--flatbg);color:var(--muted)}
+.cw{overflow-x:auto}svg{width:100%;height:auto;display:block}.cw svg.wide{min-width:520px}.cw svg.half{min-width:290px}.ax{fill:var(--muted);font-size:10.5px}.gl{}svg line.gl{stroke:var(--grid)}
+svg line.zero{stroke:var(--line);stroke-width:1.2}.donut{max-width:210px;margin:0 auto}.dc{fill:var(--ink);font-size:17px;font-weight:700}.ds{fill:var(--muted);font-size:9.5px}
+.legend{display:flex;flex-wrap:wrap;gap:4px 14px;font-size:12.5px;color:var(--muted);margin:2px 0 6px}
+.legend i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:6px;vertical-align:-1px}
+.hb{display:grid;grid-template-columns:minmax(80px,32%) 1fr auto;gap:10px;align-items:center;margin:7px 0;font-size:13.5px}
+.hb span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.hb .bar{background:var(--grid);border-radius:99px;height:9px;overflow:hidden}
+.hb .bar i{display:block;height:100%;border-radius:99px}.hb b{font-variant-numeric:tabular-nums}
+.tw{overflow-x:auto}table{border-collapse:collapse;width:100%;font-size:13.5px}
+th,td{padding:7px 10px;border-bottom:1px solid var(--grid);text-align:left;white-space:nowrap}th{color:var(--muted);font-weight:600;font-size:12.5px}
+.n{text-align:right;font-variant-numeric:tabular-nums}tbody tr:hover{background:var(--flatbg)}
+.empty{color:var(--muted);padding:26px 0;text-align:center;font-size:13px}
+.insights{display:grid;gap:8px;margin:0;padding:0;list-style:none}.insights li{background:var(--card);border-radius:12px;padding:10px 14px;box-shadow:var(--shadow);border-left:4px solid var(--accent)}
+.split{display:grid;grid-template-columns:210px 1fr;gap:14px;align-items:center}@media(max-width:560px){.split{grid-template-columns:1fr}}
+footer{color:var(--muted);font-size:12.5px;text-align:center;padding:10px 16px 30px}
+@media print{body{background:#fff}.hero{padding:18px}.card,.kpi{box-shadow:none;border:1px solid #ddd;break-inside:avoid}}
+"""
+
+def _rp_series() -> list:
+    """One entry per calendar day from the first to the last saved one (days
+    with no activity are zeros, so charts don't skip them); `reg` is the
+    registered-user total, carried forward over gaps."""
+    days = STATS_HISTORY["days"]
+    if not days:
+        return []
+    d, last = datetime.strptime(min(days), "%Y-%m-%d").date(), datetime.strptime(max(days), "%Y-%m-%d").date()
+    out, reg = [], 0
+    while d <= last:
+        key = d.isoformat()
+        r = days.get(key) or {}
+        reg = r.get("users_total") or reg
+        out.append({"date": key, "r": r, "reg": reg, "wd": d.weekday()})
+        d += timedelta(days=1)
+    return out
+
+def _rp_completed_weeks() -> list:
+    """[(week_start, aggregate)] for every finished week, oldest first."""
+    cur = _stats_week_key(_stats_today()[0])
+    keys = sorted({_stats_week_key(d) for d in STATS_HISTORY["days"]} | set(STATS_HISTORY["weeks"]))
+    return [(k, _week_agg(k)) for k in keys if k != cur and _week_agg(k)]
+
+def build_html_report() -> str:
+    now = datetime.now(DAILY_QUIZ_TZ)
+    days = STATS_HISTORY["days"]
+    ser = _rp_series()
+    allagg = _agg_stats(list(days.values())) if days else _blank_stats_day()
+    registered = _count_registered_users()
+    entries = [(k, e) for k, e in ANALYTICS.items() if isinstance(k, str) and k.lstrip("-").isdigit() and isinstance(e, dict)]
+    A = lambda r, k: r.get(k, 0) or 0   # noqa: E731
+
+    # ── windows for the headline trend chips: the 7 full days before today vs the 7 before those ──
+    full = ser[:-1] if ser and ser[-1]["date"] == now.strftime("%Y-%m-%d") else ser
+    w7, p7 = full[-7:], full[-14:-7]
+    have_two = len(full) >= 14
+
+    def win(rows, key):
+        return sum(A(x["r"], key) for x in rows)
+
+    def chip(key, rows_a=None, rows_b=None):
+        return _rp_chip(_rp_change(win(rows_a or w7, key), win(rows_b or p7, key))) if have_two else _rp_chip(None)
+
+    reg_now = ser[-1]["reg"] if ser else registered
+    reg_then = next((x["reg"] for x in reversed(ser[:-7]) if x["reg"]), 0) if len(ser) > 7 else 0
+    acc_w7, acc_p7 = _rp_pct(win(w7, "correct"), win(w7, "answered")), _rp_pct(win(p7, "correct"), win(p7, "answered"))
+    reach_base = (ser[-1]["reg"] if ser and ser[-1]["reg"] else registered)   # same user total the day records used
+    reach7 = min(100.0, sum(A(x["r"], "active") for x in w7) / len(w7) / reach_base * 100) if w7 and reach_base else 0.0
+    cq = [e.get("custom_quiz") or {} for _k, e in entries]
+    cq_users = sum(1 for c in cq if c.get("runs"))
+    xp_total = sum(e.get("xp", 0) or 0 for _k, e in entries)
+
+    # ── 1. KPIs ──
+    kpis = "".join([
+        _rp_kpi("👥", "Registered users", f"{registered:,}",
+                _rp_chip(_rp_change(reg_now, reg_then), "% in 7 days") if reg_then else "",
+                f"+{reg_now - reg_then:,} in the last 7 days" if reg_then and reg_now >= reg_then else ""),
+        _rp_kpi("❓", "Questions answered", f"{allagg['answered']:,}", chip("answered"), f"{win(w7, 'answered'):,} in the last 7 days"),
+        _rp_kpi("🎯", "Overall accuracy", f"{_rp_pct(allagg['correct'], allagg['answered']):.1f}%",
+                _rp_chip(acc_w7 - acc_p7, " pts vs prev 7d") if have_two and win(p7, "answered") else "", "all time"),
+        _rp_kpi("🔥", "Avg daily reach", f"{reach7:.1f}%", "", "active users ÷ registered, last 7 days"),
+        _rp_kpi("🎓", "Lectures finished", f"{allagg['lectures']:,}", chip("lectures")),
+        _rp_kpi("💥", "Daily Quizzes done", f"{allagg['daily_done']:,}", chip("daily_done"),
+                f"avg score {_rp_pct(allagg['daily_correct'], allagg['daily_total']):.0f}%" if allagg["daily_total"] else ""),
+        _rp_kpi("🎯", "Custom Quizzes", f"{allagg['custom_runs']:,}", chip("custom_runs"),
+                f"{cq_users:,} users · {_rp_pct(allagg['custom_correct'], allagg['custom_questions']):.0f}% accuracy" if allagg["custom_runs"] else ""),
+        _rp_kpi("✨", "XP earned (all users)", _rp_fmt(xp_total), "", f"{allagg['achievements']:,} achievements unlocked"),
+    ])
+
+    # ── 2. daily charts (most recent N days) ──
+    recent = ser[-_RP_DAILY_CHART_DAYS:]
+    lab = [x["date"][5:] for x in recent]
+    ans = [A(x["r"], "answered") for x in recent]
+    ma = [sum(ans[max(0, i - 6):i + 1]) / len(ans[max(0, i - 6):i + 1]) for i in range(len(ans))]
+    acc = [round(_rp_pct(A(x["r"], "correct"), A(x["r"], "answered")), 1) if A(x["r"], "answered") else None for x in recent]
+    dau = [A(x["r"], "active") for x in recent]
+    regs = [x["reg"] or None for x in recent]
+    note_days = f"last {len(recent)} days" if len(ser) > len(recent) else f"{len(recent)} day(s)"
+    c_answers = _rp_chart(lab, [{"name": "Answers", "color": _RP_BLUE, "values": ans, "area": True},
+                                {"name": "7-day average", "color": _RP_AMBER, "values": ma, "dash": True}], wide=True)
+    c_acc = _rp_chart(lab, [{"name": "Accuracy", "color": _RP_GREEN, "values": acc, "area": True}], suffix="%")
+    c_dau = _rp_chart(lab, [{"name": "Active users", "color": _RP_BLUE, "values": dau}], kind="bar")
+    c_reg = _rp_chart(lab, [{"name": "Registered users", "color": "#8b5cf6", "values": regs, "area": True}])
+
+    # ── 3. weekly growth ──
+    weeks = _rp_completed_weeks()
+    wl = [k[5:] for k, _a in weeks]
+    w_ans = [a["answered"] for _k, a in weeks]
+    w_act = [a.get("active", 0) for _k, a in weeks]
+    w_lec = [a["lectures"] for _k, a in weeks]
+
+    def wow(vals):
+        return [None] + [(_rp_change(vals[i], vals[i - 1]) if vals[i - 1] else None) for i in range(1, len(vals))]
+
+    g_ans, g_act = wow(w_ans), wow(w_act)
+    clr = lambda g: [(_RP_GREEN if (v or 0) >= 0 else _RP_RED) for v in g]   # noqa: E731
+    c_growth = _rp_chart(wl[1:], [{"name": "Answers WoW", "color": _RP_BLUE, "values": [round(v, 1) if v is not None else None for v in g_ans[1:]],
+                                    "colors": clr(g_ans[1:])}], kind="bar", suffix="%")
+    c_weekly = _rp_chart(wl, [{"name": "Answers", "color": _RP_BLUE, "values": w_ans, "area": True}])
+    c_wact = _rp_chart(wl, [{"name": "Active users", "color": _RP_AMBER, "values": w_act}], kind="bar")
+    cagr = None
+    if len(w_ans) >= 3 and w_ans[0] > 0 and w_ans[-1] > 0:
+        cagr = ((w_ans[-1] / w_ans[0]) ** (1 / (len(w_ans) - 1)) - 1) * 100
+    wk_rows = []
+    for i in range(len(weeks) - 1, max(len(weeks) - 13, -1), -1):
+        k, a = weeks[i]
+        def gcell(g):
+            return "—" if g is None else f'<span class="chip {"up" if g >= 0 else "down"}">{"▲" if g >= 0 else "▼"} {abs(g):.0f}%</span>'
+        wk_rows.append([_rp_e(k), f"{a['answered']:,}", gcell(g_ans[i]), f"{_rp_pct(a['correct'], a['answered']):.0f}%",
+                        f"{a.get('active', 0):,}", gcell(g_act[i]), f"{a['lectures']:,}", f"{a['daily_done']:,}"])
+
+    # ── 4. sources / years / hours / weekdays ──
+    src_items = [(STATS_SOURCE_LABELS.get(k, k), v[0], _RP_SRC_COLORS.get(k, "#94a3b8")) for k, v in allagg["src"].items() if v[0]]
+    donut = _rp_donut(src_items, _rp_fmt(allagg["answered"]), "answers")
+    src_legend = _rp_legend([(f"{n} · {_rp_fmt(v)} ({_rp_pct(v, allagg['answered']):.0f}%)", c) for n, v, c in src_items])
+    stack_series = [{"name": STATS_SOURCE_LABELS.get(k, k), "color": _RP_SRC_COLORS.get(k, "#94a3b8"),
+                     "values": [(a["src"].get(k) or [0, 0])[0] for _k, a in weeks]} for k in STATS_SOURCES]
+    c_stack = _rp_chart(wl, stack_series, kind="stack")
+    by_year = sorted(allagg["year"].items(), key=lambda kv: -kv[1][0])
+    year_bars = _rp_hbars([(_stats_year_name(k), v[0], f"{v[0]:,} · {_rp_pct(v[1], v[0]):.0f}% acc") for k, v in by_year if v[0]], _RP_TEAL)
+    reg_year = Counter(get_year_class(int(k)) for k, e in SETTINGS.items() if str(k).lstrip("-").isdigit() and e.get("nickname"))
+    reg_bars = _rp_hbars([(_stats_year_name(k or "unknown"), v) for k, v in reg_year.most_common()], "#8b5cf6")
+    hours = allagg["hours"]
+    c_hours = _rp_chart([f"{h:02d}" for h in range(24)], [{"name": "Answers", "color": _RP_AMBER, "values": hours}], kind="bar", h=210)
+    wd_tot, wd_n = [0] * 7, [0] * 7
+    for x in ser:
+        if x["r"]:
+            wd_tot[x["wd"]] += A(x["r"], "answered")
+            wd_n[x["wd"]] += 1
+    wd_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    wd_avg = [round(t / n) if n else 0 for t, n in zip(wd_tot, wd_n)]
+    c_wd = _rp_chart(wd_names, [{"name": "Avg answers", "color": _RP_BLUE, "values": wd_avg}], kind="bar", h=210)
+
+    # ── 5. Custom Quiz ──
+    c_runs = _rp_chart(lab, [{"name": "Custom Quiz runs", "color": "#ec4899", "values": [A(x["r"], "custom_runs") for x in recent]}], kind="bar", h=210)
+    sp = [round(A(x["r"], "custom_time") / A(x["r"], "custom_questions"), 1) if A(x["r"], "custom_questions") else None for x in recent]
+    c_speed = _rp_chart(lab, [{"name": "Seconds per question", "color": _RP_TEAL, "values": sp}], suffix="s", h=210)
+    cq_top = sorted(((get_nickname(int(k)) or "—", c) for (k, _e), c in zip(entries, cq) if c.get("runs") and get_nickname(int(k))),
+                    key=lambda t: -t[1].get("questions", 0))[:8]
+    cq_rows = [[_rp_e(n), f"{c['runs']:,}", f"{c['questions']:,}", f"{_rp_pct(c.get('correct', 0), c['questions']):.0f}%",
+                f"{c.get('seconds', 0) / c['questions']:.1f}s"] for n, c in cq_top]
+
+    # ── 6. learners ──
+    lv = Counter(int(e.get("level", 0) or 0) for _k, e in entries if e.get("last_active_date"))
+    lv_max = max(lv) if lv else 0
+    c_levels = _rp_chart([str(i) for i in range(lv_max + 1)], [{"name": "Users", "color": "#8b5cf6", "values": [lv.get(i, 0) for i in range(lv_max + 1)]}], kind="bar", h=210)
+    buckets = [("0", 0, 0), ("1–2", 1, 2), ("3–6", 3, 6), ("7–13", 7, 13), ("14–29", 14, 29), ("30+", 30, 10 ** 9)]
+    sb = [e.get("streak_best", 0) or 0 for _k, e in entries if e.get("last_active_date")]
+    streak_bars = _rp_hbars([(f"{n} days", sum(1 for s in sb if lo <= s <= hi)) for n, lo, hi in buckets], _RP_AMBER)
+    top_xp = sorted(((get_nickname(int(k)) or None, e) for k, e in entries), key=lambda t: -(t[1].get("xp", 0) or 0))
+    top_rows = [[str(i), _rp_e(n), f"{e.get('xp', 0):,}", str(e.get("level", 0)), f"{e.get('streak_best', 0)}d",
+                 f"{_rp_pct(e.get('lecture_questions_correct', 0), e.get('lecture_questions_answered', 0)):.0f}%"]
+                for i, (n, e) in enumerate([t for t in top_xp if t[0]][:10], 1)]
+
+    # ── 7. content / events / lectures ──
+    content = [(year_label(y), sum(len(e.get("ids", [])) for e in QUIZ_INDEX.get(y, {}).values()), len(QUIZ_INDEX.get(y, {})))
+               for y in YEAR_ORDER if QUIZ_INDEX.get(y)]
+    content_bars = _rp_hbars([(n, q, f"{q:,} questions · {l:,} lectures") for n, q, l in content], _RP_BLUE)
+    ev_rows = []
+    for eid, ev in sorted(EVENTS.items(), key=lambda kv: -(kv[1].get("created_at") or 0)):
+        res = ev.get("results") or {}
+        pcts = [_rp_pct(r.get("correct", 0), r.get("total", 0)) for r in res.values() if r.get("total")]
+        status = "🏁 ended" if ev.get("ended") else ("🟢 live" if ev.get("live") else "📝 draft")
+        ev_rows.append([_rp_e(ev.get("name", "—")), _rp_e(year_label(ev.get("year") or "")), status,
+                        f"{len(ev.get('questions') or []):,}" if not ev.get("ended") else "—", f"{len(res):,}",
+                        f"{sum(pcts) / len(pcts):.0f}%" if pcts else "—", f"{max(pcts):.0f}%" if pcts else "—"])
+    lec_stats = []
+    for lr_key, rows in LECTURE_RESULTS.items():
+        if not isinstance(rows, dict) or not rows:
+            continue
+        live = _lecture_live_ids(lr_key)
+        scores = [_lecture_live_score(live, r)[2] for r in rows.values() if isinstance(r, dict)]
+        if not scores:
+            continue
+        yr, _, name = lr_key.partition(":")
+        lec_stats.append((name, yr, len(scores), sum(r.get("attempts", 1) for r in rows.values() if isinstance(r, dict)), sum(scores) / len(scores)))
+    lec_stats.sort(key=lambda t: -t[2])
+    lec_rows = [[_rp_e(n), _rp_e(year_label(y)), f"{t:,}", f"{a:,}", f"{p:.0f}%"] for n, y, t, a, p in lec_stats[:10]]
+
+    # ── 8. recent days table + insights ──
+    day_rows = [[_rp_e(x["date"]), f"{A(x['r'], 'answered'):,}", f"{_rp_pct(A(x['r'], 'correct'), A(x['r'], 'answered')):.0f}%",
+                 f"{A(x['r'], 'active'):,}", f"{A(x['r'], 'lectures'):,}", f"{A(x['r'], 'daily_done'):,}", f"{A(x['r'], 'custom_runs'):,}"]
+                for x in reversed(ser[-14:])]
+    ins = []
+    if have_two and win(p7, "answered"):
+        ch = _rp_change(win(w7, "answered"), win(p7, "answered"))
+        ins.append(f"Answers are <b>{'up' if ch >= 0 else 'down'} {abs(ch):.1f}%</b> over the last 7 full days ({win(w7, 'answered'):,} vs {win(p7, 'answered'):,}).")
+    if cagr is not None:
+        ins.append(f"Weekly answers have compounded at <b>{cagr:+.1f}% per week</b> across {len(w_ans)} finished weeks.")
+    if ser and max(A(x["r"], "answered") for x in ser):
+        best = max(ser, key=lambda x: A(x["r"], "answered"))
+        ins.append(f"Best day so far: <b>{_rp_e(best['date'])}</b> with {A(best['r'], 'answered'):,} answers and {A(best['r'], 'active'):,} active users.")
+    if max(hours) > 0:
+        ph = max(range(24), key=lambda i: hours[i])
+        ins.append(f"Peak hour is <b>{ph:02d}:00</b> (Cairo) — {_rp_pct(hours[ph], sum(hours)):.1f}% of all answers.")
+    if any(wd_n):
+        bd = max(range(7), key=lambda i: wd_avg[i])
+        ins.append(f"Busiest weekday: <b>{wd_names[bd]}</b> (~{wd_avg[bd]:,} answers on average).")
+    if src_items:
+        s0 = max(src_items, key=lambda t: t[1])
+        ins.append(f"<b>{_rp_e(s0[0])}</b> drives {_rp_pct(s0[1], allagg['answered']):.0f}% of all answers.")
+    if allagg["custom_runs"]:
+        ins.append(f"<b>{cq_users:,}</b> users have finished a Custom Quiz — {allagg['custom_runs']:,} runs, "
+                   f"{allagg['custom_time'] / max(allagg['custom_questions'], 1):.1f}s per question on average.")
+    insights = '<ul class="insights">' + "".join(f"<li>{i}</li>" for i in ins) + "</ul>" if ins else ""
+
+    first_day = min(days) if days else "—"
+    sections = [
+        f'<div class="kpis">{kpis}</div>',
+        (f"<h2>💡 Highlights</h2>{insights}" if insights else ""),
+        f'<h2>📈 Growth <small>{note_days}</small></h2><div class="grid">'
+        + _rp_card("Questions answered per day", c_answers, "with a 7-day moving average", _rp_legend([("Answers", _RP_BLUE), ("7-day average", _RP_AMBER)]), True)
+        + _rp_card("Registered users", c_reg, "cumulative nicknames registered")
+        + _rp_card("Daily active users", c_dau)
+        + _rp_card("Accuracy per day", c_acc, "share of answers that were correct")
+        + _rp_card("Week-over-week growth in answers", c_growth,
+                   (f"compound growth <b>{cagr:+.1f}%/week</b>" if cagr is not None else "needs 3+ finished weeks for a trend"))
+        + _rp_card("Weekly answers", c_weekly, "per finished week")
+        + _rp_card("Weekly active users", c_wact, "unique users per finished week")
+        + _rp_card("Finished weeks (Fri→Thu)",
+                   _rp_table(["Week of", "Answers", "WoW", "Acc", "Users", "WoW", "Lect", "Daily"], wk_rows), wide=True)
+        + "</div>",
+        '<h2>🧭 Engagement</h2><div class="grid">'
+        + _rp_card("Where answers come from", f'<div class="split">{donut}<div>{src_legend}</div></div>', "all time")
+        + _rp_card("Source mix per week", c_stack, "", _rp_legend([(STATS_SOURCE_LABELS.get(k, k), _RP_SRC_COLORS.get(k, "#94a3b8")) for k in STATS_SOURCES]))
+        + _rp_card("Activity by hour", c_hours, "all-time answers, Cairo time")
+        + _rp_card("Average answers by weekday", c_wd)
+        + _rp_card("Answers by year", year_bars, "answers and accuracy")
+        + _rp_card("Registered users by year", reg_bars)
+        + "</div>",
+        '<h2>🎯 Custom Quiz</h2><div class="grid">'
+        + _rp_card("Runs per day", c_runs)
+        + _rp_card("Speed", c_speed, "average seconds per question")
+        + _rp_card("Most active Custom Quiz users", _rp_table(["Nickname", "Runs", "Questions", "Accuracy", "Speed"], cq_rows), wide=True)
+        + "</div>",
+        '<h2>🏆 Learners</h2><div class="grid">'
+        + _rp_card("Level distribution", c_levels, "users per level")
+        + _rp_card("Best streaks", streak_bars, "users by longest streak")
+        + _rp_card("Top 10 by XP", _rp_table(["#", "Nickname", "XP", "Level", "Best streak", "Lecture acc."], top_rows, 2), wide=True)
+        + "</div>",
+        '<h2>📚 Content & events</h2><div class="grid">'
+        + _rp_card("Question bank", content_bars, "ready questions per year")
+        + _rp_card("Most attempted lectures", _rp_table(["Lecture", "Year", "Users", "Attempts", "Avg best"], lec_rows, 2))
+        + _rp_card("Events", _rp_table(["Event", "Year", "Status", "Questions", "Solvers", "Avg", "Best"], ev_rows, 3), wide=True)
+        + "</div>",
+        '<h2>🗓 Daily log</h2><div class="grid">'
+        + _rp_card("Last 14 days", _rp_table(["Date", "Answers", "Acc", "Active", "Lectures", "Daily", "Custom"], day_rows), wide=True)
+        + "</div>",
+    ]
+    return (
+        '<!doctype html><html lang="en"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        f'<title>Quizician — Analytics Report {now.strftime("%Y-%m-%d")}</title><style>{_RP_CSS}</style></head><body>'
+        f'<header class="hero"><div class="wrap"><h1>Quizician Analytics</h1><p>Everything the bot has saved, in one place.</p>'
+        f'<div class="meta"><span class="pill">Generated {now.strftime("%Y-%m-%d %H:%M")} Cairo</span>'
+        f'<span class="pill">Tracking since {_rp_e(first_day)}</span><span class="pill">{len(days)} day(s) saved</span>'
+        f'<span class="pill">{registered:,} registered users</span></div></div></header>'
+        f'<main class="wrap">{"".join(sections)}</main>'
+        '<footer>Hover a bar or point for exact values · unique-user figures can’t be summed across days, so '
+        '“active users” are per day/week · numbers cover only the period since tracking began.</footer></body></html>'
+    )
+
+async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Creator-only: /report — builds the HTML analytics report and sends it as a file."""
+    if not is_creator(update):
+        await update.message.reply_text(MSG_ADMIN_ONLY)
+        return
+    status = await update.message.reply_text("⏳ Building the report…")
+    try:
+        await _stats_flush()   # roll weeks + save, so the report matches /stats
+        doc = build_html_report()
+    except Exception as e:
+        print("REPORT ERROR:", repr(e))
+        await status.edit_text(f"⚠️ Couldn't build the report: {e}")
+        return
+    day = datetime.now(DAILY_QUIZ_TZ).strftime("%Y-%m-%d")
+    await update.message.reply_document(
+        InputFile(BytesIO(doc.encode("utf-8")), filename=f"quizician_report_{day}.html"),
+        caption="📊 Quizician analytics report — open it in any browser (works offline, follows light/dark mode).",
+    )
+    try:
+        await status.delete()
+    except Exception:
+        pass
 
 async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin-only at-a-glance dashboard: is the bot up, how many users/
@@ -17576,6 +18949,7 @@ async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         + "\n\n" + _stats_block(f"🗓 This week — since {_fmt_day(wk)}", this_week)
         + (("\n\n" + _stats_block(f"⏮ Last week — {_fmt_day(last_wk)} → {_fmt_day(_add_days(last_wk, 6))}", prev_week))
            if prev_week else "")
+        + "\n\n" + _stats_all_time_block()
     )
 
     text = (
@@ -18484,6 +19858,18 @@ async def _send_mystats(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_
 
     mistake_count = _user_mistake_count(user_id)
 
+    # 🎯 Custom Quiz lifetime totals (saved by _custom_quiz_save) — omitted until they've finished one.
+    cq = entry.get("custom_quiz") or {}
+    cq_block = ""
+    if cq.get("runs") and cq.get("questions"):
+        cq_block = (
+            "🎯 Custom Quiz\n"
+            f"   Quizzes: {cq['runs']:,}\n"
+            f"   Questions: {cq['questions']:,}\n"
+            f"   Accuracy: {cq.get('correct', 0) / cq['questions'] * 100:.1f}%\n"
+            f"   Speed: {cq.get('seconds', 0.0) / cq['questions']:.1f}s per question\n\n"
+        )
+
     # Current module's subjects, strongest -> weakest. "Current module" is
     # the admin-set /daily_module scope when there is one, else the module
     # of the user's own latest answer — see _current_module_for_stats.
@@ -18555,6 +19941,7 @@ async def _send_mystats(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_
         f"   Answered: {lec_answered:,}\n"
         f"   Correct: {lec_correct:,}\n"
         f"   Accuracy: {accuracy:.1f}%\n\n"
+        f"{cq_block}"
         f"{subjects_block}"
         f"🧠 Mistakes Bank\n"
         f"  current: {mistake_count} questions\n\n"
@@ -18990,7 +20377,7 @@ async def _flush_mistakes_bank_job(context: ContextTypes.DEFAULT_TYPE):
 # come back and finish; it's only meant to catch sessions that are,
 # realistically, abandoned for good.
 # ═══════════════════════════════════════════════════════════════
-STALE_SESSION_IDLE_SECONDS   = 6 * 3600  # 6 hours of no activity before a session is reclaimed
+STALE_SESSION_IDLE_SECONDS   = 3 * 24 * 3600  # 3 days of no activity before a session is reclaimed
 STALE_SESSION_CHECK_INTERVAL = 3600      # check once an hour
 
 async def _cleanup_stale_sessions_job(context: ContextTypes.DEFAULT_TYPE):
@@ -19407,6 +20794,7 @@ app.add_handler(CommandHandler("set_year",       set_year_cmd))
 app.add_handler(CommandHandler("tell",           tell_cmd))
 app.add_handler(CommandHandler("health",         health_cmd))
 app.add_handler(CommandHandler("stats",          stats_cmd))
+app.add_handler(CommandHandler("report",         report_cmd))
 app.add_handler(CommandHandler("restore",        restore_cmd))
 app.add_handler(CommandHandler("broadcast",      broadcast_cmd))
 app.add_handler(CommandHandler("ban",            ban_cmd))
