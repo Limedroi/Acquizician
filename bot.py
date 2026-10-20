@@ -7089,7 +7089,7 @@ def settings_menu_keyboard(user_id: int, page: int = 1) -> InlineKeyboardMarkup:
 
     if page == 3:
         return InlineKeyboardMarkup([
-            [InlineKeyboardButton("لائحة حبائب دين أمي", callback_data="settings_adore")],
+            [InlineKeyboardButton("لائحة أحبائي فالله", callback_data="settings_adore")],
             [InlineKeyboardButton("ℹ️ About Us", callback_data="settings_about_us")],
             [InlineKeyboardButton("🫶 Support Us", callback_data="settings_support_us")],
             [InlineKeyboardButton("📜 Terms of Service", callback_data="settings_terms")],
@@ -10094,7 +10094,7 @@ async def time_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/time — current Cairo time, and when the next 💥Daily Quiz💥 push is."""
     now = datetime.now(DAILY_QUIZ_TZ)
     await update.message.reply_text(
-        f"🕒 دلوقتي: <b>{now.strftime('%I:%M %p')}</b> (توقيت القاهرة)\n\n"
+        f"🕒 دلوقتي: <b>{now.strftime('%I:%M %p')}</b> (بتوقيت أرض القمر)\n\n"
         f"{_next_daily_quiz_line()}",
         parse_mode=ParseMode.HTML,
     )
@@ -17141,7 +17141,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if query.data == "settings_adore":
-        await _send_info_page(context, query, ADORE_LIST_TEXT, "لائحة حبائب دين أمي")
+        await _send_info_page(context, query, ADORE_LIST_TEXT, "لائحة أحبائي فالله")
         return
 
     if query.data == "settings_about_us":
@@ -21222,7 +21222,7 @@ async def _send_mystats(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_
         ]]),
     )
 
-# Settings page 3 -> "لائحة حبائب دين أمي". Quizzy_Adore_Art + a hand-kept list
+# Settings page 3 -> "لائحة أحبائي فالله". Quizzy_Adore_Art + a hand-kept list
 # (explicitly NOT complete — the footnote says so). Names are escaped at render.
 ADORE_LIST_NAMES = [
     ("عبد الرحمن صلاح", "Da vinci"),
@@ -21236,7 +21236,7 @@ ADORE_LIST_NAMES = [
 ]
 ADORE_LIST_TEXT = (
     f"<code>{html.escape(QUIZZY_ADORE_ART)}</code>\n"
-    "<b>لائحة حبائب دين أمي</b>\n\n"
+    "<b>لائحة أحبائي فالله</b>\n\n"
     + "\n".join(f"• {html.escape(n)} ({html.escape(t)})" for n, t in ADORE_LIST_NAMES)
     + "\n\n<i>* this is NOT the full list i am just very forgetful :)</i>"
 )
@@ -21302,7 +21302,7 @@ async def _send_settings(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply
     if page == 3:
         text = (
             "⚙️ <b>الإعدادات — صفحة 3</b>\n\n"
-            "<b>لائحة حبائب دين أمي</b> · ℹ️ <b>About Us</b> · 🫶 <b>Support Us</b> · 📜 <b>Terms of Service</b>"
+            "<b>لائحة أحبائي فالله</b> · ℹ️ <b>About Us</b> · 🫶 <b>Support Us</b> · 📜 <b>Terms of Service</b>"
         )
     elif page == 2:
         nickname = get_nickname(user_id)
