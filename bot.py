@@ -3800,7 +3800,7 @@ async def _resolve_mistake(context: ContextTypes.DEFAULT_TYPE, entry: dict, stat
             _mistakes_index_remove(entry)
             await save_mistakes_bank()
         except ValueError:
-            pass   # already removed by a concurrent lookup — harmless
+            pass   # already removed by a concurrent lookup — harmlesss
     return snap
 
 async def _resolve_mistakes(context: ContextTypes.DEFAULT_TYPE, entries: list) -> list:
