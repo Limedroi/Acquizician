@@ -20531,6 +20531,20 @@ async def memory_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
+async def packages_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Creator only: installed Python packages and versions."""
+    if not is_creator(update):
+        await update.message.reply_text(MSG_ADMIN_ONLY)
+        return
+    from importlib.metadata import distributions
+    pkgs = sorted(
+        ((d.metadata["Name"] or "?"), d.version) for d in distributions()
+    )
+    lines = [f"{html.escape(n)} {html.escape(v)}" for n, v in pkgs]
+    text = "<b>📦 Installed packages</b>\n<pre>" + "\n".join(lines) + "</pre>"
+    await update.message.reply_text(text[:4000], parse_mode=ParseMode.HTML)
+
+
 async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin-only at-a-glance dashboard: is the bot up, how many users/
     lectures exist, whether each channel backup is currently trustworthy
