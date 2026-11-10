@@ -6191,6 +6191,7 @@ def _sessions_snapshot() -> dict:
         # /event_start events (keyed by event id) live here until an admin deletes them; /event_end
         # archives a played event with its leaderboard — see the EVENTS section.
         "events":                    EVENTS,
+        "honor_lists":               HONOR_LISTS,
         # Today's analytics record (the permanent history lives in
         # stats_history.json — this keeps today intact if the disk is wiped).
         "stats_today":               _stats_snapshot_today(),
@@ -6306,6 +6307,9 @@ def _restore_sessions_dict(raw: dict) -> None:
     EVENTS.clear()
     EVENTS.update(raw.get("events") or {})
     _events_rekey()   # snapshots from before multi-event keyed EVENTS by year
+    if isinstance(raw.get("honor_lists"), dict):   # older snapshots predate it — leave the live lists alone
+        HONOR_LISTS.clear()
+        HONOR_LISTS.update({k: v for k, v in raw["honor_lists"].items() if isinstance(v, str)})
     _st = raw.get("stats_today")
     if isinstance(_st, dict) and _st.get("date") and isinstance(_st.get("rec"), dict):
         _merge_stats_history({"days": {_st["date"]: _st["rec"]}})
@@ -10778,6 +10782,44 @@ async def add_lecture_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #                        year's users (see _event_menu_row / start_menu_keyboard)
 # Question dict: {"question","options","correct","explanation","description",
 #                 "image": {"file_id","spoiler"}|None, "case": str|None}
+# ── 🎖️ LIST OF HONOR ────────────────────────────────────────────
+# One admin-edited text per cohort, shown from Leaderboard -> LIST OF HONOR.
+# Stored as Telegram-HTML (formatting the admin typed is kept) and saved with
+# the sessions snapshot, so it survives restarts and rides the channel backup.
+HONOR_LISTS: dict = {}            # year key -> HTML text
+AWAITING_HONOR_EDIT: dict = {}    # admin uid -> year key while waiting for the typed list
+HONOR_YEARS = (                   # (year key, button label) in button order
+    ("y1", "MFM 46"), ("y2", "MFM 45"), ("y3", "MFM 44"),
+    ("n1", "MNU YEAR 1"), ("n2", "MNU YEAR 2"), ("n3", "MNU YEAR 3"),
+)
+HONOR_MAX_HTML = 3900             # stays under Telegram's 4096-char message limit
+
+def _honor_can_edit(update, year: str) -> bool:
+    """Creator: every cohort. Secondary admins: only the cohorts in their
+    SECONDARY_ADMIN_YEARS scope. Everyone else: none."""
+    if not is_admin(update):
+        return False
+    allowed = admin_allowed_years(update.effective_user.id)
+    return allowed is None or year in allowed
+
+def _honor_menu_view():
+    rows = [
+        [InlineKeyboardButton(lbl, callback_data=f"honor_y:{y}") for y, lbl in HONOR_YEARS[:3]],
+        [InlineKeyboardButton(lbl, callback_data=f"honor_y:{y}") for y, lbl in HONOR_YEARS[3:]],
+        [InlineKeyboardButton("⬅️ Leaderboard Menu", callback_data="leaderboard_menu")],
+    ]
+    return "🎖️ <b>LIST OF HONOR</b>\n\nاختار الدفعة:", InlineKeyboardMarkup(rows)
+
+def _honor_year_view(year: str, is_adm: bool):
+    label = dict(HONOR_YEARS).get(year, year)
+    body = (HONOR_LISTS.get(year) or "").strip()
+    text = f"🎖️ <b>LIST OF HONOR — {html.escape(label)}</b>\n\n" + (body or "📭 القايمة لسه فاضية.")
+    rows = []
+    if is_adm:
+        rows.append([InlineKeyboardButton("✏️ Edit list", callback_data=f"honor_e:{year}")])
+    rows.append([InlineKeyboardButton("⬅️ LIST OF HONOR", callback_data="honor_menu")])
+    return text, InlineKeyboardMarkup(rows)
+
 EVENTS: dict = {}
 AWAITING_EVENT_NAME: dict = {}   # admin uid -> True while waiting for the typed event name
 AWAITING_EVENT_DESC: dict = {}   # admin uid -> True while waiting for the event description
@@ -10861,6 +10903,7 @@ async def event_start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     EVENT_PICK.pop(uid, None)
     AWAITING_EVENT_EDIT.pop(uid, None)
     AWAITING_EVENT_DESC.pop(uid, None)
+    AWAITING_EVENT_LEVEL.pop(uid, None)
     AWAITING_EVENT_NAME[uid] = True
     await update.message.reply_text(
         "<b>Event Start</b>\n\n"
@@ -10884,6 +10927,32 @@ def _event_is_once(ev: dict) -> bool:
     """True for events that each student may take only once (older events
     have no flag and stay unlocked, exactly as before)."""
     return (ev or {}).get("attempts") == "once"
+
+AWAITING_EVENT_LEVEL: dict = {}   # admin uid -> True while /event_start waits for the minimum level
+
+_EVENT_LEVEL_PROMPT = (
+    "🎚 <b>أقل Level يقدر يدخل الـ Event؟</b>\n\n"
+    "ابعت رقم الـ Level (مثلاً <code>5</code> يعني Level 5 وأعلى)،\n"
+    "أو دوس الزرار لو مفيش شرط."
+)
+
+def _event_level_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔓 مفيش شرط", callback_data="evta_lvl:0")]])
+
+def _event_min_level(ev: dict) -> int:
+    """Minimum level to enter the event (0 = open to everyone; older events
+    have no field and stay open)."""
+    try:
+        return max(0, int((ev or {}).get("min_level") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+def _event_user_level(user_id: int) -> int:
+    e = ANALYTICS.get(str(user_id))
+    try:
+        return _xp_to_level(int(e.get("xp", 0))) if isinstance(e, dict) else 0
+    except (TypeError, ValueError):
+        return 0
 
 async def _event_pick_step(context, uid: int, uni, send) -> None:
     """Uni then year. A step with a single option is skipped automatically
@@ -10918,6 +10987,7 @@ async def _event_begin(context, uid: int, year: str, send) -> None:
         "name": name, "description": description, "year": year, "live": False, "created_by": uid,
         "created_at": time.time(), "questions": [], "results": {},
         "attempts": pick.get("attempts") or "unlocked",   # "once" | "unlocked"
+        "min_level": int(pick.get("min_level") or 0),     # 0 = no requirement
     }
     eid = _event_uid(ev)
     while eid in EVENTS:   # ids are random; this is just a collision guard
@@ -11098,6 +11168,8 @@ def _event_rank(ev: dict, limit: int | None = EVENT_LB_USER_ROWS) -> list:
             continue
         if not has_nickname(uid):
             continue
+        if uid in (ev.get("lb_hidden") or []):
+            continue
         rows.append({
             **r, "user_id": uid, "name": get_nickname(uid),
             "correct": r.get("correct", 0), "total": r.get("total", 0),
@@ -11177,6 +11249,15 @@ async def _event_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
             await send("⚠️ الجلسة انتهت — ابدأ من /event_start تاني.")
             return
         EVENT_PICK[uid]["attempts"] = mode
+        AWAITING_EVENT_LEVEL[uid] = True
+        await send(_EVENT_LEVEL_PROMPT, _event_level_markup())
+        return
+
+    if data == "evta_lvl:0":
+        if uid not in EVENT_PICK or not AWAITING_EVENT_LEVEL.pop(uid, None):
+            await send("⚠️ الجلسة انتهت — ابدأ من /event_start تاني.")
+            return
+        EVENT_PICK[uid]["min_level"] = 0
         await _event_pick_step(context, uid, None, send)
         return
 
@@ -11207,6 +11288,7 @@ async def _event_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     if data == "evta_cancel":
+        AWAITING_EVENT_LEVEL.pop(uid, None)
         PICKER.pop(uid, None)
         au = EVENT_AUTHORING.pop(uid, None)
         if not au:
@@ -11417,6 +11499,8 @@ def _event_save_result(ev: dict, user_id: int, s: dict) -> None:
     if s.get("result_saved"):
         return
     s["result_saved"] = True
+    if user_id in (ev.get("lb_hidden") or []):
+        return   # removed from the board by an admin (cheater)
     new = {
         "user_id": user_id, "name": get_nickname(user_id), "correct": s["correct"],
         "answered": s["answered"], "total": s["total"], "duration": round(s.get("duration", 0.0), 1),
@@ -11513,11 +11597,17 @@ def _event_preview_view(eid: str, user_id: int, token: str | None = None):
     lines += ["", f"📝 {len(ev['questions'])} سؤال" + (f" + ✍️ {_n_w} مكتوب" if _n_w else "")]
     once = _event_is_once(ev)
     used = once and str(user_id) in (ev.get("taken") or {})
+    need = _event_min_level(ev)
+    locked = need > _event_user_level(user_id)
+    if need:
+        lines += ["", f"🎚 للـ Event ده لازم تكون <b>Level {need}</b> أو أعلى."]
+    if locked:
+        lines += ["", f"🔒 انت دلوقتي Level {_event_user_level(user_id)} — كمّل حل وهتفتحله."]
     if once:
         lines += ["", "1️⃣ الـ Event ده بيتحل <b>مرة واحدة بس</b>."]
     if used:
         lines += ["", "✅ انت حليته قبل كده — تقدر تشوف الـ leaderboard."]
-    buttons = [] if used else [[InlineKeyboardButton("▶️ ابدأ", callback_data=f"evtu_go:{eid}")]]
+    buttons = [] if (used or locked) else [[InlineKeyboardButton("▶️ ابدأ", callback_data=f"evtu_go:{eid}")]]
     buttons += [
         lb_row,
         [InlineKeyboardButton("❌ إلغاء", callback_data="back_home")],
@@ -11585,6 +11675,12 @@ async def _event_user_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     if (not ev or not ev.get("live") or not _event_has_items(ev)
             or get_year_class(uid) != ev.get("year")):
         await query.edit_message_text("⚠️ الـ Event ده خلص أو مش متاح ليك.", reply_markup=home)
+        return
+    if _event_min_level(ev) > _event_user_level(uid):
+        await query.edit_message_text(
+            f"🔒 الـ Event ده لـ <b>Level {_event_min_level(ev)}</b> وأعلى — انت Level {_event_user_level(uid)}.",
+            parse_mode=ParseMode.HTML, reply_markup=home,
+        )
         return
     if _event_is_once(ev):
         if str(uid) in (ev.get("taken") or {}) or (EVENT_SESSIONS.get(uid) or {}).get("eid") == eid:
@@ -12121,7 +12217,8 @@ def _event_menu_view(eid: str, ev: dict):
     head = f"{UNIVERSITIES.get(year_university(year), '')} {year_label(year)}"
     if ev.get("ended"):
         rows = [
-            [InlineKeyboardButton("🏆 Leaderboard", callback_data=f"evta_lb:{eid}")],
+            [InlineKeyboardButton("🏆 Leaderboard", callback_data=f"evta_lb:{eid}"),
+             InlineKeyboardButton("🧹 Manage board", callback_data=f"evta_lbm:{eid}:0")],
             [InlineKeyboardButton("🗑 مسح نهائي", callback_data=f"evta_purge:{eid}")],
             [InlineKeyboardButton("🔙 رجوع للـ Events", callback_data="evta_el")],
         ]
@@ -12134,6 +12231,8 @@ def _event_menu_view(eid: str, ev: dict):
          InlineKeyboardButton("✏️ Rename", callback_data=f"evta_ren:{eid}")],
         [InlineKeyboardButton("📝 Description", callback_data=f"evta_dsc:{eid}"),
          InlineKeyboardButton("🏆 Leaderboard", callback_data=f"evta_lb:{eid}")],
+        [InlineKeyboardButton("🧹 Manage board", callback_data=f"evta_lbm:{eid}:0"),
+         InlineKeyboardButton("🎚 Level", callback_data=f"evta_lve:{eid}")],
     ]
     if not ev.get("live") and _event_has_items(ev):
         rows.append([InlineKeyboardButton("🚀 Publish", callback_data=f"evta_pubd:{eid}")])
@@ -12141,7 +12240,8 @@ def _event_menu_view(eid: str, ev: dict):
     text = (
         f"<b>{html.escape(ev['name'])}</b>\n"
         f"{head} · {state} · " + ("1️⃣ مرة واحدة" if _event_is_once(ev) else "🔓 Unlocked") + "\n"
-        f"📝 {n} سؤال" + (f" + ✍️ {_event_written_count(ev)} مكتوب" if _event_written_count(ev) else "") + f" · 👥 {taken} حلّوه"
+        f"📝 {n} سؤال" + (f" + ✍️ {_event_written_count(ev)} مكتوب" if _event_written_count(ev) else "") + f" · 👥 {taken} حلّوه\n"
+        + (f"🎚 Level {_event_min_level(ev)}+" if _event_min_level(ev) else "🎚 مفيش شرط Level")
     )
     return text, InlineKeyboardMarkup(rows)
 
@@ -12172,6 +12272,45 @@ def _event_list_view(uid: int, eid: str, ev: dict, page: int, mode: str):
     if not items:
         text += "\n\n📭 مفيش أسئلة."
     return text, InlineKeyboardMarkup(rows)
+
+EVENT_LB_MANAGE_PAGE = 10
+
+def _event_lb_manage_view(eid: str, ev: dict, page: int = 0):
+    """Admin view of the event board: one 🗑 button per entry + ➕ Add entry."""
+    ranked = _event_rank(ev, limit=None)
+    page, pages, a, b = _lb_pager(len(ranked), page, EVENT_LB_MANAGE_PAGE)
+    lines = [f"🧹 <b>Manage board — {html.escape(ev['name'])}</b>"]
+    if pages > 1:
+        lines[0] += f" (صفحة {page + 1}/{pages})"
+    lines.append("")
+    rows = []
+    for i, r in enumerate(ranked[a:b], a + 1):
+        lines.append(f"{i}. {html.escape(r['name'])} — {r['correct']}/{r['total']} ✅ · ⏱️ {_format_duration(r['duration'])}")
+        rows.append([InlineKeyboardButton(f"🗑 {i}. {r['name'][:30]}", callback_data=f"evta_lbd:{eid}:{r['user_id']}")])
+    if not ranked:
+        lines.append("📭 الـ leaderboard فاضي.")
+    hidden = len(ev.get("lb_hidden") or [])
+    if hidden:
+        lines += ["", f"🚫 {hidden} اتشالوا"]
+    nav = _lb_nav_row(f"evta_lbm:{eid}", page, pages)
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("➕ Add entry", callback_data=f"evta_lba:{eid}")])
+    rows.append([InlineKeyboardButton("🔙 رجوع", callback_data=f"evta_ev:{eid}")])
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+def _parse_lb_time(t: str):
+    """'95', '95.5' or '1:35' / '1:02:03' -> seconds, or None if unparseable."""
+    t = (t or "").strip()
+    if not t:
+        return 0.0
+    try:
+        secs = 0.0
+        for part in t.split(":"):
+            secs = secs * 60 + float(part)
+        return round(secs, 1) if secs >= 0 else None
+    except ValueError:
+        return None
 
 async def edit_event_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin: /edit_event — events in the admin's scope -> browse / edit /
@@ -12206,6 +12345,7 @@ async def _event_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         "evta_el", "evta_ev", "evta_ql", "evta_qs", "evta_ed", "evta_edc", "evta_edp", "evta_rm",
         "evta_qd", "evta_qdok", "evta_ins", "evta_add", "evta_ren", "evta_dsc", "evta_srch", "evta_pubd",
         "evta_lb", "evta_purge", "evta_purgeok",
+        "evta_lbm", "evta_lbd", "evta_lbdok", "evta_lba", "evta_lve",
     }:
         return False
 
@@ -12389,6 +12529,65 @@ async def _event_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return True
 
+    if cmd == "evta_lve":
+        AWAITING_EVENT_EDIT[uid] = {"kind": "level", "eid": eid, "qid": None}
+        cur = _event_min_level(ev)
+        await send(f"🎚 الشرط الحالي: {f'Level {cur}+' if cur else 'مفيش'}\n\nابعت أقل Level جديد (0 = مفيش شرط):",
+                   InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"evta_ev:{eid}")]]))
+        return True
+
+    if cmd == "evta_lbm":
+        text, markup = _event_lb_manage_view(eid, ev, qid_of(2) or 0)
+        await send(text, markup)
+        return True
+
+    if cmd == "evta_lbd":
+        tuid = qid_of(2)
+        row = (ev.get("results") or {}).get(str(tuid))
+        if row is None:
+            text, markup = _event_lb_manage_view(eid, ev, 0)
+            await send("⚠️ اليوزر ده مش في الـ leaderboard.\n\n" + text, markup)
+            return True
+        nm = html.escape(get_nickname(tuid) or row.get("name") or str(tuid))
+        await send(
+            f"🗑 تشيل <b>{nm}</b> من الـ leaderboard؟\n"
+            f"{row.get('correct', 0)}/{row.get('total', 0)} ✅\n\n"
+            "مش هيقدر يدخل الـ leaderboard تاني بعد كده (لحد ما تضيفه بإيدك).",
+            InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ أيوه، شيله", callback_data=f"evta_lbdok:{eid}:{tuid}"),
+                InlineKeyboardButton("↩️ لأ", callback_data=f"evta_lbm:{eid}:0"),
+            ]]),
+        )
+        return True
+
+    if cmd == "evta_lbdok":
+        tuid = qid_of(2)
+        (ev.get("results") or {}).pop(str(tuid), None)
+        hidden = ev.setdefault("lb_hidden", [])
+        if tuid is not None and tuid not in hidden:
+            hidden.append(tuid)
+        await _event_persist(context)
+        await admin_log(context, "🧹 Event leaderboard entry removed",
+                        f"{html.escape(ev['name'])} — {html.escape(get_nickname(tuid) or str(tuid))} ({tuid})", uid)
+        text, markup = _event_lb_manage_view(eid, ev, 0)
+        await send("🗑 اتشال.\n\n" + text, markup)
+        return True
+
+    if cmd == "evta_lba":
+        AWAITING_EVENT_EDIT[uid] = {"kind": "lbadd", "eid": eid, "qid": None}
+        await send(
+            "➕ ابعت الـ entry بالشكل ده:\n"
+            "<code>Nickname | correct | total | time</code>\n\n"
+            "• <b>Nickname</b> (أو الـ Telegram ID)\n"
+            "• <b>correct</b> = عدد الإجابات الصح\n"
+            "• <b>total</b> اختياري (الافتراضي = عدد أسئلة الـ Event)\n"
+            "• <b>time</b> اختياري: ثواني (<code>95</code>) أو <code>1:35</code>\n\n"
+            "مثال: <code>Ahmed | 18 | 20 | 1:35</code>\n"
+            "لو اليوزر موجود، النتيجة هتتبدل.",
+            InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"evta_lbm:{eid}:0")]]),
+        )
+        return True
+
     if cmd == "evta_purge":
         await send(
             f"🗑 تمسح <b>{html.escape(ev['name'])}</b> نهائي؟\nالـ leaderboard بتاعه هيتمسح معاه.",
@@ -12458,6 +12657,62 @@ async def _event_apply_text_edit(update: Update, context: ContextTypes.DEFAULT_T
         ev["description"] = _entities_to_html(update.message.text, update.message.entities).strip()
         await _event_persist(context)
         await back_to_event()
+        return
+
+    if kind == "level":
+        raw = text.strip()
+        if not raw.isdigit() or not 0 <= int(raw) <= 999:
+            AWAITING_EVENT_EDIT[uid] = ee
+            await reply("⚠️ ابعت رقم Level صحيح (0 = مفيش شرط).")
+            return
+        ev["min_level"] = int(raw)
+        await _event_persist(context)
+        await back_to_event()
+        return
+
+    if kind == "lbadd":
+        parts = [p.strip() for p in text.split("|")]
+        ref = parts[0] if parts else ""
+        back = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Manage board", callback_data=f"evta_lbm:{eid}:0")]])
+
+        async def retry(msg):
+            AWAITING_EVENT_EDIT[uid] = ee
+            await reply(msg, reply_markup=back)
+
+        matches = _resolve_user_refs(ref)
+        if not matches:
+            await retry("⚠️ مفيش يوزر بالاسم/الـ ID ده — ابعت تاني.")
+            return
+        if len(matches) > 1:
+            names = "\n".join(f"• {get_nickname(m) or '—'} — {m}" for m in matches[:15])
+            await retry(f"⚠️ في أكتر من يوزر بالاسم ده، ابعت الـ ID بدل الاسم:\n{names}")
+            return
+        tuid = matches[0]
+        if not has_nickname(tuid):
+            await retry("⚠️ اليوزر ده معندوش nickname، فمش هيظهر في الـ leaderboard.")
+            return
+        try:
+            correct = int(parts[1])
+            total = int(parts[2]) if len(parts) > 2 and parts[2] else len(ev.get("questions", [])) or correct
+        except (ValueError, IndexError):
+            await retry("⚠️ الشكل: Nickname | correct | total | time — ابعت تاني.")
+            return
+        secs = _parse_lb_time(parts[3]) if len(parts) > 3 else 0.0
+        if secs is None or correct < 0 or total < 1 or correct > total:
+            await retry("⚠️ أرقام مش مظبوطة (correct لازم ≤ total، والوقت ثواني أو m:ss) — ابعت تاني.")
+            return
+        ev.setdefault("results", {})[str(tuid)] = {
+            "user_id": tuid, "name": get_nickname(tuid), "correct": correct,
+            "answered": total, "total": total, "duration": secs, "manual": True,
+        }
+        hidden = ev.get("lb_hidden") or []
+        if tuid in hidden:
+            hidden.remove(tuid)
+        await _event_persist(context)
+        await admin_log(context, "➕ Event leaderboard entry added",
+                        f"{html.escape(ev['name'])} — {html.escape(get_nickname(tuid))} ({tuid}) · {correct}/{total}", uid)
+        t, m = _event_lb_manage_view(eid, ev, 0)
+        await reply("✅ اتضاف.\n\n" + t, parse_mode=ParseMode.HTML, reply_markup=m)
         return
 
     if kind == "search":
@@ -13649,6 +13904,50 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 _EVENT_MODE_PROMPT, parse_mode=ParseMode.HTML, reply_markup=_event_mode_markup(),
             )
+            return
+
+    # ── LIST OF HONOR: admin is typing a cohort's list ───────────────
+    _honor_year = AWAITING_HONOR_EDIT.pop(real_uid, None)
+    if _honor_year and not _honor_can_edit(update, _honor_year):
+        await update.message.reply_text("🚫 القايمة دي مش في صلاحياتك.")
+        return
+    if _honor_year:
+        _raw = (update.message.text or "").strip()
+        if _raw == "-":
+            _new_html = ""
+        else:
+            _new_html = _entities_to_html(update.message.text, update.message.entities).strip()
+        if len(_new_html) > HONOR_MAX_HTML:
+            AWAITING_HONOR_EDIT[real_uid] = _honor_year
+            await update.message.reply_text(
+                f"⚠️ القايمة طويلة ({len(_new_html)} حرف بعد التنسيق) — الحد {HONOR_MAX_HTML}. قصّرها وابعتها تاني."
+            )
+            return
+        if _new_html:
+            HONOR_LISTS[_honor_year] = _new_html
+        else:
+            HONOR_LISTS.pop(_honor_year, None)
+        await _flush_sessions_if_changed()
+        await backup_sessions_to_channel(context, force=True)
+        _t, _m = _honor_year_view(_honor_year, _honor_can_edit(update, _honor_year))
+        await update.message.reply_text("✅ اتحفظت.\n\n" + _t, parse_mode=ParseMode.HTML, reply_markup=_m)
+        return
+
+    # ── /event_start: waiting on the minimum level ───────────────────
+    if AWAITING_EVENT_LEVEL.get(real_uid):
+        if not is_admin(update) or real_uid not in EVENT_PICK:
+            AWAITING_EVENT_LEVEL.pop(real_uid, None)
+        else:
+            raw_lvl = text.strip()
+            if not raw_lvl.isdigit() or not 0 <= int(raw_lvl) <= 999:
+                await update.message.reply_text("⚠️ ابعت رقم Level صحيح (مثلاً 5)، أو دوس «مفيش شرط».")
+                return
+            AWAITING_EVENT_LEVEL.pop(real_uid, None)
+            EVENT_PICK[real_uid]["min_level"] = int(raw_lvl)
+
+            async def _lvl_send(t, m=None):
+                await update.message.reply_text(t, parse_mode=ParseMode.HTML, reply_markup=m)
+            await _event_pick_step(context, real_uid, None, _lvl_send)
             return
 
     # ── /edit_daily ➕ authoring in progress (owns this admin's texts) ──
@@ -17574,8 +17873,40 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     InlineKeyboardButton("📅 Weekly", callback_data="weekly_leaderboard"),
                     InlineKeyboardButton("🌍 Global", callback_data="year_leaderboard"),
                 ],
+                [InlineKeyboardButton("🎖️ LIST OF HONOR", callback_data="honor_menu")],
                 [InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")],
             ]),
+        )
+        return
+
+    if query.data == "honor_menu":
+        AWAITING_HONOR_EDIT.pop(user_id, None)
+        _t, _m = _honor_menu_view()
+        await query.edit_message_text(_t, parse_mode=ParseMode.HTML, reply_markup=_m)
+        return
+
+    if query.data.startswith("honor_y:"):
+        AWAITING_HONOR_EDIT.pop(user_id, None)
+        _y = query.data.split(":", 1)[1]
+        if _y not in dict(HONOR_YEARS):
+            return
+        _t, _m = _honor_year_view(_y, _honor_can_edit(update, _y))
+        await query.edit_message_text(_t, parse_mode=ParseMode.HTML, reply_markup=_m)
+        return
+
+    if query.data.startswith("honor_e:"):
+        _y = query.data.split(":", 1)[1]
+        if _y not in dict(HONOR_YEARS):
+            return
+        if not _honor_can_edit(update, _y):
+            await query.answer("🚫 القايمة دي مش في صلاحياتك.", show_alert=True)
+            return
+        AWAITING_HONOR_EDIT[user_id] = _y
+        await query.edit_message_text(
+            f"✏️ ابعت قايمة <b>{html.escape(dict(HONOR_YEARS)[_y])}</b> كنص — التنسيق (Bold / Italic...) هيتحفظ.\n"
+            "ابعت <code>-</code> لو عايز تفضّيها.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"honor_y:{_y}")]]),
         )
         return
 
